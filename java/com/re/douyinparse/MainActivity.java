@@ -447,6 +447,8 @@ public class MainActivity extends Activity {
           + "仅解析公开分享页面，不存储任何用户数据，不使用、不上传任何账号信息。\n\n"
           + "【问题反馈】\n"
           + "QQ：" + APP_QQ + "\n\n"
+          + "【开源地址】\n"
+          + "https://github.com/a2137190676/DYParse\n\n"
           + "【更新】\n"
           + "新版本发布在 GitHub Releases，点下方「检查更新」即可。";
 
