@@ -56,12 +56,17 @@
 # 1. 准备 android.jar（示例：Android 14）
 cp $ANDROID_HOME/platforms/android-34/android.jar .
 
-# 2. 编译 + 签名
+# 2. 下载依赖库（Media3 / Guava / Kotlin stdlib 等，约 14MB）
+bash fetch_libs.sh
+
+# 3. 编译 + 签名
 bash build.sh
 
-# 3. 产物
+# 4. 产物
 # build/DYParse.apk
 ```
+
+> `libs/` 下的依赖不会进入仓库（已加入 .gitignore），请用 `fetch_libs.sh` 获取。
 
 `build.sh` 中的 `d8` 路径需要按你自己的 SDK 位置调整：
 
