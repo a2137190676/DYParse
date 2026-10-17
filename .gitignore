@@ -1,0 +1,30 @@
+# Build output
+build/
+*.apk
+*.ap_
+*.dex
+
+# Android SDK stub (local only)
+android.jar
+
+# Signing
+*.keystore
+!.debug.keystore
+*.jks
+release.properties
+keystore.properties
+
+# IDE
+.idea/
+*.iml
+.gradle/
+local.properties
+
+# Logs / temp
+*.log
+*.bak
+*.tmp
+.DS_Store
+
+# Reverse-engineering scratch
+reverse/
