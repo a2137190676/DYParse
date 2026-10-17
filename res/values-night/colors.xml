@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand">#FF3B60</color>
+    <color name="brand_dark">#E02A4E</color>
+
+    <!-- 夜间 -->
+    <color name="bg">#0E0F13</color>
+    <color name="surface">#191B21</color>
+    <color name="surface_alt">#21242C</color>
+    <color name="stroke">#2B2F39</color>
+    <color name="text">#F2F3F5</color>
+    <color name="text_sub">#9BA1AE</color>
+    <color name="text_hint">#63697A</color>
+
+    <color name="player_bg">#000000</color>
+    <color name="scrim">#A6000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="white_sub">#B0B0BC</color>
+</resources>
