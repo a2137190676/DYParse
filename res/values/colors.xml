@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 品牌色（抖音红） -->
+    <color name="brand">#FE2C55</color>
+    <color name="brand_dark">#D91E45</color>
+
+    <!-- 日间 -->
+    <color name="bg">#F5F6F8</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="surface_alt">#F0F1F4</color>
+    <color name="stroke">#E3E5EA</color>
+    <color name="text">#1A1A1F</color>
+    <color name="text_sub">#6B6F7A</color>
+    <color name="text_hint">#A8ACB6</color>
+
+    <!-- 播放器/遮罩（两套共用） -->
+    <color name="player_bg">#000000</color>
+    <color name="scrim">#A6000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="white_sub">#B0B0BC</color>
+</resources>
