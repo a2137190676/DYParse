@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+# 二进制
+*.apk binary
+*.jar binary
+*.keystore binary
+*.png binary
+*.webp binary
+*.ttf binary
