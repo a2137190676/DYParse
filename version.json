@@ -1,0 +1,8 @@
+{
+  "tag": "v1.3.2",
+  "name": "v1.3.2 双源更新 + BGM 提取",
+  "body": "DY解析器 v1.3.2 - 双更新源 + 背景音乐提取\n\n新增\n- 更新源可切换：设置 → 更新源，Gitee / GitHub 二选一\n- GitHub 仓库同步开源：github.com/a2137190676/DYParse\n- BGM 提取：抖音背景音乐原曲 MP3 直接下载（免转码）\n- 限时日常提示：识别 story 内容并给出明确说明\n- 运行日志：设置 → 运行日志，可查看解析/下载/报错记录\n\n优化\n- 设置页重构：所有功能入口集中到右上角「设置」\n- 服务器地址隐藏：设置里不再显示内置服务器真实地址\n- 下载目录分类：视频/图片/音频/合集各自独立目录，均支持自定义\n\n修复\n- 二次解析视频黑屏（TextureView 被隐藏后未恢复）\n- 二次解析旧播放器/图片残留\n- 解析结果统计数据字段丢失\n\n代码开源\nGitee：https://gitee.com/adaaixianzun/dyparse\nGitHub：https://github.com/a2137190676/DYParse",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.2/DYParse-v1.3.2.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.2/DYParse-v1.3.2.apk",
+  "released": "2026-10-20"
+}
