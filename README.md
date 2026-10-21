@@ -180,6 +180,8 @@ bash build.sh
 
 > `libs/` 下的依赖不会进入仓库（已加入 .gitignore），请用 `fetch_libs.sh` 获取。
 
+> **不支持 GitHub Actions 云端编译**：本项目用裸 `aapt + javac + d8 + apksigner` 构建，依赖 `libs/` 里 12 个 jar（Media3 / ffmpeg-kit / Kotlin 等，约 14MB）。这些 jar 不进仓库，云端 checkout 后没有它们必然编译失败。请在本机按上面步骤编译。仓库中已移除 `.github/workflows/`。
+
 `build.sh` 会自动按以下顺序找 dex 工具链，**不需要手动改路径**：
 
 1. `$ANDROID_HOME/build-tools/*/lib/d8.jar`
