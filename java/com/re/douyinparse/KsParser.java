@@ -56,11 +56,22 @@ public class KsParser {
         public long likeCount = 0;
         public String pageUrl = "";
         public String err = "";
+        /** 是否来自合集分享（subBiz=KS_HEJI_SHARE）：只能拿到被分享那一集 */
+        public boolean isHeji = false;
         public final List<String> images = new ArrayList<String>();   // 图集
 
         public boolean hasVideo(){ return playUrl != null && playUrl.length() > 0; }
         public boolean hasImages(){ return !images.isEmpty(); }
         public boolean ok(){ return hasVideo() || hasImages(); }
+        /**
+         * 是否「快手静态图集」：有图、无视频、且快手没下发任何动图轨道。
+         * 快手的 photoType=SINGLE_PICTURE / HORIZONTAL_ATLAS 都是纯静态，
+         * 作者标 #live实况动图 也一样——实测 mainMvUrls 恒为 []，
+         * atlas 路径改 .mp4/.gif/.mov 全 404。
+         */
+        public boolean isKsStaticAtlas(){
+            return !hasVideo() && hasImages();
+        }
 
         /**
          * 转成 MainActivity.render() 认识的 JSON 字段：
@@ -90,6 +101,12 @@ public class KsParser {
             kv(b, "i_musicTitle", musicTitle);
             kv(b, "i_musicAuthor", musicAuthor);
             kv(b, "i_music", musicUrl);
+            // 快手分享页给的是完整音轨 m4a（非片段），直接当 BGM 用。
+            // 抖音的 music 只是 15s 片段，那边由 detail 的 play_url 提供 i_bgm。
+            if(musicUrl != null && musicUrl.length() > 0){
+                kv(b, "i_bgm", musicUrl);
+                if(musicTitle != null && musicTitle.length() > 0) kv(b, "i_bgmTitle", musicTitle);
+            }
             kv(b, "i_platform", "快手");
             StringBuilder st = new StringBuilder();
             if(viewCount > 0) st.append("播放 ").append(viewCount);
@@ -147,6 +164,10 @@ public class KsParser {
                 v.err = "页面抓取失败";
                 return v;
             }
+            // 合集分享：subBiz=KS_HEJI_SHARE。快手网页端只下发被分享的那一集，
+            // 没有合集列表接口（试过 collection/list、heji/info 等全 404，
+            // 能通的 /rest/wd/photo/info 需要 App 签名，返回 antispam need captcha）。
+            if(real != null && real.indexOf("KS_HEJI_SHARE") >= 0) v.isHeji = true;
             Log.i(TAG, "KS_HTML len=" + html.length() + " hasInit=" + (html.indexOf("INIT_STATE") >= 0));
             parseHtml(html, v);
             if(!v.ok() && v.err.length() == 0){
@@ -327,17 +348,36 @@ public class KsParser {
             v.musicUrl    = firstUrlOf(st.get("audioUrls"));
         }
 
-        // 图集：photoType=IMAGE 或 atlas 非空
+        // 图集：atlas 可能挂在 photo.atlas，也可能挂在 ext_params.atlas（实测多数在后者）
         String photoType = s(photo.get("photoType")).toUpperCase();
         List<String> atlas = atlasUrls(photo.get("atlas"));
-        if(atlas.isEmpty() && photoType.contains("IMAGE")){
-            atlas = atlasUrls(photo.get("ext_params"));   // 兜底：ext_params.atlas
+        if(atlas.isEmpty()){
+            Object ep = photo.get("ext_params");
+            if(ep instanceof Map){
+                Object ea = ((Map)ep).get("atlas");
+                if(ea != null) atlas = atlasUrls(ea);
+            }
         }
         if(!atlas.isEmpty()){
             v.images.addAll(atlas);
         } else if(photoType.contains("IMAGE") || photoType.contains("ATLAS")){
             List<String> iu = plainUrls(photo.get("imageUrls"));
             if(!iu.isEmpty()) v.images.addAll(iu);
+        }
+
+        // 单图作品（SINGLE_PICTURE）：没有 atlas，用 coverUrls 当图
+        if(v.images.isEmpty() && photoType.contains("SINGLE_PICTURE")){
+            List<String> cu = urlsOf(photo.get("coverUrls"));
+            if(cu.isEmpty()) cu = urlsOf(photo.get("webpCoverUrls"));
+            if(!cu.isEmpty()) v.images.addAll(cu);
+        }
+        // 图文兜底：mainMvUrls 为空 + 有 coverUrls + 不是视频，按单图处理
+        if(v.images.isEmpty() && v.musicUrl.length() == 0){
+            boolean noVideo = firstUrlOf(photo.get("mainMvUrls")).length() == 0;
+            if(noVideo && photoType.length() > 0 && !photoType.contains("VIDEO")){
+                List<String> cu = urlsOf(photo.get("coverUrls"));
+                if(!cu.isEmpty()) v.images.addAll(cu);
+            }
         }
 
         // 纯图集不该再有视频；反之图集解析成功就清掉视频地址，避免 UI 走错分支
@@ -348,12 +388,14 @@ public class KsParser {
                 + " music=" + (v.musicUrl.length() > 0 ? "1" : "0"));
     }
 
-    /** 递归找作品节点：有 photoId，且带 mainMvUrls / manifest / atlas 之一 */
+    /** 递归找作品节点：有 photoId，且带 mainMvUrls / manifest / atlas / ext_params 之一 */
     static Map findPhoto(Object o){
         if(o instanceof Map){
             Map m = (Map) o;
             if(m.get("photoId") != null
-                    && (m.get("mainMvUrls") != null || m.get("manifest") != null || m.get("atlas") != null)){
+                    && (m.get("mainMvUrls") != null || m.get("manifest") != null
+                        || m.get("atlas") != null || m.get("ext_params") != null
+                        || m.get("photoType") != null)){
                 return m;
             }
             for(Object val : m.values()){
@@ -389,33 +431,107 @@ public class KsParser {
         return null;
     }
 
-    /** atlas 结构：{list:[{url:"..."}], ...}；也接受 {atlas:{list:[...]}} 嵌套一层 */
+    /**
+     * atlas 结构：{list:[...], cdnList:[{cdn:"p2.a.yximgs.com"}], size:[{w,h}]}
+     * list 里的元素可能是：
+     *   - 绝对 URL 字符串：https://...
+     *   - 相对路径字符串：/ufile/atlas/xxx_0.webp  ← 需要拼 cdnList 里的域名
+     *   - Map：{url:"..."} 或 {cdn:[...]}
+     */
     static List<String> atlasUrls(Object atlas){
         List<String> out = new ArrayList<String>();
         if(atlas == null) return out;
         Object listObj = null;
+        String baseCdn = "";
         if(atlas instanceof Map){
             Map m = (Map) atlas;
             listObj = m.get("list");
             if(listObj == null && m.get("atlas") != null) return atlasUrls(m.get("atlas"));
+            // 取第一个可用 CDN 域名
+            Object cl = m.get("cdnList");
+            if(cl instanceof List){
+                for(Object c : (List) cl){
+                    if(c instanceof Map){
+                        String d = s(((Map) c).get("cdn"));
+                        if(d.length() > 0){ baseCdn = d; break; }
+                    }
+                }
+            }
+            if(baseCdn.length() == 0){
+                Object cd = m.get("cdn");
+                if(cd instanceof List){
+                    for(Object c : (List) cd){
+                        String d = s(c);
+                        if(d.length() > 0){ baseCdn = d; break; }
+                    }
+                } else if(cd != null){
+                    baseCdn = s(cd);
+                }
+            }
         } else if(atlas instanceof List){
             listObj = atlas;
         }
         if(listObj instanceof List){
+            java.util.Set<String> seenPath = new java.util.HashSet<String>();
             for(Object it : (List) listObj){
+                String u = "";
                 if(it instanceof Map){
                     Map im = (Map) it;
-                    String u = s(im.get("url"));
+                    u = s(im.get("url"));
                     if(u.length() == 0) u = firstUrlOf(im.get("cdn"));
                     if(u.length() == 0) u = firstUrlOf(im.get("urls"));
-                    if(u.startsWith("http")) out.add(u);
                 } else if(it instanceof String){
-                    String u = (String) it;
-                    if(u.startsWith("http")) out.add(u);
+                    u = (String) it;
                 }
+                u = absUrl(u, baseCdn);
+                if(u.length() == 0) continue;
+                // 按路径去重：同图不同 CDN 只留一个
+                if(seenPath.add(urlPathKey(u))) out.add(u);
             }
         }
         return out;
+    }
+
+    /** 相对路径拼 CDN；已是 http 开头则原样返回 */
+    static String absUrl(String u, String baseCdn){
+        if(u == null || u.length() == 0) return "";
+        if(u.startsWith("http")) return u;
+        if(u.startsWith("//")) return "https:" + u;
+        if(baseCdn.length() == 0) return "";
+        if(u.startsWith("/")) return "https://" + baseCdn + u;
+        return "https://" + baseCdn + "/" + u;
+    }
+
+    /** [{url:"..."},...] 取所有 url（按文件路径去重：同图不同 CDN 只留一个） */
+    static List<String> urlsOf(Object arr){
+        List<String> out = new ArrayList<String>();
+        if(!(arr instanceof List)) return out;
+        java.util.Set<String> seenPath = new java.util.HashSet<String>();
+        for(Object o : (List) arr){
+            String u = "";
+            if(o instanceof Map) u = s(((Map) o).get("url"));
+            else if(o instanceof String) u = (String) o;
+            if(!u.startsWith("http")) continue;
+            String key = urlPathKey(u);
+            if(seenPath.add(key)) out.add(u);
+        }
+        return out;
+    }
+
+    /**
+     * URL 去重键：只取 path 部分，忽略 host 和 query。
+     * 快手同一张图会挂多个 CDN（p2/p3/p23.a.yximgs.com），
+     * 路径完全相同 → 是同一个文件，不能当两张图。
+     */
+    static String urlPathKey(String u){
+        try{
+            java.net.URL x = new java.net.URL(u);
+            String p = x.getPath();
+            return p != null && p.length() > 0 ? p : u;
+        }catch(Throwable t){
+            int q = u.indexOf('?');
+            return q > 0 ? u.substring(0, q) : u;
+        }
     }
 
     /** [{url:"..."},...] 或 ["http...", ...] */
