@@ -90,7 +90,12 @@ public class MainActivity extends Activity {
     static final String KEY_DL_ANIM  = "dl_anim";
     /** 兼容旧版单一自定义路径 key */
     static final String KEY_DL_PATH  = "dl_path";
-    static final String DYP_SRV_DEFAULT = SrvConfig.DEFAULT_SERVER;
+    /** 内置服务器默认地址。
+     *  取值来自 SrvSecret.serverAddr()（字节异或混淆，防 strings 直接提取），
+     *  不再使用 SrvConfig 的明文注入 —— 明文会让 `strings classes.dex`
+     *  直接暴露服务器 IP，等于把加速层地址公开。
+     *  开源仓库里 SrvSecret 是空壳（返回 ""），所以开源版天然无内置服务器。 */
+    static final String DYP_SRV_DEFAULT = SrvSecret.serverAddr();
 
     /** 该 URL 是否属于 TikTok 域（含其 CDN） */
     static boolean isTikTokUrl(String url){
