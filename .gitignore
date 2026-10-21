@@ -1,30 +1,23 @@
-# Build output
+
+# Build tools (auto-downloaded)；inject_srv.py 属于构建流程，需进仓库
+tools/r8.jar
+tools/*.jar
+
+# 内置服务器地址（仅本地编译用，不进开源仓库）
+secret_srv.txt
+
+# 私有凭据目录（真版 SrvSecret/SrvCert + 生成脚本，不进开源仓库）
+secret_src/
+
+# 服务器实现与凭据（server.py 含鉴权逻辑，uifid/auth/cert 含真实凭据）
+server/
+server/__pycache__/
+
+# 含真实凭据的混淆类：仓库里只留空壳占位版
+# （构建时由 secret_src/ 覆盖，构建完 build.sh 自动恢复空壳）
+
+# 构建产物
 build/
-*.apk
-*.ap_
-*.dex
 
-# Android SDK stub (local only)
-android.jar
-
-# Signing
-*.keystore
-!.debug.keystore
-*.jks
-release.properties
-keystore.properties
-
-# IDE
-.idea/
-*.iml
-.gradle/
-local.properties
-
-# Logs / temp
-*.log
-*.bak
-*.tmp
-.DS_Store
-
-# Reverse-engineering scratch
-reverse/
+# 本地 APK 存档（releases/encrypted=加密发布版；releases/plain=未加密原包防源码丢失）
+releases/
