@@ -8,50 +8,73 @@
     <LinearLayout
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:orientation="horizontal" android:gravity="center_vertical"
-        android:paddingLeft="18dp" android:paddingRight="10dp"
-        android:paddingTop="16dp" android:paddingBottom="10dp">
+        android:paddingLeft="20dp" android:paddingRight="12dp"
+        android:paddingTop="18dp" android:paddingBottom="12dp">
+
+        <!-- 品牌块：圆角小方块内放渐变点，替代原来的两段文字 -->
+        <View
+            android:layout_width="4dp" android:layout_height="24dp"
+            android:background="@drawable/brand_bar"/>
 
         <TextView
             android:layout_width="wrap_content" android:layout_height="wrap_content"
-            android:id="@+id/tvTitleDY" android:text="DY" android:textColor="@color/brand"
-            android:textStyle="bold" android:textSize="23sp"/>
+            android:layout_marginLeft="9dp"
+            android:id="@+id/tvTitleDY" android:text="解析器" android:textColor="@color/text"
+            android:textStyle="bold" android:textSize="22sp" android:letterSpacing="0.01"/>
         <TextView
             android:layout_width="wrap_content" android:layout_height="wrap_content"
-            android:id="@+id/tvTitle" android:text="解析器" android:textColor="@color/text"
-            android:textStyle="bold" android:textSize="23sp"/>
+            android:layout_marginLeft="7dp"
+            android:id="@+id/tvTitle" android:text="Pro" android:textColor="@color/brand"
+            android:textStyle="bold" android:textSize="13sp"
+            android:background="@drawable/pill_brand"
+            android:paddingLeft="7dp" android:paddingRight="7dp"
+            android:paddingTop="2dp" android:paddingBottom="2dp"/>
 
         <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
 
         <TextView android:id="@+id/btnTheme"
-            android:layout_width="40dp" android:layout_height="40dp"
+            android:layout_width="38dp" android:layout_height="38dp"
             android:background="@drawable/btn_icon" android:gravity="center"
-            android:text="暗" android:textColor="@color/text_sub" android:textSize="15sp"/>
-        <TextView android:id="@+id/btnAbout"
-            android:layout_width="wrap_content" android:layout_height="40dp"
+            android:text="暗" android:textColor="@color/text_sub" android:textSize="14sp"/>
+        <TextView android:id="@+id/btnSettings"
+            android:layout_width="38dp" android:layout_height="38dp"
             android:layout_marginLeft="4dp" android:background="@drawable/btn_icon"
-            android:gravity="center" android:paddingLeft="10dp" android:paddingRight="10dp"
-            android:text="关于" android:textColor="@color/text_sub"
-            android:textSize="14sp"/>
+            android:gravity="center"
+            android:text="设置" android:textColor="@color/text_sub" android:textSize="12sp"/>
     </LinearLayout>
 
     <!-- 输入区 -->
     <LinearLayout
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:paddingLeft="16dp" android:paddingRight="16dp">
+        android:paddingLeft="18dp" android:paddingRight="18dp">
+
+        <!-- 支持平台提示（让用户一眼知道能粘什么） -->
+        <TextView
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="支持 抖音 · 快手 · TikTok，可直接粘贴分享口令"
+            android:textColor="@color/text_hint" android:textSize="11sp"
+            android:paddingLeft="4dp" android:paddingBottom="8dp"/>
+
+        <!-- 服务器状态提示 -->
+        <TextView android:id="@+id/tvSrvInfo"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="内置服务器有效期至 2027-04-20"
+            android:textColor="@color/text_hint" android:textSize="10sp"
+            android:paddingLeft="4dp" android:paddingBottom="8dp"/>
 
         <EditText android:id="@+id/input"
-            android:layout_width="match_parent" android:layout_height="52dp"
+            android:layout_width="match_parent" android:layout_height="54dp"
             android:background="@drawable/input_bg" android:paddingLeft="16dp"
-            android:paddingRight="16dp" android:hint="粘贴抖音分享链接或口令"
+            android:paddingRight="16dp" android:hint="粘贴分享链接或口令"
             android:textColor="@color/text" android:textColorHint="@color/text_hint"
             android:textSize="14sp" android:singleLine="true" android:inputType="textUri"/>
 
         <TextView android:id="@+id/btn"
-            android:layout_width="match_parent" android:layout_height="50dp"
+            android:layout_width="match_parent" android:layout_height="52dp"
             android:layout_marginTop="12dp" android:background="@drawable/btn_primary"
-            android:gravity="center" android:text="解析" android:textColor="#FFFFFF"
-            android:textStyle="bold" android:textSize="16sp"/>
+            android:gravity="center" android:text="解 析" android:textColor="#FFFFFF"
+            android:textStyle="bold" android:textSize="16sp" android:letterSpacing="0.08"/>
 
         <TextView android:id="@+id/status"
             android:layout_width="match_parent" android:layout_height="wrap_content"
@@ -60,103 +83,161 @@
             android:paddingLeft="4dp"/>
     </LinearLayout>
 
-    <!-- 操作按钮 -->
+    <!-- 下载/转码进度条 -->
+    <LinearLayout android:id="@+id/progressBox"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:visibility="gone"
+        android:background="@drawable/card_progress"
+        android:layout_marginLeft="18dp" android:layout_marginRight="18dp"
+        android:layout_marginTop="2dp" android:layout_marginBottom="8dp"
+        android:paddingLeft="14dp" android:paddingRight="14dp"
+        android:paddingTop="11dp" android:paddingBottom="12dp">
+
+        <LinearLayout
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+
+            <TextView android:id="@+id/progressLabel"
+                android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="准备中"
+                android:textColor="@color/text_sub" android:textSize="12sp"/>
+
+            <TextView android:id="@+id/progressPct"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="0%" android:textColor="@color/brand"
+                android:textSize="12sp" android:textStyle="bold"/>
+        </LinearLayout>
+
+        <ProgressBar android:id="@+id/progressBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent" android:layout_height="6dp"
+            android:layout_marginTop="8dp" android:max="1000"
+            android:progress="0" android:progressDrawable="@drawable/progress_h"
+            android:progressTint="@color/brand"/>
+    </LinearLayout>
+
+    <!-- 操作按钮：4 个等分，主按钮突出 -->
     <LinearLayout android:id="@+id/actions"
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:orientation="horizontal" android:visibility="gone"
-        android:paddingLeft="16dp" android:paddingRight="16dp"
+        android:paddingLeft="18dp" android:paddingRight="18dp"
         android:paddingBottom="10dp">
+
         <TextView android:id="@+id/btnPlay"
-            android:layout_width="0dp" android:layout_height="42dp" android:layout_weight="1"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
             android:background="@drawable/btn_ghost" android:gravity="center"
-            android:text="播放" android:textColor="@color/text" android:textSize="14sp"/>
+            android:text="播放" android:textColor="@color/text" android:textSize="13sp"/>
         <TextView android:id="@+id/btnDl"
-            android:layout_width="0dp" android:layout_height="42dp" android:layout_weight="1"
-            android:layout_marginLeft="8dp" android:background="@drawable/btn_ghost"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginLeft="7dp" android:background="@drawable/btn_ghost"
             android:gravity="center" android:text="下载" android:textColor="@color/text"
-            android:textSize="14sp"/>
+            android:textSize="13sp"/>
         <TextView android:id="@+id/btnFull"
-            android:layout_width="0dp" android:layout_height="42dp" android:layout_weight="1"
-            android:layout_marginLeft="8dp" android:background="@drawable/btn_primary"
-            android:gravity="center" android:text="全屏播放" android:textColor="#FFFFFF"
-            android:textSize="14sp" android:textStyle="bold"/>
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginLeft="7dp" android:background="@drawable/btn_primary"
+            android:gravity="center" android:text="全屏" android:textColor="#FFFFFF"
+            android:textSize="13sp" android:textStyle="bold"/>
+        <TextView android:id="@+id/btnAudio"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginLeft="7dp" android:background="@drawable/btn_ghost"
+            android:gravity="center" android:text="转MP3" android:textColor="@color/text"
+            android:textSize="13sp"/>
+        <TextView android:id="@+id/btnMusic"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginLeft="7dp" android:background="@drawable/btn_ghost"
+            android:gravity="center" android:text="BGM" android:textColor="@color/text"
+            android:textSize="13sp" android:visibility="gone"/>
     </LinearLayout>
 
-    <!-- 视频区 -->
-    <FrameLayout android:id="@+id/videoBox"
-        android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:layout_marginLeft="16dp" android:layout_marginRight="16dp"
-        android:background="@color/player_bg" android:visibility="gone">
-
-        <TextureView android:id="@+id/video"
-            android:layout_width="match_parent" android:layout_height="210dp"/>
-
-        <LinearLayout android:id="@+id/miniBar"
-            android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_gravity="bottom" android:background="@drawable/bg_bar"
-            android:orientation="vertical" android:paddingLeft="10dp"
-            android:paddingRight="10dp" android:paddingTop="16dp"
-            android:paddingBottom="6dp">
-
-            <LinearLayout android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal" android:gravity="center_vertical">
-                <TextView android:id="@+id/miniTimeNow"
-                    android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:text="00:00" android:textColor="@color/white" android:textSize="10sp"/>
-                <SeekBar android:id="@+id/miniSeek"
-                    android:layout_width="0dp" android:layout_height="wrap_content"
-                    android:layout_weight="1" android:layout_marginLeft="8dp"
-                    android:layout_marginRight="8dp" android:max="1000"
-                    android:progressDrawable="@drawable/seek_progress"
-                    android:thumb="@drawable/seek_thumb" android:splitTrack="false"/>
-                <TextView android:id="@+id/miniTimeAll"
-                    android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:text="00:00" android:textColor="@color/white_sub" android:textSize="10sp"/>
-            </LinearLayout>
-
-            <LinearLayout android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal" android:gravity="center_vertical">
-                <TextView android:id="@+id/miniPlay"
-                    android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:padding="6dp" android:text="||" android:textColor="@color/white"
-                    android:textSize="16sp" android:textStyle="bold"/>
-                <TextView android:id="@+id/miniSpeed"
-                    android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:padding="6dp" android:text="1.0X" android:textColor="@color/white"
-                    android:textSize="11sp" android:textStyle="bold"/>
-                <View android:layout_width="0dp" android:layout_height="1dp"
-                    android:layout_weight="1"/>
-                <TextView android:id="@+id/miniFull"
-                    android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:padding="6dp" android:text="全屏" android:textColor="@color/white"
-                    android:textSize="12sp"/>
-            </LinearLayout>
-        </LinearLayout>
-    </FrameLayout>
-
-    <!-- 图片区 -->
-    <FrameLayout
-        android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:layout_marginLeft="16dp" android:layout_marginRight="16dp">
-
-        <ImageView android:id="@+id/img"
-            android:layout_width="match_parent" android:layout_height="280dp"
-            android:background="@color/surface_alt" android:scaleType="fitCenter"
-            android:visibility="gone"/>
-    </FrameLayout>
-
-    <!-- 解析结果卡片列表 -->
+    <!-- 视频区 + 图片区 + 结果卡片：同一个 ScrollView，整页一起滚 -->
     <ScrollView android:id="@+id/scrollOut"
         android:layout_width="match_parent" android:layout_height="0dp"
-        android:layout_weight="1" android:paddingLeft="16dp"
-        android:paddingRight="16dp" android:paddingTop="10dp"
-        android:paddingBottom="16dp" android:scrollbars="none">
+        android:layout_weight="1" android:scrollbars="none"
+        android:overScrollMode="never">
 
-        <LinearLayout android:id="@+id/out"
+        <LinearLayout
             android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="vertical"/>
+            android:orientation="vertical"
+            android:paddingLeft="18dp" android:paddingRight="18dp"
+            android:paddingTop="10dp" android:paddingBottom="18dp">
+
+            <FrameLayout android:id="@+id/videoBox"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:background="@drawable/card_player" android:visibility="gone">
+
+                <TextureView android:id="@+id/video"
+                    android:layout_width="match_parent" android:layout_height="210dp"/>
+
+                <LinearLayout android:id="@+id/miniBar"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_gravity="bottom" android:background="@drawable/bg_bar"
+                    android:orientation="vertical" android:paddingLeft="12dp"
+                    android:paddingRight="12dp" android:paddingTop="16dp"
+                    android:paddingBottom="8dp">
+
+                    <LinearLayout android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:id="@+id/miniTimeNow"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="00:00" android:textColor="@color/white" android:textSize="10sp"/>
+                        <SeekBar android:id="@+id/miniSeek"
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:layout_marginLeft="8dp"
+                            android:layout_marginRight="8dp" android:max="1000"
+                            android:progressDrawable="@drawable/seek_progress"
+                            android:thumb="@drawable/seek_thumb" android:splitTrack="false"/>
+                        <TextView android:id="@+id/miniTimeAll"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="00:00" android:textColor="@color/white_sub" android:textSize="10sp"/>
+                    </LinearLayout>
+
+                    <LinearLayout android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:id="@+id/miniPlay"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:padding="6dp" android:text="||" android:textColor="@color/white"
+                            android:textSize="16sp" android:textStyle="bold"/>
+                        <TextView android:id="@+id/miniSpeed"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:padding="6dp" android:text="1.0X" android:textColor="@color/white"
+                            android:textSize="11sp" android:textStyle="bold"/>
+                        <View android:layout_width="0dp" android:layout_height="1dp"
+                            android:layout_weight="1"/>
+                        <TextView android:id="@+id/miniFull"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:padding="6dp" android:text="全屏" android:textColor="@color/white"
+                            android:textSize="12sp"/>
+                    </LinearLayout>
+                </LinearLayout>
+            </FrameLayout>
+
+            <!-- 图片区 -->
+            <FrameLayout
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="10dp">
+
+                <ImageView android:id="@+id/img"
+                    android:layout_width="match_parent" android:layout_height="280dp"
+                    android:background="@color/surface_alt" android:scaleType="fitCenter"
+                    android:visibility="gone"/>
+
+                <!-- 实况角标：这张图有短视频版本，可存为 MP4 -->
+                <TextView android:id="@+id/liveBadge"
+                    android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:layout_gravity="top|start" android:layout_margin="10dp"
+                    android:background="#B3000000" android:paddingLeft="9dp" android:paddingRight="9dp"
+                    android:paddingTop="3dp" android:paddingBottom="3dp"
+                    android:textColor="#FFFFFF" android:text="LIVE" android:textSize="11sp"
+                    android:textStyle="bold" android:visibility="gone"/>
+            </FrameLayout>
+
+            <!-- 解析结果卡片列表 -->
+            <LinearLayout android:id="@+id/out"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical"/>
+        </LinearLayout>
     </ScrollView>
 
     <WebView android:id="@+id/web"
