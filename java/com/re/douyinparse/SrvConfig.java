@@ -11,5 +11,10 @@ package com.re.douyinparse;
  * 开源仓库只保留 &lt;INJECT_SERVER&gt; 占位符，不暴露真实服务器地址。
  */
 public final class SrvConfig {
-    public static final String DEFAULT_SERVER = "<INJECT_SERVER>";
+    /**
+     * 已废弃：不再使用明文注入。
+     * 内置服务器地址请用 SrvSecret.serverAddr()（字节异或混淆，防 strings 提取）。
+     * 这里恒为占位符，避免任何构建路径把真实 IP 写进 DEX 明文字符串表。
+     */
+    public static final String DEFAULT_SERVER = "";
 }
