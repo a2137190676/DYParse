@@ -3,6 +3,72 @@
 本文记录每个版本的变更内容。版本号遵循 `major.minor.patch`，对应 `versionCode = major*10000 + minor*100 + patch`。
 
 ---
+## v1.3.3 (2026-10-21)
+
+本次为**实况照片封装 + 动图目录**版本。
+
+### 新增
+
+**实况照片封装（真·Motion Photo）**
+- 抖音实况图不再只导出 MP4，封装成相册可识别的实况照片（单个 `.jpg`）
+- 采用 Google Motion Photo **V2** 格式：`GCamera:MotionPhoto="1"`
+- 同时写 `OpCamera:OLivePhotoVersion="2"` / `MotionPhotoOwner="oplus"` / `VideoLength`，兼容 OPPO / 一加 / 华为图库
+- 文件布局 `[SOI][XMP APP1][JPEG 剩余][MP4]`，华为图库顶部显示「实况」标签，长按可播放
+- 静态图自动转 JPEG（抖音给的是 WEBP，直接拼相册不认）
+
+**「动图」独立目录**
+- 实况照片存到 `Download/DYParse/动图/`，与普通图片分开
+- 路径可自定义：设置 → 下载路径 → 动图目录
+- 「修复媒体库」同步覆盖该目录
+
+**多选下载**
+- 多图 / 多实况：弹窗列出每张，标注「图片」或「实况→动图/」，默认勾选当前，支持全选
+- 视频合集：可选择下载第几集，文件名格式 `标题_第N集_时间戳.mp4`
+- 下载完成显示**实际保存路径**，不再只显示分类名
+
+**快手增强**
+- 图文解析：`photoType=SINGLE_PICTURE`，图片取自 `coverUrls`
+- live 图集解析：`photoType=HORIZONTAL_ATLAS`，图片在 `ext_params.atlas.list[]`（相对路径），自动拼 `cdnList` 域名
+- 背景音乐适配：分享页给的完整音轨 m4a 直接作为 BGM 下载
+- 同一文件的多 CDN 备份按 URL path 去重，不再识别成多张
+
+### 优化
+
+**更新策略（不再强制）**
+- 弹窗改为三选：`立即更新` / `浏览器打开` / `下个版本再提醒`
+- 选「下个版本再提醒」记下当前版本号，该版本及以下不再弹窗
+- 手动点「检查更新」时无视该记录，一定会弹
+- 保留强制更新能力：服务端 `version.json` 下发 `force:1` 或 `min_version`，低于该版本必须更新，弹窗只有「立即更新 / 退出」
+
+**媒体库**
+- 下载成功后自动调用 `MediaScannerConnection.scanFile`，相册立即可见
+- 新增「设置 → 修复媒体库」：递归扫描下载目录（含自定义分类目录），批量补录历史文件
+
+**图片后缀修正**
+- 读文件头判断真实格式：`FF D8 FF` 保持 `.jpg`，`RIFF....WEBP` 改 `.webp`，`89 50 4E 47` 改 `.png`
+- 实况照片（`ff d8 ff e1`）不受影响
+
+### 修复
+
+- **相册看不到已下载文件**：代码里从未通知媒体库，文件在磁盘但不在 MediaStore
+- **连续解析残留上一次结果**：`parse()` 现在重置 18 个状态字段
+- **先解析图文再解析实况，实况退化为静态图**：根因是 WebView SSR 抢先置 `webDone` 导致 detail 结果被丢弃。新增 `detailRendered` 标记 + `renderGen` 渲染代次，只允许最新代次改界面
+- **图片点不开大图**：`OnTouchListener` 消费了触摸事件导致 `OnClick` 不触发，改回 `OnClickListener`
+- 实况图 `dynS` 分隔符错位：第 1 张是静态图时，第 2 张的动轨地址被塞到第 1 个位置
+- 快手图文/live 图集解析失败（`INIT_STATE 里没找到 photo 节点`）
+
+### 已知限制
+
+- **快手合集无法抓全**：网页端不下发合集列表
+  - 分享页 `subBiz=BROWSE_SLIDE_PHOTO` 时只有当前一集
+  - `subBiz=KS_HEJI_SHARE` 时也只有被分享的那一集
+  - 全集接口（`collection/list`、`heji/list`、`photo/collection` 等）全部 404
+  - 唯一存在的 `wd/photo/info` 返回 `2001 antispam need captcha`
+  - 结论：只能逐集分享、逐条解析
+- **快手不下发动图轨道**：`mainMvUrls` 恒为空，`sameFrame.allow=false`，atlas 路径改 `.mp4`/`.gif`/`.mov` 全 404。作者标 `#live实况动图` 也一样，只能存静态图
+- TikTok CDN 直连需代理（平台限制，非 App 问题）
+
+---
 ## v1.3.1 (2026-10-20)
 
 本次为**内置服务器加速 + 整页滚动优化**版本。
