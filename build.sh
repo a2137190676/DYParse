@@ -117,7 +117,10 @@ else
   fi
 fi
 
-python3 tools/inject_srv.py || { echo '[ERR] inject_srv 失败'; exit 4; }
+# 注意：不再调用 tools/inject_srv.py 往 SrvConfig 写明文地址。
+# 明文地址会让 `strings classes.dex` 直接暴露服务器 IP，
+# 内置地址统一由 SrvSecret.serverAddr() 提供（字节异或混淆）。
+# SrvConfig 保留占位符仅为兼容旧引用，DEFAULT_SERVER 恒为 <INJECT_SERVER>。
 
 # ---------- 1. 解包 AAR ----------
 rm -rf "$BUILD/aars" "$BUILD/res-overlays" "$BUILD/gen" "$BUILD/obj" "$BUILD/dex" \
@@ -354,20 +357,19 @@ fi
 rm -f "$BUILD/app-res.apk" "$BUILD/app-unsigned.apk" "$BUILD/app-repacked.apk" \
       "$BUILD/app-aligned.apk" "$BUILD/lib.zip"
 
-# 恢复 SrvConfig.java 为占位符（真实地址只留在编译产物里，不进源码/仓库）
+# 恢复 SrvConfig.java 为空值（不再写明文地址，也不写占位符）
 python3 - "$BUILD" <<'PY'
 import os, sys
 src = os.path.join("java", "com", "re", "douyinparse", "SrvConfig.java")
 with open(src, encoding="utf-8") as f:
     code = f.read()
-mark = '"<INJECT_SERVER>"'
 i = code.find('public static final String DEFAULT_SERVER =')
 if i >= 0:
     j = code.find(';', i)
-    code = code[:i] + 'public static final String DEFAULT_SERVER = ' + mark + code[j:]
-with open(src, "w", encoding="utf-8") as f:
-    f.write(code)
-print("       SrvConfig.java restored to placeholder")
+    code = code[:i] + 'public static final String DEFAULT_SERVER = ""' + code[j:]
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(code)
+print("       SrvConfig.java restored to empty")
 PY
 
 # 恢复 SrvSecret/SrvCert/SrvClient 为空壳占位版（真版/.empty 版只存在于 secret_src/，防误提交）
