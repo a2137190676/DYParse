@@ -151,10 +151,18 @@ public class PlayerActivity extends Activity {
 
     void initPlayer(){
         try{
+            String ref = nz(getIntent() != null ? getIntent().getStringExtra("ref") : null);
+            if(ref.length() == 0){
+                ref = (url.indexOf("tiktok") >= 0) ? "https://www.tiktok.com/"
+                    : (url.indexOf("kwimgs.com") >= 0 || url.indexOf("yximgs.com") >= 0
+                       || url.indexOf("ndcimgs.com") >= 0 || url.indexOf("kuaishou") >= 0)
+                      ? "https://www.kuaishou.com/" : "https://www.douyin.com/";
+            }
+            final String referer = ref;
             DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
-                .setUserAgent(MUA)
-                .setDefaultRequestProperties(new java.util.HashMap<String,String>(){{ put("Referer", "https://www.douyin.com/"); }})
-                .setAllowCrossProtocolRedirects(true);
+                    .setUserAgent(MUA)
+                    .setDefaultRequestProperties(new java.util.HashMap<String,String>(){{ put("Referer", referer); }})
+                    .setAllowCrossProtocolRedirects(true);
 
             player = new ExoPlayer.Builder(this)
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(http))
@@ -466,7 +474,11 @@ public class PlayerActivity extends Activity {
             r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
             r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
             r.addRequestHeader("User-Agent", MUA);
-            r.addRequestHeader("Referer", "https://www.douyin.com/");
+            String ref = "https://www.douyin.com/";
+            if(d.indexOf("tiktok") >= 0) ref = "https://www.tiktok.com/";
+            else if(d.indexOf("kwimgs.com") >= 0 || d.indexOf("yximgs.com") >= 0
+                    || d.indexOf("ndcimgs.com") >= 0 || d.indexOf("kuaishou") >= 0) ref = "https://www.kuaishou.com/";
+            r.addRequestHeader("Referer", ref);
             dm.enqueue(r);
             showHint("\u5df2\u52a0\u5165\u4e0b\u8f7d\uff1aDownload/" + name, 2200);
         }catch(Exception e){ Log.i(TAG, "DL_ERR " + e); showHint("\u4e0b\u8f7d\u5931\u8d25", 1500); }
