@@ -37,6 +37,15 @@ public class MainActivity extends Activity {
     String curBgmTitle = "";
     /** 实况角标（LIVE），图集里标出哪张能存成 MP4 */
     TextView liveBadge;
+    /** X（Twitter）多视频：一条推可带 2~4 个视频，下载前让用户选第几个 */
+    final java.util.List<String> curXVideos = new java.util.ArrayList<String>();
+    final java.util.List<String> curXVidDur = new java.util.ArrayList<String>();
+    final java.util.List<String> curXVidSize = new java.util.ArrayList<String>();
+    /** 服务器机场流量是否可用（false = 需要用户自己挂代理） */
+    boolean xSrvUsable = true;
+    String xSrvReason = "";
+    /** X 直连播放失败 → 已回退过服务器中转，防止无限循环 */
+    boolean xSrvFallbackDone = false;
     // 小窗播放器（ExoPlayer + TextureView）
     android.view.TextureView video;
     android.view.Surface videoSurface;
@@ -61,6 +70,8 @@ public class MainActivity extends Activity {
     long miniLastTapTime = 0;
     float miniLastTapX = 0;
     String curPlay="", curCover="", curWs="", curImgs="", curId="", curDesc="";
+    /** YouTube direct：独立音轨直链（itag 140 m4a），与 curPlay 合并播放/下载 */
+    String curAudio="";
     /** 快手：分享页给的独立音轨 m4a，非空时优先用它转 MP3 */
     String curMusic="";
     String curShowImg="";
@@ -105,11 +116,19 @@ public class MainActivity extends Activity {
             || u.contains("byteoversea") || u.contains("ibytedtos") || u.contains("muscdn");
     }
 
+    /** 该 URL 是否属于 X / Twitter 域（含其 CDN 与解析镜像） */
+    static boolean isXDomain(String url){
+        return XParser.isXUrl(url)
+            || (url != null && (url.contains("twimg.com") || url.contains("fxtwitter.com")));
+    }
+
     /** 依据「仅 TikTok」开关决定这条 URL 要不要走代理 */
     static boolean proxyFor(String url, SharedPreferences p){
         if(p == null) return true;
         if(!p.getBoolean(KEY_PROXY_TT_ONLY, false)) return true;   // 全局模式：都走
-        return isTikTokUrl(url);
+        // 「仅境外平台」模式：TikTok、X、YouTube（含 googlevideo CDN）都算境外，走代理
+        return isTikTokUrl(url) || isXDomain(url) || YtParser.isYtUrl(url)
+            || (url != null && url.contains("googlevideo.com"));
     }
 
     /** 读代理配置：返回 null 表示不用代理 */
@@ -314,6 +333,8 @@ public class MainActivity extends Activity {
         // WebView 改为懒加载：抖音解析时才初始化，避免拖慢冷启动
         web=(WebView)findViewById(R.id.web);
         actions=(LinearLayout)findViewById(R.id.actions);
+        // 双页签：解析 / 历史
+        setupTabs();
         btnPlay=(TextView)findViewById(R.id.btnPlay);
         btnDl=(TextView)findViewById(R.id.btnDl);
         btnFull=(TextView)findViewById(R.id.btnFull);
@@ -530,6 +551,130 @@ public class MainActivity extends Activity {
         });
         web.setWebChromeClient(new WebChromeClient());
         web.addJavascriptInterface(new Bridge(), "DyBridge");
+    }
+
+    /** 三页签初始化：解析 / 列表 / 历史 */
+    View pageParse, pageHistory, pageList;
+    LinearLayout historyWrap, listWrap;
+    TextView historyEmpty, listHead, btnDlAll;
+    TextView tabParse, tabHistory, tabList;
+
+    void setupTabs(){
+        tabParse = (TextView)findViewById(R.id.tabParse);
+        tabList = (TextView)findViewById(R.id.tabList);
+        tabHistory = (TextView)findViewById(R.id.tabHistory);
+        pageParse = findViewById(R.id.pageParse);
+        pageList = findViewById(R.id.pageList);
+        pageHistory = findViewById(R.id.pageHistory);
+        historyWrap = (LinearLayout)findViewById(R.id.historyWrap);
+        historyEmpty = (TextView)findViewById(R.id.historyEmpty);
+        listWrap = (LinearLayout)findViewById(R.id.listWrap);
+        listHead = (TextView)findViewById(R.id.listHead);
+        btnDlAll = (TextView)findViewById(R.id.btnDlAll);
+        tabParse.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(0); }});
+        tabList.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(1); }});
+        tabHistory.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(2); }});
+        switchTab(0);
+        refreshHistory();
+    }
+
+    void switchTab(int idx){
+        try{
+            boolean dark = isDarkMode();
+            int textC = dark ? 0xFFE8EAF0 : 0xFF1A1C22;
+            int hintC = dark ? 0xFF8A8F9C : 0xFF9AA0AC;
+            pageParse.setVisibility(idx == 0 ? View.VISIBLE : View.GONE);
+            pageList.setVisibility(idx == 1 ? View.VISIBLE : View.GONE);
+            pageHistory.setVisibility(idx == 2 ? View.VISIBLE : View.GONE);
+            TextView[] tabs = {tabParse, tabList, tabHistory};
+            for(int i = 0; i < tabs.length; i++){
+                if(i == idx){
+                    tabs[i].setBackground(makeRoundRect(0x1AFE2C55, 0, 10));
+                    tabs[i].setTextColor(textC);
+                    tabs[i].setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                } else {
+                    tabs[i].setBackground(makeRoundRect(0x0DFFFFFF, 0x14FFFFFF, 10));
+                    tabs[i].setTextColor(hintC);
+                    tabs[i].setTypeface(android.graphics.Typeface.DEFAULT);
+                }
+            }
+            if(idx == 2) refreshHistory();
+        }catch(Throwable t){ Log.i("DYP", "TAB_ERR " + t); }
+    }
+
+    /** 历史页刷新：显示下载记录（文件名 + 时间） */
+    void refreshHistory(){
+        if(historyWrap == null || historyEmpty == null) return;
+        // 清掉除空状态外的所有子 view
+        for(int i = historyWrap.getChildCount() - 1; i >= 0; i--){
+            View v = historyWrap.getChildAt(i);
+            if(v != historyEmpty) historyWrap.removeView(v);
+        }
+        java.io.File root = new java.io.File(dlRootDir());
+        java.util.List<java.io.File> files = new java.util.ArrayList<java.io.File>();
+        collectFiles(root, files, 0);
+        if(files.isEmpty()){
+            historyEmpty.setVisibility(View.VISIBLE);
+            return;
+        }
+        historyEmpty.setVisibility(View.GONE);
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US);
+        for(int i = 0; i < files.size() && i < 100; i++){
+            final java.io.File f = files.get(i);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setBackground(makeRoundRect(curDark ? 0xFF24272F : 0xFFFFFFFF, curDark ? 0xFF333842 : 0xFFE1E4E9, 12));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = dp(8);
+            row.setLayoutParams(lp);
+
+            TextView name = new TextView(this);
+            name.setText(f.getName());
+            name.setTextSize(13);
+            name.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+            name.setSingleLine(true);
+            name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            name.setLayoutParams(nlp);
+
+            TextView meta = new TextView(this);
+            meta.setText(fmt.format(new java.util.Date(f.lastModified()))
+                    + "  " + InnerDownloader.sizeText(f.length()));
+            meta.setTextSize(11);
+            meta.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+            meta.setPadding(dp(8), 0, 0, 0);
+
+            row.addView(name);
+            row.addView(meta);
+            row.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                showHintToast("文件：" + f.getAbsolutePath());
+            }});
+            historyWrap.addView(row);
+        }
+    }
+
+    /** 递归收集下载目录里的文件（按时间倒序） */
+    void collectFiles(java.io.File dir, java.util.List<java.io.File> out, int depth){
+        if(dir == null || !dir.exists() || depth > 4) return;
+        java.io.File[] fs = dir.listFiles();
+        if(fs == null) return;
+        java.util.Arrays.sort(fs, new java.util.Comparator<java.io.File>(){
+            public int compare(java.io.File a, java.io.File b){
+                return Long.compare(b.lastModified(), a.lastModified());
+            }
+        });
+        for(java.io.File f : fs){
+            if(f.isDirectory()){
+                collectFiles(f, out, depth + 1);
+            } else if(f.getName().endsWith(".mp4") || f.getName().endsWith(".mp3")
+                    || f.getName().endsWith(".m4a") || f.getName().endsWith(".jpg")
+                    || f.getName().endsWith(".png")){
+                out.add(f);
+            }
+        }
     }
 
     /** onCreate 的后半段：按钮与手势（与 WebView 无关，立即执行） */
@@ -1848,15 +1993,25 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             });
 
             if(ok){
-                progSet(1f, "下载完成，正在安装");
-                s("下载完成，正在安装...");
+                progSet(1f, "下载完成");
                 h.post(new Runnable(){ public void run(){
-                    showHintToast("下载完成，正在拉起安装器");
-                }});
-                h.postDelayed(new Runnable(){ public void run(){
                     progHide();
-                    installApk();
-                }}, 700);
+                    // 弹「立即安装」对话框，用户点一下才拉起安装器
+                    // （避免自动拉起被 ROM 拦截后用户找不到安装入口）
+                    new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setTitle("下载完成")
+                        .setMessage("新版本已下载完成。\n\n"
+                            + "点击「立即安装」开始安装。\n"
+                            + "如果系统拦截了安装请求，也可以稍后在设置里重新检查更新再装。")
+                        .setPositiveButton("立即安装", new android.content.DialogInterface.OnClickListener(){
+                            public void onClick(android.content.DialogInterface d, int w){
+                                installApk();
+                            }
+                        })
+                        .setNegativeButton("稍后", null)
+                        .show();
+                    s("下载完成，点击弹窗安装");
+                }});
             } else {
                 s("更新下载失败");
                 progHide();
@@ -1930,10 +2085,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 
     /** 「安装未知应用」未授权时的引导弹窗 */
     void showInstallPermissionDialog(){
+        pendingInstallApk = true;
         new android.app.AlertDialog.Builder(this)
             .setTitle("需要安装权限")
             .setMessage("系统尚未允许本应用安装 APK。\n\n"
-                + "请在接下来的页面里找到「DY解析器」，打开「允许安装未知应用」，然后返回重试。\n\n"
+                + "请在接下来的页面里找到「DY解析器」，打开「允许安装未知应用」，然后返回本应用，会自动继续安装。\n\n"
                 + "也可以手动到「设置 → 应用 → 特殊权限 → 安装未知应用」中开启。")
             .setPositiveButton("去开启", new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int w){
@@ -2069,14 +2225,34 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             new Runnable(){ public void run(){ checkUpdate(false); }});
     }
 
-    /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
+/** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v1.3.3】实况照片 + 动图目录\n"
-          + "新增\n"
-          + "· 实况照片封装：抖音实况存成真·Motion Photo，相册长按可播\n"
-          + "· 「动图」下载目录：实况单独存放，路径可自定义\n"
-          + "· 多图/实况多选下载：可选择下载第几张\n"
+            "【v1.3.4】主页列表 + 三页签 + 境外直连优化\n"
+           + "新增\n"
+           + "· 主页列表：YouTube 频道 / TikTok 用户 / X 主页\n"
+           + "· 主页作品逐条下载 + 全部下载（自动解析直链）\n"
+           + "· 三页签布局：解析 / 列表 / 历史\n"
+           + "· 历史页：下载记录卡片（文件名 + 时间 + 大小）\n"
+           + "· X 外链卡片深挖：纯卡片推也能挖出视频\n"
+           + "· 安装权限授权后自动继续安装 + 「立即安装」按钮\n"
+           + "· 各平台最高画质：X formats 挑最高码率\n"
+           + "优化\n"
+           + "· X 挂代理 → 直连解析/下载，不烧机场流量\n"
+           + "· X 直连失败自动回退服务器中转\n"
+           + "· 服务器中转强制直连（不套用户代理）\n"
+           + "· 大视频下载前提醒（代理优先 / 服务器兜底）\n"
+           + "· 服务器 fetch_media 并发锁（修复 502）\n"
+           + "修复\n"
+           + "· X 视频没画面没时长（Referer + 代理失效回退）\n"
+           + "· TikTok 主页下载 502（服务器并发竞态）\n"
+           + "· 更新安装权限二次调用失败\n"
+            + "· 播放器 googlevideo Referer 错误";
+    }
+    static String changelogOld(){
+        return
+              "【v1.3.3】实况照片 + 动图目录\n"
+           + "· 多图/实况多选下载：可选择下载第几张\n"
           + "· 视频合集按集下载，文件名自动带「第 N 集」\n"
           + "· 下载完成显示实际保存路径\n"
           + "· 快手图文 / live 图集解析（SINGLE_PICTURE / HORIZONTAL_ATLAS）\n"
@@ -2203,7 +2379,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             boolean on = p.getBoolean(KEY_PROXY_ON, false);
             String addr = p.getString(KEY_PROXY, "");
             boolean ttOnly = p.getBoolean(KEY_PROXY_TT_ONLY, false);
-            boolean applies = on && (!ttOnly || isTikTokUrl(url));
+            boolean applies = on && (!ttOnly || isTikTokUrl(url) || isXDomain(url) || YtParser.isYtUrl(url)
+                || (url != null && url.contains("googlevideo.com")));
             return on + "|" + applies + "|" + addr;
         }catch(Throwable t){ return "err"; }
     }
@@ -3204,11 +3381,30 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
 
     /** 取当前生效的服务器地址（用户自填 > 内置默认） */
     String effSrv(){
-        String s = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DYP_SRV, DYP_SRV_DEFAULT);
+        return effSrvS(this);
+    }
+
+    /** 静态版：给解析器用 */
+    static String effSrvS(Context ctx){
+        String s;
+        try{
+            s = ctx.getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DYP_SRV, DYP_SRV_DEFAULT);
+        }catch(Throwable t){
+            s = DYP_SRV_DEFAULT;
+        }
         if(s == null) s = "";
         s = s.trim();
         while(s.endsWith("/")) s = s.substring(0, s.length() - 1);
         return s;
+    }
+
+    /** 静态版：HMAC 鉴权密钥（来自 SrvSecret，异或混淆存储） */
+    static String srvHmacKeyS(Context ctx){
+        try{
+            return SrvSecret.hmacKey();
+        }catch(Throwable t){
+            return "";
+        }
     }
 
     /** 机场流量缓存（避免每次开设置都请求） */
@@ -3777,6 +3973,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             curDesc=gs(get(m,"i_desc"));
             curPlay=gs(get(m,"i_ws"));
             if(curPlay.length()==0) curPlay=gs(get(m,"i_play"));
+            // YouTube direct：独立音轨（googlevideo itag 140 m4a），播放器合并、下载后本地 mux
+            curAudio=gs(get(m,"i_audio"));
             curCover=gs(get(m,"i_cover"));
             curImgs=gs(get(m,"i_imgs"));
             String dyn=gs(get(m,"i_dyn"));
@@ -3814,6 +4012,24 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             // BGM：抖音 detail 给的完整背景音乐 MP3，单独下载，不当视频音轨用
             curBgm = gs(get(m,"i_bgm"));
             curBgmTitle = gs(get(m,"i_bgmTitle"));
+            // X 多视频：解析全部视频直链，下载时可逐个选
+            curXVideos.clear(); curXVidDur.clear(); curXVidSize.clear();
+            try{
+                if("X".equals(gs(get(m,"i_platform")))){
+                    String mix = gs(get(m,"i_mix"));
+                    if(mix.length() > 0){
+                        String[] xs = mix.split("\\|");
+                        String[] ds = gs(get(m,"i_mixDur")).split("\\|", -1);
+                        String[] ss = gs(get(m,"i_mixSize")).split("\\|", -1);
+                        for(int i = 0; i < xs.length; i++){
+                            if(xs[i].length() == 0) continue;
+                            curXVideos.add(xs[i]);
+                            curXVidDur.add(i < ds.length ? ds[i] : "");
+                            curXVidSize.add(i < ss.length ? ss[i] : "");
+                        }
+                    }
+                }
+            }catch(Throwable t){ Log.i("DYP", "XV_MIX_ERR " + t); }
             h.post(new Runnable(){ public void run(){
                 if(btnMusic != null){
                     if(curBgm != null && curBgm.length() > 0){
@@ -4024,6 +4240,21 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         // 兼容无协议的 v.kuaishou.com/xxxx
         m = Pattern.compile("(?:v\\.kuaishou\\.com|www\\.kuaishou\\.com|m\\.kuaishou\\.com|v\\.m\\.chenzhongtech\\.com)/[A-Za-z0-9_.-]+").matcher(t);
         if(m.find()) return "https://" + m.group();
+        // X / Twitter：x.com/{user}/status/{id}、twitter.com、t.co 短链
+        // 注意：X 链接常带 ?s=20 之类查询参数，字符集要含 ? = &
+        m = Pattern.compile("https?://(?:www\\.|mobile\\.)?(?:x\\.com|twitter\\.com)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
+        if(m.find()) return m.group();
+        m = Pattern.compile("https?://t\\.co/[A-Za-z0-9]+").matcher(t);
+        if(m.find()) return m.group();
+        // 兼容无协议的 x.com/.../status/...
+        m = Pattern.compile("(?:www\\.|mobile\\.)?(?:x\\.com|twitter\\.com)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
+        if(m.find()) return "https://" + m.group();
+        // YouTube：watch?v= / shorts / playlist / youtu.be
+        m = Pattern.compile("https?://(?:www\\.|m\\.)?(?:youtube\\.com|youtu\\.be)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
+        if(m.find()) return m.group();
+        // 兼容无协议的 youtu.be/xxx
+        m = Pattern.compile("(?:youtube\\.com|youtu\\.be)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
+        if(m.find()) return "https://" + m.group();
         // 兜底：任意 http 链接
         m = Pattern.compile("https?://[\\w./?=&%#@:+-]+").matcher(t);
         if(m.find()) return m.group();
@@ -4065,6 +4296,7 @@ void parse(){
         curWs = "";
         curBgm = "";
         curBgmTitle = "";
+        curXVideos.clear(); curXVidDur.clear(); curXVidSize.clear();
         ttSrvId = "";
         ttSrvRaw = "";
         ttSrvVideoOk = false;
@@ -4089,6 +4321,113 @@ void parse(){
     void loadForParse(final String url){
         curUrl = url;
         o("");
+        // 主页列表：YouTube @频道 / TikTok @用户 / X 用户名主页
+        if(isProfileUrl(url)){
+            s("解析主页列表...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final java.util.List<ProfileParser.ProfileItem> list = ProfileParser.resolveProfile(MainActivity.this, url);
+                final String err = ProfileParser.lastErr;
+                h.post(new Runnable(){ public void run(){
+                    if(list != null && !list.isEmpty()){
+                        webDone = true;
+                        showProfileList(list);
+                    } else {
+                        s("主页解析失败：" + (err.length() > 0 ? err : "未知错误"));
+                        showHintToast(err.length() > 0 ? err : "主页解析失败");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // YouTube：走服务器（yt-dlp + 机场代理），本地直连被 DNS 污染
+        if(YtParser.isYtUrl(url)){
+            s("解析 YouTube...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final YtParser.YtVideo v = YtParser.resolve(MainActivity.this, url);
+                Log.i("DYP", "YT_RESULT err=" + v.err + " ok=" + v.ok()
+                        + " id=" + v.id + " items=" + v.items.size());
+                h.post(new Runnable(){ public void run(){
+                    if(v.isPlaylist()){
+                        webDone = true;
+                        showYtPlaylist(v);
+                        return;
+                    }
+                    if(v.ok()){
+                        webDone = true;
+                        String r = render(v.toResultJson());
+                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        o(r);
+                        s("完成(YouTube)");
+                        if(!v.subUsable){
+                            showHintToast("服务器代理流量：" + (v.subReason.length() > 0
+                                    ? v.subReason : "不可用"));
+                        }
+                    } else {
+                        s("YouTube 解析失败");
+                        showHintToast(v.err.length() > 0 ? v.err : "YouTube 解析失败");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // X（Twitter）：纯 HTTP，fxtwitter + syndication 双源，不需要 WebView
+        if(XParser.isXUrl(url)){
+            s("解析 X...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final XParser.XVideo v = XParser.resolve(MainActivity.this, url);
+                Log.i("DYP", "X_RESULT err=" + v.err + " ok=" + v.ok()
+                        + " id=" + v.id + " videos=" + v.videos.size() + " imgs=" + v.images.size());
+                h.post(new Runnable(){ public void run(){
+                    if(v.ok()){
+                        webDone = true;
+                        xSrvUsable = v.serverUsable;
+                        xSrvReason = v.serverReason;
+                        String r = render(v.toResultJson());
+                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        o(r);
+                        if(v.hasVideo()){
+                            if(v.videos.size() > 1)
+                                s("完成(X) " + v.videos.size() + " 个视频 · 可逐个下载");
+                            else
+                                s("完成(X)");
+                        } else if(v.hasImages()){
+                            s("完成(X) " + v.images.size() + " 张图片");
+                        } else {
+                            s("完成(X) 纯文字推");
+                        }
+                        // 机场流量提醒：服务器中转不可用时告知用户自己挂代理
+                        if(!v.serverUsable){
+                            showHintToast("服务器代理流量：" + (v.serverReason.length() > 0
+                                    ? v.serverReason : "不可用") + "，下载请自行挂代理");
+                        }
+                    } else if(!v.ok() && v.cardUrl.length() > 0){
+                        // 纯卡片推（无媒体但有外链）：走服务器外链深挖
+                        s("推文无媒体，正在解析外链卡片…");
+                        new Thread(new Runnable(){ public void run(){
+                            final String r = resolveCardLink(v.cardUrl);
+                            h.post(new Runnable(){ public void run(){
+                                if(r != null && r.length() > 0){
+                                    webDone = true;
+                                    String rj = render(r);
+                                    Log.i("DYP", "RESULT_BEGIN\n" + rj + "\nRESULT_END");
+                                    o(rj);
+                                    s("完成(外链视频)");
+                                } else {
+                                    s("X 解析失败：推文无媒体，外链也没挖到视频");
+                                }
+                            }});
+                        }}).start();
+                    } else {
+                        s("X 解析失败：" + v.err);
+                        showHintToast(v.err.length() > 0 ? v.err : "X 解析失败");
+                    }
+                }});
+            }}).start();
+            return;
+        }
         // 快手：纯 HTTP 就能拿全，不需要 WebView（分享页 SSR 里 INIT_STATE 是明文 JSON）
         if(KsParser.isKsUrl(url) && !isTikTokUrl(url)){
             s("解析快手...");
@@ -4652,16 +4991,26 @@ void parse(){
             // 代理/Referer 可能随设置变化，URL 也换站，重建播放器
             boolean ttUrl = isTikTokUrl(curPlay);
             boolean ksUrl = KsParser.isKsUrl(curPlay);
+            boolean xUrl = isXDomain(curPlay) || isXDomain(curUrl);
+            boolean ytPlayUrl = YtParser.isYtUrl(curPlay) || YtParser.isYtUrl(curUrl)
+                    || (curPlay != null && curPlay.contains("googlevideo.com"))
+                    || (curAudio != null && curAudio.contains("googlevideo.com"));
+            // 当前播放器用的 DataSource.Factory（双轨合并时复用）
+            final androidx.media3.datasource.DataSource.Factory[] dsf = new androidx.media3.datasource.DataSource.Factory[1];
             if(miniPlayer == null || miniProxyKey == null || miniProxyKey != proxyCacheKey(curPlay) || miniWasTT != ttUrl){
                 if(miniPlayer != null){ try{ miniPlayer.release(); }catch(Throwable t){} miniPlayer = null; }
-                String ref = ttUrl ? "https://www.tiktok.com/" : (ksUrl ? "https://www.kuaishou.com/" : "https://www.douyin.com/");
+                String ref = ttUrl ? "https://www.tiktok.com/"
+                    : (ksUrl ? "https://www.kuaishou.com/"
+                    : (xUrl ? "https://x.com/"
+                    : (ytPlayUrl ? "https://www.youtube.com/" : "https://www.douyin.com/")));
                 androidx.media3.datasource.DefaultHttpDataSource.Factory http =
                     new androidx.media3.datasource.DefaultHttpDataSource.Factory()
                         .setUserAgent(MUA)
                         .setDefaultRequestProperties(new HashMap<String,String>(){{ put("Referer", ref); }})
                         .setAllowCrossProtocolRedirects(true);
-                // 代理：按「仅 TikTok」开关决定
-                final Proxy pxPlay = curProxyFor(curPlay);
+                // 代理：按「仅 TikTok」开关决定；服务器中转地址强制直连（用户代理可能不通）
+                final Proxy pxPlay = (curPlay != null && (curPlay.indexOf("/api/x/dl") >= 0 || curPlay.indexOf("/api/yt/file") >= 0))
+                        ? null : curProxyFor(curPlay);
                 Log.i("DYP", "MINI_DS tt=" + ttUrl + " proxy=" + (pxPlay != null));
                 androidx.media3.datasource.DataSource.Factory f = http;
                 if(pxPlay != null){
@@ -4684,6 +5033,7 @@ void parse(){
                         }
                     };
                 }
+                dsf[0] = f;
                 miniPlayer = new androidx.media3.exoplayer.ExoPlayer.Builder(this)
                     .setMediaSourceFactory(new androidx.media3.exoplayer.source.DefaultMediaSourceFactory(f))
                     .build();
@@ -4697,7 +5047,17 @@ void parse(){
                             if(d > 0) miniTimeAll.setText(fmt(d));
                             miniPlay.setText("\u23f8");
                             Log.i("DYP", "MINI_READY dur=" + d);
-                        } else if(state == androidx.media3.common.Player.STATE_ENDED){
+                         } else if(state == androidx.media3.common.Player.STATE_BUFFERING){
+                             // 缓冲中：X/YouTube 走服务器中转，回源大视频可能要 1-2 分钟
+                             String tip = "缓冲中";
+                             if(isXDomain(curUrl)) tip = "缓冲中（服务器回源，稍等）";
+                             else if(YtParser.isYtUrl(curUrl)){
+                                 tip = ProxyPolicy.hasUserProxy(MainActivity.this)
+                                         ? "缓冲中（走你的代理直连 googlevideo，稍等）"
+                                         : "缓冲中（服务器解析回源，稍等）";
+                             }
+                             if(status != null) status.setText(tip);
+                         } else if(state == androidx.media3.common.Player.STATE_ENDED){
                             miniPlay.setText("\u25b6");
                         }
                     }
@@ -4715,6 +5075,32 @@ void parse(){
                                 + "这不是解析失败，是 TikTok 的 CDN 只放行住宅 IP。\n"
                                 + "换住宅节点，或点「关于 → 网络自检」看具体原因。";
                             h.post(new Runnable(){ public void run(){ s(msg); }});
+                        }
+                        // X 直连播放失败：用户的代理节点连不上 video.twimg.com → 自动回退服务器中转
+                        if((isXDomain(curUrl) || (curPlay != null && curPlay.contains("twimg.com")))
+                                && !xSrvFallbackDone && ProxyPolicy.hasUserProxy(MainActivity.this)){
+                            xSrvFallbackDone = true;
+                            final String fbUrl = curUrl;
+                            h.post(new Runnable(){ public void run(){
+                                s("X 直连播放失败，正在回退服务器中转…");
+                            }});
+                            new Thread(new Runnable(){ public void run(){
+                                final XParser.XVideo v = XParser.resolveServerOnly(MainActivity.this, fbUrl);
+                                h.post(new Runnable(){ public void run(){
+                                    if(v.ok() && v.hasVideo()){
+                                        Log.i("DYP", "X_SRV_FALLBACK render");
+                                        curPlay = v.firstVideo();
+                                        // 服务器中转地址：不走用户代理（走代理可能同样不通）
+                                        miniProxyKey = null;
+                                        try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                                        doPlay();
+                                    } else {
+                                        s("X 播放失败：你的代理节点连不上 X 视频 CDN。\n"
+                                          + "解决：设置 → 代理 换个境外节点；\n"
+                                          + "或关闭代理走服务器中转。");
+                                    }
+                                }});
+                            }}).start();
                         }
                     }
                 });
@@ -4741,7 +5127,32 @@ void parse(){
             } else {
                 Log.i("DYP", "MINI_NO_SURFACE");
             }
-            miniPlayer.setMediaItem(androidx.media3.common.MediaItem.fromUri(Uri.parse(curPlay)));
+            if(curAudio != null && curAudio.length() > 0 && curAudio.startsWith("http")){
+                // YouTube direct：视频轨 + 音频轨双 URL，用 MergingMediaSource 合并播放
+                Log.i("DYP", "MINI_MERGE audio=" + curAudio.substring(0, Math.min(60, curAudio.length())));
+                String base = curPlay;
+                androidx.media3.datasource.DataSource.Factory baseF = dsf[0];
+                if(baseF == null){
+                    // 播放器复用时没有重建 DataSource.Factory，用默认 HTTP（不带代理）
+                    // 这种情况只发生在同一代理配置下连播两条双轨视频，兜底即可
+                    baseF = new androidx.media3.datasource.DefaultHttpDataSource.Factory()
+                        .setUserAgent(MUA)
+                        .setAllowCrossProtocolRedirects(true);
+                }
+                androidx.media3.exoplayer.source.MediaSource.Factory mf =
+                        new androidx.media3.exoplayer.source.DefaultMediaSourceFactory(baseF);
+                // 音频轨复用同一 DataSource.Factory（同样走代理 + youtube Referer）
+                java.util.List<androidx.media3.common.MediaItem> items = new java.util.ArrayList<androidx.media3.common.MediaItem>();
+                items.add(androidx.media3.common.MediaItem.fromUri(Uri.parse(base)));
+                items.add(androidx.media3.common.MediaItem.fromUri(Uri.parse(curAudio)));
+                androidx.media3.exoplayer.source.MergingMediaSource mms =
+                        new androidx.media3.exoplayer.source.MergingMediaSource(
+                                mf.createMediaSource(items.get(0)),
+                                mf.createMediaSource(items.get(1)));
+                miniPlayer.setMediaSource(mms);
+            } else {
+                miniPlayer.setMediaItem(androidx.media3.common.MediaItem.fromUri(Uri.parse(curPlay)));
+            }
             miniPlayer.prepare();
             miniPlayer.setPlayWhenReady(true);
             s("\u64ad\u653e\u4e2d...");
@@ -4797,10 +5208,38 @@ void parse(){
             public boolean onSingleTapConfirmed(android.view.MotionEvent e){ return true; }
             public boolean onDoubleTap(android.view.MotionEvent e){ miniTogglePlay(); return true; }
         });
+        // 左右滑动：YouTube 播放列表切上一集/下一集；X 多视频切上一个/下一个
+        final android.view.GestureDetector gdFling = new android.view.GestureDetector(this,
+            new android.view.GestureDetector.SimpleOnGestureListener(){
+            public boolean onDown(android.view.MotionEvent e){ return false; }
+            public boolean onFling(android.view.MotionEvent a, android.view.MotionEvent b, float vx, float vy){
+                if(a == null || b == null) return false;
+                float dx = b.getX() - a.getX(), dy = b.getY() - a.getY();
+                if(Math.abs(dx) < 120 || Math.abs(dx) < Math.abs(dy)) return false;
+                if(dx < 0){
+                    // 左滑 → 下一集/下一个
+                    if(!ytPlaylist.isEmpty()){ ytNext(); return true; }
+                    if(curXVideos.size() > 1){
+                        // X 多视频：切换到下一个视频
+                        playXVideo(1);
+                        return true;
+                    }
+                } else {
+                    // 右滑 → 上一集/上一个
+                    if(!ytPlaylist.isEmpty()){ ytPrev(); return true; }
+                    if(curXVideos.size() > 1){
+                        playXVideo(-1);
+                        return true;
+                    }
+                }
+                return false;
+            }
+        });
 
         video.setOnTouchListener(new View.OnTouchListener(){
             public boolean onTouch(View v, android.view.MotionEvent ev){
                 gd.onTouchEvent(ev);
+                gdFling.onTouchEvent(ev);
                 switch(ev.getActionMasked()){
                     case android.view.MotionEvent.ACTION_DOWN:
                         miniDownX = ev.getX(); miniDownY = ev.getY();
@@ -4816,6 +5255,27 @@ void parse(){
                 return true;
             }
         });
+    }
+
+    /** X 多视频：切换播放第 N 个（相对偏移） */
+    int curXVideoIdx = 0;
+    void playXVideo(int delta){
+        if(curXVideos.isEmpty()) return;
+        int ni = curXVideoIdx + delta;
+        if(ni < 0) ni = 0;
+        if(ni >= curXVideos.size()) ni = curXVideos.size() - 1;
+        if(ni == curXVideoIdx){
+            showHintToast(delta > 0 ? "已经是最后一个视频" : "已经是第一个视频");
+            return;
+        }
+        curXVideoIdx = ni;
+        curPlay = curXVideos.get(ni);
+        try{
+            if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; }
+        }catch(Throwable t){}
+        startedUrl = "";
+        doPlay();
+        s("X 视频 " + (ni + 1) + "/" + curXVideos.size());
     }
 
     // 小窗播放器生命周期：切到后台自动暂停
@@ -4834,7 +5294,22 @@ void parse(){
     @Override protected void onResume(){
         super.onResume();
         try{ if(web != null) web.onResume(); }catch(Throwable t){}
+        // 从「安装未知应用」设置页返回且 APK 已就绪 → 自动继续安装
+        if(pendingInstallApk){
+            pendingInstallApk = false;
+            boolean can = false;
+            try{ can = getPackageManager().canRequestPackageInstalls(); }catch(Throwable t){}
+            if(can){
+                h.postDelayed(new Runnable(){ public void run(){
+                    s("权限已授予，继续安装...");
+                    installApk();
+                }}, 400);
+            }
+        }
     }
+
+    /** 权限引导页返回后要自动重试安装 */
+    boolean pendingInstallApk = false;
 
     @Override protected void onDestroy(){
         super.onDestroy();
@@ -5113,14 +5588,460 @@ void parse(){
             }});
         }}).start();
     }
+    /**
+     * X 多视频选择器：一条推带 2~4 个视频时，让用户选下载第几个。
+     * 文件名格式：x_{tweetId}_视频N_{时间戳}.mp4
+     */
+    void showXVideoPicker(){
+        final int n = curXVideos.size();
+        if(n == 0){ s("无视频"); return; }
+        final boolean[] sel = new boolean[n];
+        sel[0] = true;
+
+        String[] labels = new String[n];
+        for(int i = 0; i < n; i++){
+            StringBuilder lb = new StringBuilder();
+            lb.append("第 ").append(i + 1).append(" 个");
+            String sz = i < curXVidSize.size() ? curXVidSize.get(i) : "";
+            String du = i < curXVidDur.size() ? curXVidDur.get(i) : "";
+            StringBuilder meta = new StringBuilder();
+            if(sz.length() > 0) meta.append(sz);
+            if(du.length() > 0){
+                if(meta.length() > 0) meta.append("  ");
+                try{
+                    double d = Double.parseDouble(du);
+                    meta.append(String.format(java.util.Locale.US, "%.1fs", d));
+                }catch(Throwable t){ meta.append(du).append("s"); }
+            }
+            if(meta.length() > 0) lb.append("　").append(meta);
+            if(i == 0) lb.append("　（默认）");
+            labels[i] = lb.toString();
+        }
+
+        new android.app.AlertDialog.Builder(this)
+            .setTitle("选择要下载的视频（共 " + n + " 个）")
+            .setMultiChoiceItems(labels, sel,
+                new android.content.DialogInterface.OnMultiChoiceClickListener(){
+                    public void onClick(android.content.DialogInterface d, int which, boolean isChecked){
+                        sel[which] = isChecked;
+                    }
+                })
+            .setPositiveButton("下载所选", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    int cnt = 0;
+                    for(int i = 0; i < n; i++){
+                        if(!sel[i]) continue;
+                        downloadXVideo(i);
+                        cnt++;
+                    }
+                    if(cnt == 0){ s("未选择任何视频"); return; }
+                    if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
+                    s("已加入下载：" + cnt + " 个视频");
+                    Log.i("DYP", "XV_QUEUE n=" + cnt + " total=" + n);
+                }
+            })
+            .setNeutralButton("全选下载", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    for(int i = 0; i < n; i++) downloadXVideo(i);
+                    if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
+                    s("已加入下载：" + n + " 个视频");
+                    Log.i("DYP", "XV_QUEUE all n=" + n);
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /** 把第 idx 个 X 视频加入下载队列 */
+    void downloadXVideo(int idx){
+        if(idx < 0 || idx >= curXVideos.size()) return;
+        String u = curXVideos.get(idx);
+        String tag = "视频" + (idx + 1);
+        enqueueDownload(u, tag, "mp4", "视频");
+    }
+
+    /**
+     * YouTube 播放列表：卡片列表 + 点击解析单集。
+     * 解析后支持左右滑动切换上/下一集（同一播放列表内）。
+     */
+    java.util.List<YtParser.YtVideo.Item> ytPlaylist = new java.util.ArrayList<YtParser.YtVideo.Item>();
+    int ytIdx = 0;
+
+    void showYtPlaylist(final YtParser.YtVideo v){
+        ytPlaylist.clear();
+        ytPlaylist.addAll(v.items);
+        ytIdx = 0;
+        s("YouTube 播放列表 · " + ytPlaylist.size() + " 集 · 点标题解析单集");
+        StringBuilder sb = new StringBuilder();
+        sb.append("▶ 点这里解析第一集（列表太长时先点我）\n");
+        sb.append("┌── YouTube 播放列表 ──────────────\n");
+        for(int i = 0; i < ytPlaylist.size(); i++){
+            YtParser.YtVideo.Item it = ytPlaylist.get(i);
+            String t = it.title.length() > 40 ? it.title.substring(0, 40) + "…" : it.title;
+            sb.append(String.format(java.util.Locale.US, "【%d】%s  %ds\n",
+                    i + 1, t, it.durSec));
+        }
+        sb.append("└── 左右滑动播放器可切换上一集/下一集");
+        // 直接解析第 1 集（列表顶部提示 + 立即执行，避免按钮在屏幕外点不到）
+        o(sb.toString());
+        h.postDelayed(new Runnable(){ public void run(){
+            if(ytPlaylist.isEmpty()){
+                Log.i("DYP", "YT_AUTO_PARSE_FIRST skip: playlist empty");
+                return;
+            }
+            Log.i("DYP", "YT_AUTO_PARSE_FIRST n=" + ytPlaylist.size());
+            parseYtItem(0);
+        }}, 1500);
+    }
+
+    /** 解析播放列表里的第 idx 集（0 基） */
+    void parseYtItem(final int idx){
+        if(idx < 0 || idx >= ytPlaylist.size()){ s("没有这一集"); return; }
+        ytIdx = idx;
+        final YtParser.YtVideo.Item it = ytPlaylist.get(idx);
+        s("解析第 " + (idx + 1) + " 集...");
+        new Thread(new Runnable(){ public void run(){
+            final YtParser.YtVideo v = YtParser.resolve(MainActivity.this,
+                    "https://www.youtube.com/watch?v=" + it.id);
+            h.post(new Runnable(){ public void run(){
+                if(v.ok()){
+                    webDone = true;
+                    String r = render(v.toResultJson());
+                    Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                    o(r);
+                    s("完成(YouTube) 第 " + (idx + 1) + "/" + ytPlaylist.size() + " 集 · 左右滑动切换");
+                } else {
+                    s("第 " + (idx + 1) + " 集解析失败");
+                    showHintToast(v.err.length() > 0 ? v.err : "解析失败");
+                }
+            }});
+        }}).start();
+    }
+
+    /** 是否主页链接（转发给 ProfileParser 判断） */
+    boolean isProfileUrl(String url){
+        return ProfileParser.isProfileUrl(url);
+    }
+
+    /** 主页作品列表：渲染到「列表」页签，每条可解析/下载 */
+    void showProfileList(final java.util.List<ProfileParser.ProfileItem> list){
+        if(listWrap == null) return;
+        listWrap.removeAllViews();
+        final int n = list.size();
+        listHead.setText("主页共 " + n + " 条 · 点「下载」直接下，点标题先解析");
+        btnDlAll.setVisibility(n > 0 ? View.VISIBLE : View.GONE);
+        btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            new android.app.AlertDialog.Builder(MainActivity.this)
+                .setTitle("全部下载")
+                .setMessage("将把主页里 " + n + " 条全部加入下载队列。\n"
+                    + "境外平台会走服务器中转，大视频较多时速度受限。\n\n继续？")
+                .setPositiveButton("全部加入", new android.content.DialogInterface.OnClickListener(){
+                    public void onClick(android.content.DialogInterface d, int w){
+                        int added = 0;
+                        for(int i = 0; i < n; i++){
+                            ProfileParser.ProfileItem it = list.get(i);
+                            String u = it.url.length() > 0 ? it.url
+                                    : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
+                            if(u.length() == 0) continue;
+                            String tag = "视频" + (i + 1);
+                            enqueueDownload(u, tag, "mp4", "视频");
+                            added++;
+                        }
+                        s("已加入下载队列：" + added + " 条");
+                        showHintToast("已加入 " + added + " 条下载任务");
+                        switchTab(0);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+        }});
+        for(int i = 0; i < n; i++){
+            final ProfileParser.ProfileItem it = list.get(i);
+            final int idx = i;
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setBackground(makeRoundRect(curDark ? 0xFF24272F : 0xFFFFFFFF,
+                    curDark ? 0xFF333842 : 0xFFE1E4E9, 12));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = dp(8);
+            row.setLayoutParams(lp);
+
+            TextView title = new TextView(this);
+            String t = it.title;
+            if(t.length() == 0) t = it.id;
+            title.setText((i + 1) + ". " + t);
+            title.setTextSize(13);
+            title.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+            title.setPadding(0, 0, 0, dp(6));
+            title.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                switchTab(0);
+                parseProfileItem(list, idx);
+            }});
+            row.addView(title);
+
+            LinearLayout btns = new LinearLayout(this);
+            btns.setOrientation(LinearLayout.HORIZONTAL);
+            TextView btnDl = new TextView(this);
+            btnDl.setText("下载");
+            btnDl.setTextSize(12);
+            btnDl.setTextColor(0xFFFE2C55);
+            btnDl.setPadding(dp(10), dp(5), dp(10), dp(5));
+            btnDl.setBackground(makeRoundRect(0x1AFE2C55, 0, 8));
+            btnDl.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                // 先解析拿直链，再入下载队列（YouTube/TikTok 原始 URL 不能直接下）
+                String u = it.url.length() > 0 ? it.url
+                        : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
+                if(u.length() == 0){ s("该条无链接"); return; }
+                s("解析第 " + (idx + 1) + " 条直链…");
+                final String finalU = u;
+                new Thread(new Runnable(){ public void run(){
+                    final String dlUrl = resolveToDirectUrl(finalU);
+                    h.post(new Runnable(){ public void run(){
+                        if(dlUrl != null && dlUrl.length() > 0){
+                            String tag = "视频" + (idx + 1);
+                            enqueueDownload(dlUrl, tag, "mp4", "视频");
+                            s("已加入下载队列：第 " + (idx + 1) + " 条");
+                            showHintToast("已加入下载队列");
+                        } else {
+                            s("第 " + (idx + 1) + " 条解析失败");
+                            showHintToast("解析失败，试试「解析看详情」");
+                        }
+                    }});
+                }}).start();
+            }});
+            btns.addView(btnDl);
+
+            TextView btnParse = new TextView(this);
+            btnParse.setText("解析看详情");
+            btnParse.setTextSize(12);
+            btnParse.setTextColor(curDark ? 0xFF8AB4F8 : 0xFF1A73E8);
+            btnParse.setPadding(dp(10), dp(5), dp(10), dp(5));
+            LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            plp.leftMargin = dp(8);
+            btnParse.setLayoutParams(plp);
+            btnParse.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                switchTab(0);
+                parseProfileItem(list, idx);
+            }});
+            btns.addView(btnParse);
+
+            if(it.durSec > 0){
+                TextView dur = new TextView(this);
+                dur.setText("  " + it.durSec + "s");
+                dur.setTextSize(11);
+                dur.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+                dur.setGravity(android.view.Gravity.CENTER_VERTICAL);
+                btns.addView(dur);
+            }
+            row.addView(btns);
+            listWrap.addView(row);
+        }
+        s("主页解析完成 · " + n + " 条 · 已切到列表页");
+        switchTab(1);
+    }
+
+    /** 解析主页列表第 idx 条（0 基） */
+    void parseProfileItem(final java.util.List<ProfileParser.ProfileItem> list, final int idx){
+        if(list == null || idx < 0 || idx >= list.size()) return;
+        final ProfileParser.ProfileItem it = list.get(idx);
+        final String target = it.url.length() > 0 ? it.url
+                : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
+        if(target.length() == 0){ s("该条无链接"); return; }
+        s("解析第 " + (idx + 1) + " 条...");
+        loadForParse(target);
+    }
+
+    /** 把一条作品 URL 解析成可直接下载的直链（按平台分发）。
+     *  YouTube：走服务器 yt parse，返回 /api/yt/file 中转
+     *  TikTok：走 TtParser 服务器解析，返回中转直链
+     *  X：走 XParser 服务器解析，返回 /api/x/dl 中转
+     *  抖音/快手：本地解析路径（原始直链）
+     *  失败返回 null */
+    String resolveToDirectUrl(String url){
+        try{
+            if(YtParser.isYtUrl(url)){
+                YtParser.YtVideo v = YtParser.resolve(this, url);
+                if(v.ok() && v.videoUrl.length() > 0) return v.videoUrl;
+                return null;
+            }
+            if(TtParser.isTtUrl(url)){
+                // TikTok：优先服务器中转（无需用户代理），失败回退本地解析
+                try{
+                    String r = parseTikTokByServer(url);
+                    if(r != null){
+                        // parseTikTokByServer 会把 curPlay 设成中转地址
+                        if(curPlay != null && curPlay.length() > 0) return curPlay;
+                    }
+                }catch(Throwable t){
+                    Log.i("DYP", "TT_SRV_FALLBACK " + t);
+                }
+                TtParser.TtVideo tv = TtParser.resolve(this, url);
+                if(tv.ok() && tv.hasVideo()){
+                    return tv.playUrl.length() > 0 ? tv.playUrl : tv.downloadUrl;
+                }
+                return null;
+            }
+            if(XParser.isXUrl(url)){
+                XParser.XVideo v = XParser.resolveServerOnly(this, url);
+                if(v.ok() && v.hasVideo()) return v.firstVideo();
+                return null;
+            }
+            // 抖音/快手：原样返回（下载器能处理）
+            return url;
+        }catch(Throwable t){
+            Log.i("DYP", "RESOLVE_DL_ERR " + t);
+            return null;
+        }
+    }
+
+    /** 切到上一集 / 下一集（解析成功后可用） */
+    void ytPrev(){
+        if(ytPlaylist.isEmpty()){ s("当前不是播放列表"); return; }
+        if(ytIdx <= 0){ showHintToast("已经是第一集"); return; }
+        parseYtItem(ytIdx - 1);
+    }
+    void ytNext(){
+        if(ytPlaylist.isEmpty()){ s("当前不是播放列表"); return; }
+        if(ytIdx >= ytPlaylist.size() - 1){ showHintToast("已经是最后一集"); return; }
+        parseYtItem(ytIdx + 1);
+    }
+
+    /** 外链卡片深挖：走服务器 /api/link/resolve，返回 render 用的 JSON */
+    String resolveCardLink(String cardUrl){
+        try{
+            String srv = effSrv();
+            if(srv.length() == 0) return null;
+            String api = srv + "/api/link/resolve?url=" + java.net.URLEncoder.encode(cardUrl, "UTF-8");
+            HttpURLConnection c = (HttpURLConnection) new java.net.URL(api).openConnection(java.net.Proxy.NO_PROXY);
+            c.setRequestProperty("User-Agent", MUA);
+            c.setRequestProperty("Accept", "application/json,*/*");
+            // HMAC 鉴权
+            String ts = String.valueOf(System.currentTimeMillis() / 1000);
+            String nonce = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+            String path = "/api/link/resolve";
+            String msg = path + "\n" + ts + "\n" + nonce;
+            String key = srvHmacKeyS(this);
+            if(key.length() > 0){
+                javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+                mac.init(new javax.crypto.spec.SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
+                byte[] raw = mac.doFinal(msg.getBytes("UTF-8"));
+                StringBuilder sb = new StringBuilder();
+                for(byte b : raw) sb.append(String.format("%02x", b));
+                c.setRequestProperty("X-TS", ts);
+                c.setRequestProperty("X-NONCE", nonce);
+                c.setRequestProperty("X-SIGN", sb.toString());
+            }
+            c.setConnectTimeout(20000);
+            c.setReadTimeout(30000);
+            int code = c.getResponseCode();
+            java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+            in.close();
+            c.disconnect();
+            String body = bo.toString("UTF-8");
+            Log.i("DYP", "LINK_RESOLVE http=" + code + " len=" + body.length());
+            if(code != 200) return null;
+            Object root = XParser.Json.parse(body);
+            if(!(root instanceof java.util.Map)) return null;
+            java.util.Map r = (java.util.Map) root;
+            Object okObj = r.get("ok");
+            boolean ok = Boolean.TRUE.equals(okObj) || "true".equals(String.valueOf(okObj));
+            if(!ok) return null;
+            String vurl = String.valueOf(r.get("video_url"));
+            if(vurl == null || vurl.length() == 0) return null;
+            // 转成 render 认识的 JSON
+            StringBuilder b = new StringBuilder(512);
+            b.append('{');
+            b.append("\"i_id\":\"").append("card").append("\",");
+            b.append("\"i_platform\":\"外链\",");
+            b.append("\"i_play\":\"").append(vurl.replace("\"", "\\\"")).append("\"");
+            String title = r.get("title") == null ? "" : String.valueOf(r.get("title"));
+            if(title.length() > 0) b.append(",\"i_desc\":\"").append(title.replace("\"", "\\\"")).append("\"");
+            b.append('}');
+            return b.toString();
+        }catch(Throwable t){
+            Log.i("DYP", "LINK_CARD_ERR " + t);
+            return null;
+        }
+    }
+
+    /** 下载视频前的大文件提醒：
+     *  X：挂了代理 → 直连 CDN（不烧机场流量）；没挂 → 走服务器机场，弹确认。
+     *  YouTube：googlevideo 直链绑定解析 IP（实测 strip ip= 后 403），
+     *          用户代理无效，一律走服务器中转，弹确认提示自建服务器方案。 */
+    void warnBigOverseas(final Runnable then){
+        final boolean isX = isXDomain(curUrl);
+        final boolean isYt = YtParser.isYtUrl(curUrl);
+        if(!isX && !isYt){
+            then.run();
+            return;
+        }
+        if(isX && ProxyPolicy.hasUserProxy(this)){
+            showHintToast("已检测到你挂了代理：X 媒体将走你的代理直连，不消耗服务器流量");
+            then.run();
+            return;
+        }
+        if(isX && !xSrvUsable){
+            showHintToast("服务器代理流量不可用，请自行挂代理后重试下载");
+            return;
+        }
+        String msg;
+        if(isYt){
+            msg = "YouTube 必须走服务器中转：\n"
+                + "1. 解析接口在国内被墙，本地无法直连\n"
+                + "2. 视频直链绑定解析 IP，挂代理也拿不到（已实测）\n\n"
+                + "当前将走服务器机场流量下载，速度受服务器带宽限制。\n"
+                + "服务器到期后（2027-04），可在设置里自建服务器地址（源码开源）。\n\n"
+                + "仍要继续下载吗？";
+        } else {
+            msg = "你没有挂代理，这个大文件将走我们服务器的机场流量下载，"
+                + "速度受服务器带宽限制（约 250KB/s），且会消耗机场流量。\n\n"
+                + "建议：在设置里挂上自己的代理，速度更快、不消耗服务器流量。\n\n"
+                + "仍要继续走服务器下载吗？";
+        }
+        new android.app.AlertDialog.Builder(this)
+            .setTitle(isYt ? "YouTube 走服务器下载" : "境外视频走服务器下载")
+            .setMessage(msg)
+            .setPositiveButton("继续下载", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ then.run(); }
+            })
+            .setNegativeButton(isYt ? "取消" : "先去设置代理", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(isYt) d.dismiss(); else showProxyDialog();
+                }
+            })
+            .setNeutralButton("取消", null)
+            .show();
+    }
+
+
     /** 下载：视频 → mp4；图集 → 多选列表；实况图 → 封装实况照片 */
     void doDownload(){
+        // X 多视频：一条推带 2~4 个视频，先让用户选第几个
+        if(curXVideos.size() > 1){
+            showXVideoPicker();
+            return;
+        }
+        // X 且服务器机场流量不可用：提示用户自己挂代理（媒体 CDN 被 DNS 污染，直连必挂）
+        if(isXDomain(curUrl) && !xSrvUsable){
+            showHintToast("服务器代理流量不可用，请自行挂代理后重试下载");
+        }
         boolean hasImgs = imgUrls != null && imgUrls.size() > 0;
         if(!hasImgs && (curPlay == null || curPlay.length() == 0)){ s("无可下载地址"); return; }
 
-        // 视频（无图集）：直接下 mp4（分类：视频）
+        // 视频（无图集）：大文件提醒后直接下 mp4（分类：视频）
         if(!hasImgs){
-            enqueueDownload(curPlay, "视频", "mp4", "视频");
+            warnBigOverseas(new Runnable(){ public void run(){
+                // YouTube direct：带独立音轨，下载后本地合成
+                String au = (curAudio != null && curAudio.startsWith("http")) ? curAudio : "";
+                enqueueDownloadWithAudio(curPlay, "视频", "mp4", "视频", "", au);
+            }});
             return;
         }
 
@@ -5238,9 +6159,152 @@ void parse(){
         }
     }
 
+    /**
+     * YouTube direct 双轨下载：视频轨 + 音频轨分别下载（都走用户代理），
+     * 再用 MediaExtractor + MediaMuxer 本地合成 mp4（不重编码，秒级完成）。
+     */
+    boolean downloadDualTrack(DlTask task, File target, final int fIdx, final int fTotal){
+        File vTmp = null, aTmp = null;
+        try{
+            h.post(new Runnable(){ public void run(){
+                progSet(0f, String.format(Locale.US, "(%d/%d) 下载视频轨…", fIdx, fTotal));
+            }});
+            vTmp = new File(getCacheDir(), "yt_v_" + System.currentTimeMillis() + ".mp4");
+            boolean vOk = InnerDownloader.fetch(task.url, vTmp, new InnerDownloader.Cb(){
+                @Override public void onStart(long totalBytes){}
+                @Override public void onProgress(long done, long tot){
+                    float r = tot > 0 ? (float)((double) done / tot) : 0f;
+                    progSet(r * 0.7f, String.format(Locale.US, "(%d/%d) 视频轨  %s / %s",
+                            fIdx, fTotal, InnerDownloader.sizeText(done),
+                            tot > 0 ? InnerDownloader.sizeText(tot) : "?"));
+                }
+                @Override public void onDone(boolean ok2, File out, String msg){}
+            }, curSession, this);
+            if(!vOk || vTmp.length() < 1024){
+                Log.i("DYP", "YT_DUAL_V_FAIL len=" + (vTmp.exists() ? vTmp.length() : -1));
+                appLog("下载", "✗ 视频轨下载失败");
+                return false;
+            }
+
+            h.post(new Runnable(){ public void run(){
+                progSet(0.72f, String.format(Locale.US, "(%d/%d) 下载音轨…", fIdx, fTotal));
+            }});
+            aTmp = new File(getCacheDir(), "yt_a_" + System.currentTimeMillis() + ".m4a");
+            boolean aOk = InnerDownloader.fetch(task.audioUrl, aTmp, new InnerDownloader.Cb(){
+                @Override public void onStart(long totalBytes){}
+                @Override public void onProgress(long done, long tot){
+                    float r = tot > 0 ? (float)((double) done / tot) : 0f;
+                    progSet(0.72f + r * 0.18f, String.format(Locale.US, "(%d/%d) 音轨  %s",
+                            fIdx, fTotal, InnerDownloader.sizeText(done)));
+                }
+                @Override public void onDone(boolean ok2, File out, String msg){}
+            }, curSession, this);
+            if(!aOk || aTmp.length() < 1024){
+                Log.i("DYP", "YT_DUAL_A_FAIL len=" + (aTmp.exists() ? aTmp.length() : -1));
+                appLog("下载", "✗ 音轨下载失败，改用纯视频轨");
+                // 音轨失败不整体失败：直接改名视频轨为最终文件
+                try{ if(target.exists()) target.delete(); vTmp.renameTo(target); }catch(Throwable t){}
+                return true;
+            }
+
+            h.post(new Runnable(){ public void run(){
+                progSet(0.92f, String.format(Locale.US, "(%d/%d) 合成音视频…", fIdx, fTotal));
+            }});
+            boolean mOk = muxMp4(vTmp.getAbsolutePath(), aTmp.getAbsolutePath(), target.getAbsolutePath());
+            Log.i("DYP", "YT_DUAL_MUX ok=" + mOk + " out=" + (target.exists() ? target.length() : -1));
+            appLog("下载", (mOk ? "✓ 视频+音轨已合成 " : "✗ 合成失败 ")
+                    + target.getName() + "  " + InnerDownloader.sizeText(target.length()));
+            if(mOk){
+                try{ savedDirs.add(target.getParentFile().getAbsolutePath()); }catch(Throwable t){}
+            }
+            return mOk;
+        }catch(Throwable t){
+            Log.i("DYP", "YT_DUAL_ERR " + t);
+            appLog("下载", "✗ 双轨下载异常 " + t);
+            return false;
+        }finally{
+            try{ if(vTmp != null) vTmp.delete(); }catch(Throwable t){}
+            try{ if(aTmp != null) aTmp.delete(); }catch(Throwable t){}
+        }
+    }
+
+    /** MediaExtractor + MediaMuxer 合成 mp4（纯拷贝，不重编码） */
+    static boolean muxMp4(String videoPath, String audioPath, String outPath){
+        android.media.MediaExtractor vEx = null, aEx = null;
+        android.media.MediaMuxer mux = null;
+        try{
+            vEx = new android.media.MediaExtractor();
+            vEx.setDataSource(videoPath);
+            int vTrack = -1;
+            for(int i = 0; i < vEx.getTrackCount(); i++){
+                android.media.MediaFormat f = vEx.getTrackFormat(i);
+                String mime = f.getString(android.media.MediaFormat.KEY_MIME);
+                if(mime != null && mime.startsWith("video/")){ vTrack = i; break; }
+            }
+            if(vTrack < 0) return false;
+
+            aEx = new android.media.MediaExtractor();
+            aEx.setDataSource(audioPath);
+            int aTrack = -1;
+            for(int i = 0; i < aEx.getTrackCount(); i++){
+                android.media.MediaFormat f = aEx.getTrackFormat(i);
+                String mime = f.getString(android.media.MediaFormat.KEY_MIME);
+                if(mime != null && mime.startsWith("audio/")){ aTrack = i; break; }
+            }
+            if(aTrack < 0) return false;
+
+            mux = new android.media.MediaMuxer(outPath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            vEx.selectTrack(vTrack);
+            android.media.MediaFormat vf = vEx.getTrackFormat(vTrack);
+            int muxV = mux.addTrack(vf);
+            int muxA = -1;
+            if(aTrack >= 0){
+                aEx.selectTrack(aTrack);
+                android.media.MediaFormat af = aEx.getTrackFormat(aTrack);
+                muxA = mux.addTrack(af);
+            }
+            mux.start();
+
+            android.media.MediaCodec.BufferInfo info = new android.media.MediaCodec.BufferInfo();
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1024 * 1024);
+            long baseV = 0;
+            while(true){
+                int n = vEx.readSampleData(buf, 0);
+                if(n < 0) break;
+                info.offset = 0;
+                info.size = n;
+                info.presentationTimeUs = vEx.getSampleTime();
+                info.flags = vEx.getSampleFlags();
+                if(baseV == 0 && info.presentationTimeUs > 0) baseV = info.presentationTimeUs;
+                mux.writeSampleData(muxV, buf, info);
+                vEx.advance();
+            }
+            if(muxA >= 0){
+                while(true){
+                    int n = aEx.readSampleData(buf, 0);
+                    if(n < 0) break;
+                    info.offset = 0;
+                    info.size = n;
+                    info.presentationTimeUs = aEx.getSampleTime();
+                    info.flags = aEx.getSampleFlags();
+                    mux.writeSampleData(muxA, buf, info);
+                    aEx.advance();
+                }
+            }
+            mux.stop();
+            return true;
+        }catch(Throwable t){
+            Log.i("DYP", "MUX_ERR " + t);
+            return false;
+        }finally{
+            try{ if(vEx != null) vEx.release(); }catch(Throwable t){}
+            try{ if(aEx != null) aEx.release(); }catch(Throwable t){}
+            try{ if(mux != null){ try{ mux.release(); }catch(Throwable t){} } }catch(Throwable t){}
+        }
+    }
+
     /** 下载 BGM：抖音 detail 给的完整背景音乐 MP3 直链，无需转码 */
     void downloadBgm(){
-        if(curBgm == null || curBgm.length() == 0){ s("无背景音乐地址"); return; }
         // 文件名带 BGM 标题（清掉非法字符），避免所有 BGM 都叫 dy_xxx_bgm_时间戳
         String safe = "";
         try{
@@ -5296,8 +6360,11 @@ void parse(){
 
                 // ---------- 阶段 2：转码（35% ~ 100%） ----------
                 // 文件名按平台加前缀，方便区分来源
-                final String pfx = TtParser.isTtUrl(srcUrl) ? "tt_"
-                                 : (KsParser.isKsUrl(srcUrl) ? "ks_" : "dy_");
+final String pfx;
+                if(TtParser.isTtUrl(srcUrl)) pfx = "tt_";
+                else if(KsParser.isKsUrl(srcUrl)) pfx = "ks_";
+                else if(isXDomain(srcUrl) || isXDomain(curUrl)) pfx = "x_";
+                else pfx = "dy_";
                 // 分类下载目录（音频）：自定义 > 默认
                 File audioDir = new File(dlDirFor("音频"));
                 if(!audioDir.exists()) audioDir.mkdirs();
@@ -5387,6 +6454,16 @@ void parse(){
         }
     }
 
+    /** 带独立音轨入队（YouTube direct 双轨下载） */
+    void enqueueDownloadWithAudio(String url, String tag, String ext, String cat, String mixDir, String audioUrl){
+        downloadQueue.add(new DlTask(url, tag, ext, cat, mixDir, "", "", audioUrl));
+        Log.i("DYP", "DL_QUEUE + " + tag + " cat=" + cat + " audio=" + (audioUrl.length() > 0) + " 总计=" + downloadQueue.size());
+        if(!dlRunning){
+            dlRunning = true;
+            runDownloadQueue();
+        }
+    }
+
     /** 下载任务：cat = 分类目录（视频/图片/音频/合集），mixDir = 合集专属子目录（可为空） */
     static class DlTask {
         final String url, tag, ext, cat, mixDir;
@@ -5394,18 +6471,24 @@ void parse(){
         final String liveUrl;
         /** 非空时用它作为文件名主体（合集用：标题_第N集），否则用 dy_<id>_<tag> */
         final String nameBase;
-        DlTask(String u, String t, String e){ this(u, t, e, "视频", "", "", ""); }
-        DlTask(String u, String t, String e, String c){ this(u, t, e, c, "", "", ""); }
+        /** YouTube direct：独立音轨直链，非空时下载后与视频轨本地 mux */
+        final String audioUrl;
+        DlTask(String u, String t, String e){ this(u, t, e, "视频", "", "", "", ""); }
+        DlTask(String u, String t, String e, String c){ this(u, t, e, c, "", "", "", ""); }
         DlTask(String u, String t, String e, String c, String m){
-            this(u, t, e, c, m, "", "");
+            this(u, t, e, c, m, "", "", "");
         }
         DlTask(String u, String t, String e, String c, String m, String lv){
-            this(u, t, e, c, m, lv, "");
+            this(u, t, e, c, m, lv, "", "");
         }
         DlTask(String u, String t, String e, String c, String m, String lv, String nb){
+            this(u, t, e, c, m, lv, nb, "");
+        }
+        DlTask(String u, String t, String e, String c, String m, String lv, String nb, String au){
             url = u; tag = t; ext = e; cat = c; mixDir = m;
             liveUrl = lv == null ? "" : lv;
             nameBase = nb == null ? "" : nb;
+            audioUrl = au == null ? "" : au;
         }
         boolean isLive(){ return liveUrl.length() > 0; }
     }
@@ -5417,6 +6500,16 @@ void parse(){
 
     /** 串行消费下载队列，进度条显示 第N个/总数 */
     void runDownloadQueue(){
+        // 前台服务：切后台继续下载（WakeLock + 通知栏占位）
+        try{
+            if(android.os.Build.VERSION.SDK_INT >= 26){
+                startForegroundService(new android.content.Intent(this, DownloadService.class));
+            } else {
+                startService(new android.content.Intent(this, DownloadService.class));
+            }
+        }catch(Throwable t){
+            Log.i("DYP", "DL_SERVICE_ERR " + t);
+        }
         new Thread(new Runnable(){ public void run(){
             int total = downloadQueue.size();
             int idx = 0;
@@ -5437,8 +6530,15 @@ void parse(){
                         // 合集：标题_第N集_时间戳.mp4
                         name = task.nameBase + "_" + System.currentTimeMillis() + "." + task.ext;
                     } else {
-                        name = (TtParser.isTtUrl(task.url) ? "tt_" : (KsParser.isKsUrl(task.url) ? "ks_" : "dy_"))
-                                + curId + "_" + task.tag + "_" + System.currentTimeMillis() + "." + task.ext;
+                        // 前缀按「当前解析的平台」判定：X/YouTube 的媒体走服务器中转，
+                        // 光看下载 URL 会误判成 dy_，所以同时看 curUrl。
+                        String pfx;
+                        if(TtParser.isTtUrl(task.url)) pfx = "tt_";
+                        else if(KsParser.isKsUrl(task.url)) pfx = "ks_";
+                        else if(isXDomain(task.url) || isXDomain(curUrl)) pfx = "x_";
+                        else if(YtParser.isYtUrl(task.url) || YtParser.isYtUrl(curUrl)) pfx = "yt_";
+                        else pfx = "dy_";
+                        name = pfx + curId + "_" + task.tag + "_" + System.currentTimeMillis() + "." + task.ext;
                     }
                     // 分类下载目录：分类自定义 > 根目录/分类；合集再加专属子文件夹
                     File catDir = new File(dlDirFor(task.cat));
@@ -5455,7 +6555,13 @@ void parse(){
                     boolean ok;
                     if(task.isLive()){
                         ok = downloadLivePhoto(task, target);
+                    } else if(task.audioUrl != null && task.audioUrl.length() > 0){
+                        // YouTube direct：视频轨 + 音频轨分别下载，MediaMuxer 本地合成 mp4
+                        ok = downloadDualTrack(task, target, fIdx, fTotal);
                     } else {
+                        // TikTok 下载需要 Session（cookie + 代理分流）
+                        final Object ttSes = TtParser.isTtUrl(task.url)
+                                ? new TtParser.Session() : curSession;
                         ok = InnerDownloader.fetch(task.url, target, new InnerDownloader.Cb(){
                             @Override public void onStart(long totalBytes){
                                 progSet(0f, String.format(Locale.US, "(%d/%d) 下载中  %s",
@@ -5472,7 +6578,7 @@ void parse(){
                                 Log.i("DYP", "DL_END " + fIdx + "/" + fTotal + " ok=" + ok2 + " " + msg);
                                 appLog("下载", (ok2 ? "✓ " : "✗ ") + out.getName() + "  " + msg);
                             }
-                        }, curSession, MainActivity.this);
+                        }, ttSes, MainActivity.this);
                     }
 
                     if(ok) okCount++; else failCount++;
@@ -5492,6 +6598,9 @@ void parse(){
             }finally{
                 final int fo = okCount, ff = failCount;
                 dlRunning = false;
+                // 队列结束：停前台服务，通知栏图标消失
+                try{ stopService(new android.content.Intent(MainActivity.this, DownloadService.class)); }
+                catch(Throwable t){}
                 // 汇总本次下载实际落盘的目录（去重，保持顺序）
                 final java.util.LinkedHashSet<String> dirSet =
                         new java.util.LinkedHashSet<String>(savedDirs);
@@ -5516,6 +6625,11 @@ void parse(){
                         }
                     }
                     s(sb.toString());
+                    if(ff > 0 && isXDomain(curUrl)){
+                        // X 的 CDN（video/pbs.twimg.com）在国内常被 DNS 污染，
+                        // 解析能成功但下载连不上，这里明确告诉用户怎么办。
+                        showHintToast("X 媒体直连失败，请开启代理后重试下载");
+                    }
                     if(ff == 0 && !dirSet.isEmpty()){
                         showHintToast("已保存到 " + dirSet.iterator().next());
                     }
