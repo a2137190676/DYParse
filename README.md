@@ -45,7 +45,8 @@
 - **下载历史**：历史页签展示下载记录（文件名 + 时间 + 大小）
 - **双更新源**：Gitee / GitHub 可切换，内置服务器加速优先
 - **运行日志**：设置内查看解析 / 下载 / 报错记录
-- **境外代理策略**：X 挂代理直连（不烧机场流量），失败自动回退服务器中转；YouTube 统一走服务器中转
+- **境外代理策略**：X 挂代理直连（不烧机场流量），失败自动回退服务器中转；YouTube 登录后走服务器解析 + 流式中转播放/下载
+- **YouTube 登录解析**：App 内登录 Google 账号自动抓 Cookie 上传服务器，解除 YouTube 风控
 
 详细的多平台实现说明见 App 内 **关于 → 平台支持说明**。
 
@@ -61,7 +62,7 @@
 | 快手 | 纯 HTTP，无 WebView，解析分享页 SSR 里的 `window.INIT_STATE` |
 | TikTok | 纯 HTTP + 自管 Cookie 会话，双页面模板互为兜底；下载走服务器中转（tikwm 直链） |
 | X（推特） | fxtwitter / syndication 双源纯 HTTP；挂代理直连 CDN，失败自动回退服务器中转；外链卡片深挖 |
-| YouTube | 服务器 yt-dlp 中转（解析 + 音视频合并 + 缓存），App 端走 `/api/yt/file` |
+| YouTube | 服务器 yt-dlp 中转（需用户登录 Cookie + node 解 n-challenge）；播放直连优先、403 回退 `/api/yt/stream` 流式中转；下载走服务器中转（已缓存视频吃缓存） |
 | 主页列表 | 服务器 `/api/profile/list`：YouTube/TikTok 用 yt-dlp flat，X 用页面正则 |
 | 数据提取 | 抖音优先 `window._ROUTER_DATA`，降级到 HTML 正则 |
 | JSON 解析 | 自实现轻量 `JP` 解析器，避免引入第三方依赖 |
@@ -74,7 +75,7 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 
 | 功能 | 为什么必须服务器 | 无服务器时的表现 |
 |---|---|---|
-| **YouTube 解析/播放/下载** | 解析接口在国内被墙（DNS 污染）；实测 googlevideo 直链绑定解析 IP，挂代理也拿不到，只能服务器 yt-dlp 中转 | 提示「无服务器：YouTube 解析必须走服务器」 |
+| **YouTube 解析/播放/下载** | 解析接口在国内被墙（DNS 污染）；实测 googlevideo 直链绑定解析 IP，挂代理也拿不到；需用户登录 Cookie + 服务器 yt-dlp（node 解 n-challenge） | 提示「YouTube 需登录 + 服务器」 |
 | **YouTube 主页列表** | 同上，频道列表走 yt-dlp flat | 同单视频 |
 | **X 无代理时的播放/下载** | X 视频 CDN（video.twimg.com）国内 DNS 污染；没挂代理时只能服务器中转 | 提示用户挂代理；服务器可用时自动回退中转 |
 | **X 外链卡片深挖** | 短链（tinyurl 等）解跳 + 落地页抓取在服务器执行 | 纯卡片推提示「外链没挖到视频」 |
