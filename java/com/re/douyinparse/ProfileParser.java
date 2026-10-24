@@ -30,12 +30,31 @@ public class ProfileParser {
         public String title = "";
         public long durSec = 0;
         public String url = "";
+        /** 列表响应里直接带的无水印直链（抖音/快手 WebView 方案用），空则下载时再解析 */
+        public String directUrl = "";
+        /** 图集（下载走图片队列） */
+        public boolean isImage = false;
     }
 
     /** 是否主页链接 */
     public static boolean isProfileUrl(String url){
         if(url == null) return false;
         String u = url.toLowerCase();
+        // 抖音用户主页：douyin.com/user/xxx（不带 /video/ /note/ /slides/）
+        if(u.contains("douyin.com/user/") && !u.contains("/video/")
+                && !u.contains("/note/") && !u.contains("/slides/")){
+            return true;
+        }
+        // 快手用户主页：kuaishou.com/profile/xxx 或 live.kuaishou.com/u/xxx
+        if((u.contains("kuaishou.com/profile/") || u.contains("live.kuaishou.com/u/"))
+                && !u.contains("/short-video/")){
+            return true;
+        }
+        // B 站空间主页
+        if(u.contains("bilibili.com") && java.util.regex.Pattern
+                .compile("bilibili\\.com/space/\\d{5,12}").matcher(u).find()){
+            return true;
+        }
         // YouTube @频道（不带 watch?v= 或 playlist）
         if((u.contains("youtube.com/@") || u.contains("youtube.com/channel/"))
                 && !u.contains("watch?") && !u.contains("playlist?")){
@@ -47,13 +66,17 @@ public class ProfileParser {
         }
         // X 用户主页（x.com/xxx，不是 /status/）
         if((u.contains("x.com/") || u.contains("twitter.com/"))){
-            Pattern p = Pattern.compile("(?:x|twitter)\\.com/([A-Za-z0-9_]+)/?$");
+            Pattern p = Pattern.compile("(?:x|twitter)\\.com/([A-Za-z0-9_]+)(?:[/?].*)?$");
             Matcher m = p.matcher(u);
             if(m.find()){
                 String name = m.group(1);
                 return !name.equals("i") && !name.equals("home") && !name.equals("intent")
                         && !name.equals("settings") && !name.equals("search");
             }
+        }
+        // YouTube @频道主页
+        if(u.contains("youtube.com/@") && !u.contains("watch?") && !u.contains("playlist?")){
+            return true;
         }
         return false;
     }
@@ -69,7 +92,8 @@ public class ProfileParser {
                 lastErr = "无服务器：主页列表需要服务器（解析境外平台）";
                 return null;
             }
-            String api = srv + "/api/profile/list?url=" + URLEncoder.encode(url, "UTF-8");
+            String api = srv + "/api/profile/list?url=" + URLEncoder.encode(url, "UTF-8")
+                    + "&uid=" + MainActivity.ytUid(ctx);
             c = (HttpURLConnection) new URL(api).openConnection(java.net.Proxy.NO_PROXY);
             c.setRequestProperty("User-Agent", UA);
             c.setRequestProperty("Accept", "application/json,*/*");
@@ -99,7 +123,7 @@ public class ProfileParser {
             while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
             in.close();
             String body = bo.toString("UTF-8");
-            Log.i(TAG, "PROFILE_HTTP " + code + " len=" + body.length());
+            Log.i(TAG, "PROFILE_HTTP " + code + " len=" + body.length() + " preview=" + body.substring(0, Math.min(150, body.length())));
             if(code != 200){
                 lastErr = "服务器错误 HTTP " + code;
                 return null;
