@@ -3,6 +3,38 @@
 本文记录每个版本的变更内容。版本号遵循 `major.minor.patch`，对应 `versionCode = major*10000 + minor*100 + patch`。
 
 ---
+## v1.3.5 (2026-10-24)
+
+本次为 **YouTube 登录解析 + 下载提速** 版本。
+
+### 新增
+
+**YouTube 登录解析**
+- App 内嵌 WebView 登录 Google 账号，自动抓取 Cookie（含 SID/HSID/__Secure-1PSID 等 HttpOnly 登录态）
+- Cookie 上传服务器（HMAC 鉴权），yt-dlp 带登录态解析，解除 YouTube 对服务器 IP 的风控
+- 登录入口：设置 → 服务器 → YouTube 登录
+
+**YouTube 流式中转**
+- 新增 `/api/yt/stream` 路由：服务器实时拉 googlevideo 回传 App，支持 Range（进度条可拖）
+- 播放直连优先，403 自动回退服务器中转（无需手动干预）
+- 主页列表下载解析完成后自动入队（不用再点一次）
+
+### 优化
+
+- YouTube 下载走服务器中转（googlevideo 直链绑定解析 IP，App 直连必 403），已缓存视频吃本地缓存
+- YouTube 优先 H.264（AV1 在部分设备解码失败）
+- YouTube 解析合并 yt-dlp 调用：首解 ~22s（原 60+），元数据缓存 4 小时内二次解析 0s
+- 服务器升级 yt-dlp 2026.10.21 + yt-dlp-ejs + `--js-runtimes node`，解 n-challenge（格式列表全恢复）
+- 所有弹窗跟随 App 主题（`dypDlg()` helper），修复 ColorOS 下弹窗暗色异常
+- 服务器地址弹窗精简：只保留服务器地址输入框
+
+### 修复
+
+- YouTube 下载空文件（googlevideo 403 时残留半成品 + 文件名空指针崩溃）
+- 主页列表 YouTube 条目下载需二次点击（pendingAutoDl 未在服务器解析路径触发）
+- 用户协议 / YouTube 登录弹窗暗色显示异常
+
+---
 ## v1.3.4 (2026-10-22)
 
 本次为**主页列表 + 三页签 + 境外直连优化**版本。
