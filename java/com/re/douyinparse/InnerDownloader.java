@@ -50,8 +50,43 @@ public class InnerDownloader {
             if(done) return true;
             Log.i(TAG, "IDL_RETRY attempt=" + attempt + " keep=" + (part.exists() ? part.length() : 0));
         }
+        // 服务器到期降级：B 站 / IG 中转下载失败 → 解 src/code 参数回退源站直连
+        String fallback = extractFallbackDirect(url);
+        if(fallback != null && !fallback.equals(url)){
+            Log.i(TAG, "IDL_FALLBACK_DIRECT " + fallback.substring(0, Math.min(80, fallback.length())));
+            try{ if(part.exists()) part.delete(); }catch(Throwable t){}
+            boolean done = fetchOnce(fallback, target, part, cb, ttSessionObj, ctx);
+            if(done) return true;
+        }
         try{ if(part.exists()) part.delete(); }catch(Throwable t){}
         return false;
+    }
+
+    /** 服务器中转 URL → 源站直链（/api/bili/dl?src=xxx → 解 xxx；/api/ins/dl → IG /media/ 端点） */
+    static String extractFallbackDirect(String url){
+        try{
+            if(url == null) return null;
+            if(url.indexOf("/api/bili/dl") >= 0 && url.indexOf("src=") > 0){
+                int i = url.indexOf("src=") + 4;
+                int j = url.indexOf('&', i);
+                String enc = j > 0 ? url.substring(i, j) : url.substring(i);
+                return java.net.URLDecoder.decode(enc, "UTF-8");
+            }
+            // IG：/api/ins/dl?code=xxx&kind=p&size=l → https://www.instagram.com/p/xxx/media/?size=l
+            if(url.indexOf("/api/ins/dl") >= 0 && url.indexOf("code=") > 0){
+                int i = url.indexOf("code=") + 5;
+                int j = url.indexOf('&', i);
+                String code = j > 0 ? url.substring(i, j) : url.substring(i);
+                String size = "l";
+                int si = url.indexOf("size=");
+                if(si > 0){
+                    int sj = url.indexOf('&', si);
+                    size = (sj > 0 ? url.substring(si + 5, sj) : url.substring(si + 5));
+                }
+                return "https://www.instagram.com/p/" + code + "/media/?size=" + size;
+            }
+        }catch(Throwable t){}
+        return null;
     }
 
     private static boolean fetchOnce(String url, File target, File part, Cb cb,
@@ -81,7 +116,14 @@ public class InnerDownloader {
                 }
             } else {
                 // 内置服务器分发（自更新 APK）：走 SrvClient 的 TLS pin + HMAC
-                if(SrvClient.isBuiltin(url)){
+                // 但下载中转（bili/x/yt/link dl）强制 8080 HTTP 直连：
+                // 真机 SrvClient 会把内置地址转 HTTPS 8443，而华为云安全组只放行 8080。
+                if(SrvClient.isBuiltin(url)
+                        && url.indexOf("/api/bili/dl") < 0
+                        && url.indexOf("/api/x/dl") < 0
+                        && url.indexOf("/api/yt/file") < 0
+                        && url.indexOf("/api/link/dl") < 0
+                        && url.indexOf("/api/ins/dl") < 0){
                     c = SrvClient.open(url, null);
                     SrvClient.sign(c, url);
                     c.setInstanceFollowRedirects(true);
@@ -96,7 +138,9 @@ public class InnerDownloader {
                         if(url.indexOf("googlevideo.com") >= 0){
                             // YouTube 直链：用户代理优先（direct 模式）；这里不看「仅 TikTok」开关
                             px = ProxyPolicy.userProxy(ctx);
-                        } else if(url.indexOf("/api/x/dl") >= 0 || url.indexOf("/api/yt/file") >= 0){
+                        } else if(url.indexOf("/api/x/dl") >= 0 || url.indexOf("/api/yt/file") >= 0
+                            || url.indexOf("/api/bili/dl") >= 0 || url.indexOf("/api/link/dl") >= 0
+                            || url.indexOf("/api/ins/dl") >= 0){
                             // 服务器中转：强制直连，不套用户代理
                             px = null;
                         } else {
@@ -105,6 +149,13 @@ public class InnerDownloader {
                     }catch(Throwable t){}
                     c = (HttpURLConnection) new URL(url).openConnection(
                             px != null ? px : java.net.Proxy.NO_PROXY);
+                    // 服务器中转：必须带 HMAC 鉴权（AUTH_PREFIXES 保护 /api/），
+                    // 用 SrvClient.sign 加头但不走它的 open（避免转 HTTPS 8443）。
+                    if(url.indexOf("/api/ins/dl") >= 0 || url.indexOf("/api/bili/dl") >= 0
+                            || url.indexOf("/api/x/dl") >= 0 || url.indexOf("/api/yt/file") >= 0
+                            || url.indexOf("/api/link/dl") >= 0){
+                        try{ SrvClient.sign(c, url); }catch(Throwable t){}
+                    }
                     c.setInstanceFollowRedirects(true);
                     c.setRequestProperty("User-Agent", MUA);
                     String ref = "https://www.douyin.com/";
@@ -112,6 +163,8 @@ public class InnerDownloader {
                     else if(KsParser.isKsUrl(url)) ref = "https://www.kuaishou.com/";
                     else if(MainActivity.isXDomain(url)) ref = "https://x.com/";
                     else if(url.indexOf("googlevideo.com") >= 0) ref = "https://www.youtube.com/";
+                    else if(url.indexOf("bilivideo.com") >= 0 || url.indexOf("bilibili.com") >= 0) ref = "https://www.bilibili.com/";
+                    else if(url.indexOf("/api/ins/dl") >= 0) ref = "https://www.instagram.com/";
                     c.setRequestProperty("Referer", ref);
                     // 断点续传：带 Range 从 .part 大小继续
                     if(resumeFrom > 0) c.setRequestProperty("Range", "bytes=" + resumeFrom + "-");
