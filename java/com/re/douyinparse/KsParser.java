@@ -431,6 +431,75 @@ public class KsParser {
         return null;
     }
 
+    /** 快手主页壳页（fw/user / profile）：返回作品列表（可能只有分享预览的几条）。
+     *  失败返回 null */
+    public static List<Map<String, String>> resolveProfileList(Context ctx, String url){
+        try{
+            String real = url;
+            if(isShort(url)){
+                String r = followRedirect(ctx, url);
+                if(r != null && r.length() > 0) real = r;
+            }
+            String html = httpGet(ctx, real);
+            if(html == null || html.length() < 500) return null;
+            String json = extractInitState(html);
+            if(json == null || json.length() < 60) return null;
+            Object root;
+            try{
+                root = new MainActivity.JP(json).parse();
+            }catch(Throwable t){
+                return null;
+            }
+            List<Map> photos = findAllPhotos(root, null, null);
+            if(photos.isEmpty()) return null;
+            List<Map<String, String>> out = new ArrayList<Map<String, String>>();
+            for(Map p : photos){
+                Map<String, String> it = new java.util.HashMap<String, String>();
+                it.put("id", s(p.get("photoId")));
+                it.put("title", s(p.get("caption")));
+                it.put("author", s(p.get("userName")));
+                // 封面
+                String cover = firstUrlOf(p.get("coverUrls"));
+                if(cover.length() == 0) cover = firstUrlOf(p.get("webpCoverUrls"));
+                it.put("cover", cover);
+                // 直链（壳页通常没有，但结构兼容）
+                it.put("mv", firstUrlOf(p.get("mainMvUrls")));
+                it.put("url", "https://www.kuaishou.com/short-video/" + it.get("id"));
+                out.add(it);
+            }
+            Log.i(TAG, "KS_PROFILE_LIST n=" + out.size());
+            return out;
+        }catch(Throwable t){
+            Log.i(TAG, "KS_PROFILE_LIST_ERR " + t);
+            return null;
+        }
+    }
+
+    /** 主页壳页（fw/user）：递归收集所有 photo 节点（含只有封面没有直链的） */
+    static List<Map> findAllPhotos(Object o, List<Map> out, java.util.Set<String> seen){
+        if(out == null) out = new ArrayList<Map>();
+        if(seen == null) seen = new java.util.HashSet<String>();
+        if(o instanceof Map){
+            Map m = (Map) o;
+            Object pid = m.get("photoId");
+            if(pid != null && m.get("caption") != null && m.get("soundTrack") == null){
+                String id = String.valueOf(pid);
+                if(!seen.contains(id)){
+                    seen.add(id);
+                    out.add(m);
+                }
+            }
+            for(Object val : m.values()){
+                findAllPhotos(val, out, seen);
+            }
+        } else if(o instanceof List){
+            for(Object val : (List) o){
+                findAllPhotos(val, out, seen);
+            }
+        }
+        return out;
+    }
+
     /**
      * atlas 结构：{list:[...], cdnList:[{cdn:"p2.a.yximgs.com"}], size:[{w,h}]}
      * list 里的元素可能是：
