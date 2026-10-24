@@ -105,6 +105,11 @@ public class YtParser {
      *  因此统一走服务器中转（yt-dlp 下载合并 mp4 进缓存，App 走 /api/yt/file）。
      *  服务器到期后：用户可自建服务器（源码开源）填进设置，功能不受影响。 */
     public static YtVideo resolve(Context ctx, String url){
+        return resolveServer(ctx, url, true);
+    }
+
+    /** direct 参数可选的服务器解析 */
+    public static YtVideo resolveServer(Context ctx, String url, boolean direct){
         YtVideo v = new YtVideo();
         v.pageUrl = url;
         if(url == null || url.length() == 0){ v.err = "空链接"; return v; }
@@ -116,7 +121,11 @@ public class YtParser {
         }
 
         try{
-            String api = srv + "/api/yt/parse?url=" + java.net.URLEncoder.encode(url, "UTF-8");
+            String uid = MainActivity.ytUid(ctx);
+            // direct=1：服务器只 dump-json 拿 googlevideo 直链（已 strip ip=），
+            // App 优先直连播放（走本机代理），403 再回退 /api/yt/stream 服务器中转
+            String api = srv + "/api/yt/parse?url=" + java.net.URLEncoder.encode(url, "UTF-8")
+                    + "&uid=" + uid + (direct ? "&direct=1" : "");
             String js = httpGetApi(ctx, api, 600000);
             if(js == null || js.length() < 50){
                 v.err = "服务器无响应";
@@ -169,6 +178,11 @@ public class YtParser {
             v.durationSec = l(get(r, "duration"));
             v.videoUrl = s(get(r, "video_url"));
             v.audioUrl = s(get(r, "audio_url"));
+            // STREAM:// 前缀：服务器流式中转（服务器拉 googlevideo 回传，Range 支持）
+            if(v.videoUrl.startsWith("STREAM://")){
+                String vid = v.videoUrl.substring(9);
+                v.videoUrl = srv + "/api/yt/stream?id=" + vid + "&uid=" + MainActivity.ytUid(ctx);
+            }
             if(v.videoUrl.length() == 0 && v.id.length() > 0){
                 // 服务器已把合并好的 mp4 存进缓存，走 /api/yt/file 中转（支持 Range）
                 v.videoUrl = srv + "/api/yt/file?id=" + v.id;
