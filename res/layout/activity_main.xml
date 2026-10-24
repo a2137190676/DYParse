@@ -35,14 +35,9 @@
             android:layout_width="38dp" android:layout_height="38dp"
             android:background="@drawable/btn_icon" android:gravity="center"
             android:text="暗" android:textColor="@color/text_sub" android:textSize="14sp"/>
-        <TextView android:id="@+id/btnSettings"
-            android:layout_width="38dp" android:layout_height="38dp"
-            android:layout_marginLeft="4dp" android:background="@drawable/btn_icon"
-            android:gravity="center"
-            android:text="设置" android:textColor="@color/text_sub" android:textSize="12sp"/>
     </LinearLayout>
 
-    <!-- 三页签：解析 / 列表 / 历史 -->
+    <!-- 四页签：解析 / 列表 / 历史 / 设置 -->
     <LinearLayout
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:orientation="horizontal"
@@ -56,12 +51,16 @@
             android:textStyle="bold"/>
         <TextView android:id="@+id/tabList"
             android:layout_width="0dp" android:layout_height="38dp" android:layout_weight="1"
-            android:layout_marginLeft="8dp" android:background="@drawable/tab_idle" android:gravity="center"
+            android:layout_marginLeft="6dp" android:background="@drawable/tab_idle" android:gravity="center"
             android:text="列表" android:textColor="@color/text_hint" android:textSize="13sp"/>
         <TextView android:id="@+id/tabHistory"
             android:layout_width="0dp" android:layout_height="38dp" android:layout_weight="1"
-            android:layout_marginLeft="8dp" android:background="@drawable/tab_idle" android:gravity="center"
+            android:layout_marginLeft="6dp" android:background="@drawable/tab_idle" android:gravity="center"
             android:text="历史" android:textColor="@color/text_hint" android:textSize="13sp"/>
+        <TextView android:id="@+id/tabSettings"
+            android:layout_width="0dp" android:layout_height="38dp" android:layout_weight="1"
+            android:layout_marginLeft="6dp" android:background="@drawable/tab_idle" android:gravity="center"
+            android:text="设置" android:textColor="@color/text_hint" android:textSize="13sp"/>
     </LinearLayout>
 
     <!-- 页签 1：解析页 -->
@@ -310,6 +309,19 @@
                 android:textColor="@color/text_hint" android:textSize="13sp"
                 android:lineSpacingExtra="4dp"/>
         </LinearLayout>
+    </ScrollView>
+
+    <!-- 页签 4：设置页 -->
+    <ScrollView android:id="@+id/pageSettings"
+        android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:visibility="gone"
+        android:scrollbars="none" android:overScrollMode="never">
+
+        <LinearLayout android:id="@+id/settingsWrap"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingLeft="18dp" android:paddingRight="18dp"
+            android:paddingTop="10dp" android:paddingBottom="18dp"/>
     </ScrollView>
 
     <WebView android:id="@+id/web"
