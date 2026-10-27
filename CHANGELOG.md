@@ -7,6 +7,78 @@
 > 旧版本 App 的更新检查走数值比较，可正常识别为更新。
 
 ---
+## v1.3.7.2 (2026-10-28)
+本次为 **抖音主页全量翻页 + 登录体验统一** 小版本，重点是抖音主页能一次拿全（实测 280 条作品 / 16 页），
+以及三平台登录后自动回解析页。
+
+### 新增
+- **抖音主页全量翻页**：主页作品列表不再只拿第一页。实测 280 条作品主页 **16 页全部翻完**，
+  日志 `DYPROF_DONE n=280 pages=16`，列表页 `SHOW_PROFILE_LIST n=280`。
+  - 走 PC 主页（`www.douyin.com/user/{sec_uid}`，桌面 UA）+ 签名接口 `aweme/v1/web/aweme/post/`
+    （`aid=6383`、`count=18`）+ `a_bogus` + secsdk 签名 + 1500ms 翻页间隔。
+  - 同一 sec_uid 只翻一次（`dyProfileDoneSecUid` 锁），避免页面反复发请求导致并发翻页互相覆盖。
+  - 翻页完成后自动收起 WebView（`about:blank` + 隐藏 + 收成 1×1），防止页面后续活动覆盖已拿到的全量结果。
+- **设置 → 抖音主页登录**：登录成功后**自动回到解析页**，和 YouTube 一致。
+  抓到 Cookie 后 800ms 自动隐藏顶栏、清空网页、恢复手机 UA、显示解析页，并提示「登录完成，已回到解析页」。
+- **设置 → 抖音 Cookie 状态**：可查看当前已保存的字段（只显示字段名与有无，不显示值）、手动清空。
+
+### 优化
+- **三平台登录行为统一**：YouTube（`stopYtLogin`）/ 抖音（`stopDyProfileLogin`）/ B站（`stopBiliLogin`）
+  全部改为「抓到 Cookie → 自动隐藏顶栏 + 清空网页 + 恢复手机 UA + 回解析页」，不再需要手动点「完成」。
+- **登录菜单改为两步弹窗**：第一步说明文字 + 「选择操作」，第二步纯列表（页面内登录 / 手动填 Cookie /
+  查看 Cookie 状态 / 清空 Cookie）。解决之前 `setMessage` + `setItems` 同时使用导致列表被挤掉、
+  界面上只剩一个「关闭」按钮的问题。
+- **抖音 Cookie 存储路径迁移**：从应用内部目录迁到 `Android/data/<包名>/files/cookies/`，
+  文件管理器可见、可备份，卸载自动清理。旧文件自动搬迁，新目录已有内容不覆盖。
+
+### 修复
+- **崩溃：`ClassCastException: LinearLayout cannot be cast to FrameLayout`**
+  - 位置：`MainActivity.showDyLoginBar()`。
+  - 根因：`web.getParent()` 实际是 `LinearLayout`，代码里硬转 `FrameLayout`。
+  - 修法：改为 `instanceof android.view.ViewGroup` 判断，并按父容器类型分别创建 `LayoutParams`
+    （FrameLayout 需 `gravity = Gravity.TOP`）。B站 `showBiliLoginBar()` 同类问题一并修好，
+    全工程已无 `(FrameLayout) web.getParent()`。
+- **连续解析第二次主页只拿到 20/38 条**
+  - 根因一：`extractSecUid()` 的正则只匹配 `sec_uid=`，而 PC 主页接口 URL 里是 `sec_user_id=`。
+    第一次解析 URL 来自分享页（有 `sec_uid=`）能正常翻页；第二次 URL 已在 PC 主页，取不到 sec_uid，
+    进入「单页回退」分支只请求一次。
+  - 根因二：翻页完成时把 `profileMode` 置了 false，而 `scheduleProfileRender()` 内部有
+    `if(!profileMode) return;`，导致 280 条渲染不出去，屏幕停在 WebView 抢先渲染的少量条目。
+  - 修法：`extractSecUid` 补 `sec_user_id=` 与 `/user/MS4wLjABAAAA...` 两种匹配；
+    渲染门禁改用独立标志 `dyProfileRenderLocked`，不再依赖 `profileMode`；
+    `doParseResolved()` 补齐 `profileMode` / `profileFetching` / `profileCollected` / `profileSeen` /
+    `dyProfileJumped` / `dyProfileDoneSecUid` / `dyProfileRenderLocked` 等状态重置。
+- **抖音登录页顶部操作条崩溃后无法恢复**：修好 `LayoutParams` 类型后不再抛异常。
+- **抖音主页跳转被打回手机版**：跳转前显式设置桌面 UA 并置 `dyProfilePcUA`，
+  在 `shouldOverrideUrlLoading` 里拦一次 `m.douyin.com/share/user/`，`onPageStarted` 对 PC 主页模式
+  注入 `injectDesktopSpoof`。
+
+### 变更
+- **抖音 Cookie 读写策略定版**
+  - `dyEffectiveCookie()` 优先级：`CookieManager` 实时（且含 `sessionid=` / `sid_tt=`）→ 本地文件兜底。
+    本地文件是登录那一刻的**死快照**，`msToken` / `__ac_signature` / `ttwid` 几分钟即过期，
+    拿它翻页第 2 页必返 `{"status_code":0}`，所以不能作为首选。
+  - `saveDyCookieLocal()` 只落盘 17 个长期票据字段（`sessionid` / `sessionid_ss` / `sid_tt` /
+    `uid_tt` / `uid_tt_ss` / `sid_guard` / `sid_ucp_v1` / `ssid_ucp_v1` / `passport_csrf_token` /
+    `passport_auth_status` / `ttwid` / `odin_tt` / `d_ticket` / `login_time` / `is_staff_user` 等），
+    不落盘短时效签名字段。
+  - `restoreDyCookieToWebView()` 在 `onCreate` 调用，仅当 WebView 里没有登录票据时才灌回，
+    避免覆盖实时值。
+- **抖音移动版登录入口已彻底移除**：`m.douyin.com` 已下线（404）；手机 UA 访问 `www.douyin.com`
+  被 302 到 `/home`；`passport/web/login` 返回「非法应用」（`error_code: 22`）。
+  这是平台风控，无免扫码的移动版登录入口。
+
+### 依赖变化
+- 抖音主页全量解析**不需要服务器**，也不需要访客凭据，只要有登录 Cookie（登录一次即可）。
+- 服务器到期不影响抖音主页解析与下载。
+
+### 已知限制
+- 抖音主页翻页依赖登录 Cookie。未登录时只能拿到第一页约 20 条。
+- 抖音没有免扫码的网页登录入口，需要手机 App 扫码；或从电脑浏览器复制 Cookie 手动填入。
+
+反馈群：995434160
+
+---
 ## v1.3.7.1 (2026-10-25)
 本次为 **抖音实况图凭据自动获取 + 本地解析** 小版本，主要是把「实况图必须靠服务器」这条依赖砍掉。
 
