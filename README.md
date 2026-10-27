@@ -4,7 +4,7 @@
 
 一个轻量级的多平台内容解析 Android 客户端：粘贴分享链接即可解析视频、图文、动图，并内置独立播放器。
 
-当前支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube** 五个平台。
+当前支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube / B站 / Instagram** 七个平台。
 
 > ⚠️ **仅供个人学习与技术研究使用**。请勿用于任何商业用途、批量抓取或侵犯他人权益的场景。内容版权归原作者所有。
 
@@ -23,8 +23,10 @@
 
 ## 功能
 
-- 支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube** 的 **视频 / 图文 / 动图** 解析
-- **主页列表**：YouTube 频道 / TikTok 用户 / X 用户主页一键列出全部作品，支持逐条下载与全部下载
+- 支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube / B站 / Instagram** 的 **视频 / 图文 / 动图** 解析
+- **主页列表**：YouTube 频道 / TikTok 用户 / X 用户主页 / B站空间 / Instagram 用户主页一键列出全部作品，支持逐条下载与全部下载（每页 100 条，带翻页）
+- **Instagram 登录解析**：App 内登录 IG 抓 Cookie 存本地（不上传），带登录态直连解析 Reel 视频流与主页作品列表
+- **B站本地直连**：view / playurl 接口免签直连，单视频、**合集（ugc_season）**、分P、空间主页都能用
 - **X 外链卡片深挖**：纯卡片推文自动解短链挖出视频
 - 图集左右滑动切图、点击查看大图
 - 独立播放器：
@@ -81,11 +83,19 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 | **X 外链卡片深挖** | 短链（tinyurl 等）解跳 + 落地页抓取在服务器执行 | 纯卡片推提示「外链没挖到视频」 |
 | **TikTok 下载** | CDN 会拦（403），tikwm 直链由服务器签发 | 提示 TikTok 下载需要服务器/代理 |
 | **主页列表（TikTok/X/YouTube）** | 三个平台主页数据都在服务器聚合（yt-dlp / 页面正则） | 提示「主页列表需要服务器」 |
-| **抖音实况图免填凭据** | UIFID_TEMP 访客凭据池在服务器（服务端签发，无算法可伪造） | 可本地填凭据，或实况退化为静态图 |
+| **B站解析/播放/下载** | view / playurl 接口国内可直连，本地免签解析；支持**纯 av号/BV号**与 **b23.tv 短链**（自动展开 302）。CDN 拉流必须用桌面 UA + `buvid3` Cookie（手机 UA 一律 403），满足后直连播放 | 服务器不可用不影响；仅直连异常时少了中转兜底 |
+| **B站清晰度** | 走 DASH（fnval=4048），从 dash.video 挑最高档。匿名封顶 480P/720P；填 `SESSDATA` 登录 → 1080P；大会员 → 1080P60/1080P+；大会员 + 4K 原片 → 4K。**Cookie 只存本地、不上传服务器** | 不填 Cookie 也能用，只是 480P/720P |
+| **B站双轨合成** | DASH 视频轨与音频轨在播放时用 MergingMediaSource 合并；下载后 MediaMuxer 无损合成 mp4 | 回退 fnval=1 整段 mp4（自带音轨） |
+| **Instagram 解析/主页** | 匿名只能拿封面（视频流 403 login_required）；需 App 内登录抓 `sessionid` 存本地，带登录态直连 `api/v1/media` 拿视频直链 | 无 Cookie 提示去登录；主页接口 429 时回退 WebView + 注入 Cookie 收集 |
+| **Instagram Cookie** | 全本地保存 `files/cookies/instagram.txt`，不上传服务器 | 完全不受服务器影响 |
+| **抖音实况图（v1.3.7.1 起本地优先）** | 详情接口强制要求 `UIFID_TEMP` 访客凭据（缺失固定 403 `ArgusSecurityPlugin`）。App 会**自动静默获取**（隐藏 WebView 桌面 UA，实测 2-3 秒），拿到后本地签名，**不走服务器**；服务器只作兜底 | 提前拿过凭据的用户完全不受影响；新装用户只要网络能开抖音页面也能自取 |
 | **自更新加速** | version.json + APK 下发走内置服务器优先 | 自动回退 Gitee / GitHub 直连检查 |
 
 **服务器到期后**（当前 2027-04-20）：
 - 抖音 / 快手解析、下载完全不受影响
+- **抖音实况图自 v1.3.7.1 起也不受影响**（凭据 App 内自取 + 本地签名，服务器只兜底）
+- **B站解析、播放、下载不受影响**（本地直连 API + CDN 直连，不依赖服务器）
+- **Instagram 解析、主页、下载不受影响**（Cookie 存本地，全走你自己网络）
 - TikTok / X 解析仍可用（本地路径），X 挂代理可下载
 - YouTube 解析、主页列表、X 外链深挖不可用
 - 所有功能自动降级，不会崩
@@ -95,6 +105,32 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 ### 抖音：为什么不用直接 HTTP 请求？
 
 抖音分享页有较为严格的风控（`a_bogus`、`X-Bogus` 签名、滑块验证）。直接用 `curl`/`OkHttp` 请求 `iesdouyin.com` 通常返回验证页。本项目通过 **真实 WebView 加载页面** 让浏览器自己完成签名与验证，再从 JS 层截获结构化数据，鲁棒性更好。
+
+### 抖音实况图：UIFID_TEMP 为什么要「让浏览器去拿」
+
+实况照片（Live Photo）的动轨只在 PC 详情接口 `/aweme/v1/web/aweme/detail/` 下发，
+而该接口在 `ArgusSecurityPlugin` 后面，缺少 `uifid` 时固定返回：
+
+```
+403 Blocked by ArgusSecurityPlugin Uifid Not Found
+```
+
+实测 3 种 UA（桌面 Chrome / iPhone Safari / 安卓 Chrome）× 4 种 Cookie（无 / 仅 ttwid / 仅 msToken / ttwid+msToken）
+共 12 组，**全部 403**。这层校验与 UA 无关，只看身份凭据。
+
+`UIFID_TEMP` 由字节服务端签发，只发给「通过了 `__ac_signature` 挑战的客户端」，
+**没有算法可以离线伪造**（这一点在开源项目 `ddcookimk` 的 README 里也有同样结论）。
+
+所以本项目的做法是：**让 App 里的 WebView 去当那个「通过挑战的客户端」**。
+
+1. 后台建一个 1×1 透明 WebView（桌面 UA），load `https://www.douyin.com/`
+2. 抖音 JS 自己算 `a_bogus` / `__ac_signature` 过挑战
+3. 服务端下发 `UIFID_TEMP`（实测 3-6 秒，与是否登录、是否点开视频**都无关**）
+4. 用 `CookieManager.getCookie()` 读出来（HttpOnly 也能读，`getRequestHeaders()` 读不到）
+5. 存本地，之后本地签名请求 detail 接口
+
+拿到凭据后只需「干净三件套」`UIFID_TEMP` + `ttwid`；
+带 `__ac_*` / `bd_ticket_*` / `fpk*` 反而会触发 `403 Blocked by ArgusSecurityPlugin Validate Error`。
 
 ### 快手：为什么要按结构找节点
 
@@ -158,7 +194,7 @@ v16-webapp-prime.tiktok.com  必须走代理
 
 | 场景 | 有服务器 | 无服务器 |
 |---|---|---|
-| 抖音实况照片 | 服务端带凭据中转 detail 接口，免填、秒出 | 需在设置里手填 UIFID_TEMP 凭据，失效要重抓 |
+| 抖音实况照片 | **v1.3.7.1 起本地签名即可**（凭据自动获取），服务器仅兜底 | 完全可用，凭据本地获取、本地签名 |
 | 短链解析 | 服务端秒解，抗本地 DNS 波动 | 本地解析，偶发慢/失败 |
 | 自更新 | 服务器直下 APK，快 | 走 Gitee Releases，可用但慢 |
 
@@ -299,6 +335,20 @@ KS_FILE=./release.keystore KS_PASS=你的密码 bash build.sh
 TikTok https://www.tiktok.com/t/XXXXXXXXX/
        https://www.tiktok.com/@user/video/<id>
        https://vt.tiktok.com/XXXXXXX/
+X      https://x.com/<user>/status/<id>
+       https://twitter.com/<user>/status/<id>
+YouTube https://www.youtube.com/watch?v=<id>
+       https://youtu.be/<id>
+       https://www.youtube.com/shorts/<id>
+       https://www.youtube.com/@频道名
+B站    https://www.bilibili.com/video/BVxxxxxxxxxx
+       https://www.bilibili.com/video/av<数字>
+       https://space.bilibili.com/<mid>
+Instagram https://www.instagram.com/reel/<code>/
+       https://www.instagram.com/p/<code>/
+       https://www.instagram.com/<用户名>
+主页   抖音 /user/、快手 /profile/、TikTok @用户、X 用户名、
+       YouTube @频道、B站 space、Instagram 用户名
 ```
 
 口令里的链接会自动抠出来，不用手动清理。
