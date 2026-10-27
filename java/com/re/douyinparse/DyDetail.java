@@ -33,6 +33,118 @@ public class DyDetail {
     public static final String API =
         "https://www.douyin.com/aweme/v1/web/aweme/detail/";
 
+    /** 主页作品列表接口（PC web 形态，需要 a_bogus 签名才能翻页） */
+    public static final String API_POST =
+        "https://www.douyin.com/aweme/v1/web/aweme/post/";
+
+    /**
+     * 构造主页作品列表的签名 query。
+     * 与 detail 不同点：这里必须带 max_cursor，且 a_bogus 会覆盖全部参数，
+     * 所以每次翻页都要用新的 cursor 重新算签名，不能直接改已有 URL 的参数。
+     */
+    public static String buildPostQuery(String secUid, long maxCursor, int count,
+                                        String msToken, String uifid){
+        Map<String, String> p = new LinkedHashMap<String, String>();
+        p.put("device_platform", "webapp");
+        p.put("aid", "6383");
+        p.put("channel", "channel_pc_web");
+        p.put("pc_client_type", "1");
+        p.put("pc_libra_divert", "Windows");
+        p.put("support_h265", "1");
+        p.put("support_dash", "1");
+        p.put("version_code", "190500");
+        p.put("version_name", "19.5.0");
+        p.put("cookie_enabled", "true");
+        p.put("screen_width", "1920");
+        p.put("screen_height", "1080");
+        p.put("browser_language", "zh-CN");
+        p.put("browser_platform", "Win32");
+        p.put("browser_name", "Chrome");
+        p.put("browser_version", "120.0.0.0");
+        p.put("browser_online", "true");
+        p.put("engine_name", "Blink");
+        p.put("engine_version", "120.0.0.0");
+        p.put("os_name", "Windows");
+        p.put("os_version", "10");
+        p.put("cpu_core_num", "8");
+        p.put("device_memory", "8");
+        p.put("platform", "PC");
+        p.put("downlink", "10");
+        p.put("effective_type", "4g");
+        p.put("round_trip_time", "200");
+        p.put("sec_user_id", secUid);
+        p.put("max_cursor", String.valueOf(maxCursor));
+        p.put("locate_query", "false");
+        p.put("show_live_replay_strategy", "1");
+        p.put("need_time_list", "1");
+        p.put("time_list_query", "0");
+        p.put("whale_cut_token", "");
+        p.put("cut_version", "1");
+        p.put("count", String.valueOf(count));
+        p.put("publish_video_strategy_type", "2");
+        p.put("msToken", msToken);
+        if(uifid != null && uifid.length() > 0) p.put("uifid", uifid);
+        return encodeQuery(p);
+    }
+
+    /**
+     * 极简版主页列表 query —— 完全按 WebView 自己发的那条请求来构造（实测参数表）：
+     *   reflow_source, web_id, device_id, aid, from_did, user_cip, sec_uid,
+     *   count, max_cursor, reflow_id, msToken, a_bogus
+     * 之前那套 40 多个 webapp 指纹参数（pc_libra_divert、screen_*、browser_* 等）
+     * 反而让服务端判定为「非真实浏览器」，第 2 页直接回 {"status_code":0}。
+     */
+    public static String buildSimpleQuery(String secUid, long maxCursor, int count,
+                                          String msToken, String webId, String deviceId,
+                                          String reflowSource, String reflowId, String userCip,
+                                          String fromDid, String aid){
+        Map<String, String> p = new LinkedHashMap<String, String>();
+        p.put("reflow_source", reflowSource == null ? "" : reflowSource);
+        p.put("web_id", webId == null ? "" : webId);
+        p.put("device_id", deviceId == null ? "" : deviceId);
+        p.put("aid", aid == null ? "6383" : aid);
+        p.put("from_did", fromDid == null ? "0" : fromDid);
+        p.put("user_cip", userCip == null ? "" : userCip);
+        p.put("sec_uid", secUid);
+        p.put("count", String.valueOf(count));
+        p.put("max_cursor", String.valueOf(maxCursor));
+        p.put("reflow_id", reflowId == null ? "" : reflowId);
+        p.put("msToken", msToken == null ? "" : msToken);
+        return encodeQuery(p);
+    }
+
+    /** 签名主页列表 query：a_bogus + secsdk（有 uifid 时） */
+    public static String signPostQuery(String query, String cookie){
+        return signPostQuery(query, cookie, true);
+    }
+
+    /**
+     * @param withSecsdk false 时不签 secsdk（即不夹带 uifid）
+     *        实测：WebView 自己的请求不带 uifid 能翻完全部；带 uifid 反而第 2 页返回 status_code:0
+     */
+    public static String signPostQuery(String query, String cookie, boolean withSecsdk){
+        String uifid = "";
+        if(withSecsdk){
+            uifid = cookieValue(cookie, "UIFID_TEMP");
+            if(uifid.length() == 0) uifid = cookieValue(cookie, "UIFID");
+            if(uifid.length() == 0) uifid = cookieValue(cookie, "uifid");
+        }
+        String aBogus = new ABogusGenerator(UA).getValue(query);
+        String signed = query + "&a_bogus=" + quoteNative(aBogus);
+        if(uifid.length() > 0){
+            signed = signSecsdk(signed, uifid, System.currentTimeMillis() / 1000L);
+        }
+        return signed;
+    }
+
+    /** 从 cookie 里取 msToken，没有就伪造 */
+    public static String msTokenOf(String cookie){
+        String msToken = cookieValue(cookie, "msToken");
+        if(msToken.length() == 0) msToken = fakeMsToken();
+        return msToken;
+    }
+
+
     private static final String WEBSIGN_SALT = "A96D855A08C0A9707F8BEF0D9A527E4E";
     private static final String WEBSIGN_SAFE = "!*'()";
 
