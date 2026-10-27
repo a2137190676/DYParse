@@ -24,7 +24,8 @@
 ## 功能
 
 - 支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube / B站 / Instagram** 的 **视频 / 图文 / 动图** 解析
-- **主页列表**：YouTube 频道 / TikTok 用户 / X 用户主页 / B站空间 / Instagram 用户主页一键列出全部作品，支持逐条下载与全部下载（每页 100 条，带翻页）
+- **主页列表**：YouTube 频道 / TikTok 用户 / X 用户主页 / B站空间 / Instagram 用户主页 / **抖音主页** 一键列出全部作品，支持逐条下载与全部下载（每页 100 条，带翻页）
+- **抖音主页全量翻页（v1.3.7.2）**：主页作品列表一次拿全，实测 280 条作品 16 页全部翻完；需登录 Cookie（登录一次即可，Cookie 只存本机不上传）
 - **Instagram 登录解析**：App 内登录 IG 抓 Cookie 存本地（不上传），带登录态直连解析 Reel 视频流与主页作品列表
 - **B站本地直连**：view / playurl 接口免签直连，单视频、**合集（ugc_season）**、分P、空间主页都能用
 - **X 外链卡片深挖**：纯卡片推文自动解短链挖出视频
@@ -61,6 +62,7 @@
 | 模块 | 方案 |
 |---|---|
 | 抖音 | `WebView` 加载分享页，注入 JS hook 捕获 `fetch` / `XMLHttpRequest` 中的 `aweme_detail` 响应 |
+| 抖音主页 | PC 主页（`www.douyin.com/user/{sec_uid}` + 桌面 UA）+ 签名接口 `aweme/v1/web/aweme/post/`（`aid=6383`、`count=18`、`a_bogus` + secsdk）+ 1500ms 间隔逐页翻完；同 sec_uid 只翻一次，完成后收起 WebView |
 | 快手 | 纯 HTTP，无 WebView，解析分享页 SSR 里的 `window.INIT_STATE` |
 | TikTok | 纯 HTTP + 自管 Cookie 会话，双页面模板互为兜底；下载走服务器中转（tikwm 直链） |
 | X（推特） | fxtwitter / syndication 双源纯 HTTP；挂代理直连 CDN，失败自动回退服务器中转；外链卡片深挖 |
@@ -89,10 +91,12 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 | **Instagram 解析/主页** | 匿名只能拿封面（视频流 403 login_required）；需 App 内登录抓 `sessionid` 存本地，带登录态直连 `api/v1/media` 拿视频直链 | 无 Cookie 提示去登录；主页接口 429 时回退 WebView + 注入 Cookie 收集 |
 | **Instagram Cookie** | 全本地保存 `files/cookies/instagram.txt`，不上传服务器 | 完全不受服务器影响 |
 | **抖音实况图（v1.3.7.1 起本地优先）** | 详情接口强制要求 `UIFID_TEMP` 访客凭据（缺失固定 403 `ArgusSecurityPlugin`）。App 会**自动静默获取**（隐藏 WebView 桌面 UA，实测 2-3 秒），拿到后本地签名，**不走服务器**；服务器只作兜底 | 提前拿过凭据的用户完全不受影响；新装用户只要网络能开抖音页面也能自取 |
+| **抖音主页列表（v1.3.7.2 起本地可用）** | 本地 WebView 跳 PC 主页 + 签名接口翻页，需要登录 Cookie（登录一次即可）。Cookie 只存本机，不上传服务器 | 服务器不可用完全不影响；未登录只能拿到第一页约 20 条 |
 | **自更新加速** | version.json + APK 下发走内置服务器优先 | 自动回退 Gitee / GitHub 直连检查 |
 
 **服务器到期后**（当前 2027-04-20）：
 - 抖音 / 快手解析、下载完全不受影响
+- **抖音主页全量翻页自 v1.3.7.2 起不受影响**（本地 WebView + 签名翻页，Cookie 只存本机）
 - **抖音实况图自 v1.3.7.1 起也不受影响**（凭据 App 内自取 + 本地签名，服务器只兜底）
 - **B站解析、播放、下载不受影响**（本地直连 API + CDN 直连，不依赖服务器）
 - **Instagram 解析、主页、下载不受影响**（Cookie 存本地，全走你自己网络）
