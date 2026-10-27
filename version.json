@@ -1,8 +1,8 @@
 {
-  "tag": "v1.3.7.1",
-  "name": "v1.3.7.1 抖音实况图凭据自动获取 + 本地解析",
-  "body": "DY解析器 v1.3.7.1\n\n新增\n- 抖音访客凭据自动获取：首次解析实况图时后台静默获取，实测 2-3 秒，全程无需操作\n- 设置 → 抖音访客凭据：可手动重新获取、手动粘贴、清空，并实时显示当前凭据状态\n- 抖音实况图改为「本地优先」解析：有凭据时直接本地签名，不再经过服务器\n- 获取失败时弹窗说明原因，提供「重试 / 手动填写」两个入口\n\n修复\n- 抖音实况图只有 1 张静态图、没有动图（LIVE 角标不出来）：详情接口强制要求访客凭据，缺少时固定返回 403 Blocked by ArgusSecurityPlugin；现改为自动获取凭据后本地签名\n- 实况图下载提示文案错误：之前写「可存为 MP4」，实际一直是 .jpg 实况照片，已改正\n- 平台支持说明里抖音一栏补充实况图机制说明\n\n变更\n- 解析优先级调整：无凭据走服务器，有凭据走本地（本地失败自动回退服务器）\n- 服务端 8443 TLS 阻塞热修 + 自愈守卫（详见更新日志 v1.3.7）\n- 版本号规则支持四位（1.3.7.1 = build 103701）\n\n依赖变化\n- 抖音实况图从「必须服务器」变成「本地可用，服务器仅兜底」\n\n反馈群：995434160\nGitHub / Gitee 同步更新",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.1/DYParse-v1.3.7.1.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.1/DYParse-v1.3.7.1.apk",
-  "released": "2026-10-25"
+  "tag": "v1.3.7.2",
+  "name": "v1.3.7.2 抖音主页全量翻页 + 登录体验统一",
+  "body": "DY解析器 v1.3.7.2\n\n新增\n- 抖音主页全量翻页：主页作品列表一次拿全，实测 280 条作品 16 页全部翻完（日志 DYPROF_DONE n=280 pages=16）\n- 设置 → 抖音主页登录：登录成功后自动回到解析页，和 YouTube 一致，不用再手动点「完成」\n- 设置 → 抖音 Cookie 状态：可查看已保存的字段（只显示有无，不显示值）、手动清空\n\n优化\n- 三平台登录行为统一：YouTube / 抖音 / B站 全部改为「抓到 Cookie → 自动隐藏顶栏 + 清空网页 + 恢复手机 UA + 回解析页」\n- 登录菜单改为两步弹窗：先说明再选操作，修复之前列表被挤掉只剩「关闭」按钮的问题\n- 抖音 Cookie 存储路径迁移到 Android/data/<包名>/files/cookies/，文件管理器可见可备份，卸载自动清理\n\n修复\n- 崩溃：ClassCastException LinearLayout cannot be cast to FrameLayout（MainActivity.showDyLoginBar，B站同类问题一并修好）\n- 连续解析第二次主页只拿到 20/38 条：extractSecUid 正则漏了 sec_user_id= 写法，且翻页完成后误置 profileMode=false 导致渲染被跳过\n- 抖音主页跳转被打回手机版：跳转前设置桌面 UA + 拦截一次 m.douyin.com/share/user/\n\n变更\n- 抖音 Cookie 读写策略定版：CookieManager 实时优先，本地文件仅作重启兜底（本地是登录瞬间的死快照，msToken 几分钟即过期）\n- 抖音移动版登录入口已移除：m.douyin.com 已下线 404，手机 UA 被 302 到 PC 版，passport 登录报「非法应用」\n\n依赖变化\n- 抖音主页全量解析不需要服务器，也不需要访客凭据，只要登录 Cookie（登录一次即可）\n- 服务器到期不影响抖音主页解析与下载\n\n反馈群：995434160\nGitHub / Gitee 同步更新",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.2/DYParse-v1.3.7.2.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.2/DYParse-v1.3.7.2.apk",
+  "released": "2026-10-28"
 }
