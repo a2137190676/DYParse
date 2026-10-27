@@ -264,6 +264,305 @@ public class MainActivity extends Activity {
         }catch(Throwable t){ Log.i("DYP", "INS_CK_GRAB_ERR " + t); }
     }
 
+    // ================= 抖音主页：桌面 UA + 登录态（唯一能拿全量列表的路径） =================
+    // 实测结论：安卓 UA 只给 15 条；桌面 UA 不登录会要求登录；桌面 UA + 登录可翻到全部。
+
+    volatile boolean dyProfileLoginMode = false;
+
+    /** 设置页入口：抖音主页登录（用于解析完整作品列表） */
+    void showDyProfileLoginMenu(){
+        curDark = isDarkMode();
+        boolean logged = dyProfileCookiesLikelyLoggedIn();
+        int n = CookieStore.count(this, CookieStore.PLATFORM_DY);
+        dypDlg()
+            .setTitle("抖音主页登录")
+            .setMessage("解析主页时要看到全部作品，需要登录抖音账号。\n\n"
+                + "实测结论：\n"
+                + "· 未登录：主页接口只回第一页，约 21 条，后面直接返回空\n"
+                + "· 已登录：可以逐页翻完（实测 49 条作品 3 页拿全）\n"
+                + "· 不需要访客凭据 UIFID，只要登录 Cookie + 签名就够\n\n"
+                + "说明：抖音没有移动版网页登录入口，网页端登录会要求手机 App 扫码验证，"
+                + "这是平台风控，无法绕过。\n"
+                + "推荐「手动填 Cookie」：电脑浏览器登录后复制过来，一次搞定。\n\n"
+                + "Cookie 只存手机本地，不上传服务器，也不发给任何第三方。\n"
+                + (logged ? "\n当前状态：已检测到登录票据。" : "\n当前状态：还没有登录。"))
+            .setPositiveButton("选择操作", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    showDyLoginActions();
+                }})
+            .setNegativeButton("关闭", null)
+            .show();
+    }
+
+    /** 第二步：选择具体操作（用独立弹窗，避免 setMessage + setItems 把列表挤掉） */
+    void showDyLoginActions(){
+        curDark = isDarkMode();
+        int n = CookieStore.count(this, CookieStore.PLATFORM_DY);
+        final String[] items = new String[]{
+            "页面内登录（网页端，可能要求扫码）",
+            "手动填 Cookie（电脑浏览器复制，最稳）",
+            (n > 0 ? "查看当前 Cookie 状态（已有 " + n + " 项）" : "查看当前 Cookie 状态（本地为空）"),
+            "清空已保存的抖音 Cookie"
+        };
+        dypDlg()
+            .setTitle("选择操作")
+            .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(w == 0){
+                        startDyProfileLogin();
+                    } else if(w == 1){
+                        showCookieDialog(CookieStore.PLATFORM_DY, "抖音");
+                    } else if(w == 2){
+                        showDyCookieStatus();
+                    } else if(w == 3){
+                        clearDyProfileLogin();
+                    }
+                }})
+            .setNegativeButton("返回", null)
+            .show();
+    }
+
+    /** 查看抖音 Cookie 当前状态（只显示名称，不显示值，避免泄露） */
+    void showDyCookieStatus(){
+        curDark = isDarkMode();
+        StringBuilder b = new StringBuilder();
+        String file = CookieStore.filePath(this, CookieStore.PLATFORM_DY);
+        int n = CookieStore.count(this, CookieStore.PLATFORM_DY);
+        b.append("文件：").append(file).append("\n\n");
+        if(n == 0){
+            b.append("本地还没有保存任何抖音 Cookie。\n\n");
+        } else {
+            java.util.List<String> names = CookieStore.names(this, CookieStore.PLATFORM_DY);
+            boolean hasSid = names.contains("sessionid");
+            boolean hasSidTt = names.contains("sid_tt");
+            boolean hasUidTt = names.contains("uid_tt");
+            b.append("已保存 ").append(n).append(" 项\n\n");
+            b.append("登录票据：\n");
+            b.append("  sessionid  ").append(hasSid ? "有" : "无").append("\n");
+            b.append("  sid_tt     ").append(hasSidTt ? "有" : "无").append("\n");
+            b.append("  uid_tt     ").append(hasUidTt ? "有" : "无").append("\n\n");
+            if(hasSid || hasSidTt || hasUidTt){
+                b.append("判断：登录态可用，主页可以翻完所有作品。\n\n");
+            } else {
+                b.append("判断：缺登录票据，主页只能拿到约 21 条。\n\n");
+            }
+            StringBuilder nm = new StringBuilder();
+            for(String k : names){
+                if(nm.length() > 0) nm.append(", ");
+                nm.append(k);
+            }
+            b.append("全部名称：\n").append(nm);
+        }
+        dypDlg().setTitle("抖音 Cookie 状态").setMessage(b.toString())
+            .setPositiveButton("知道了", null).create().show();
+    }
+
+    /** 打开抖音 PC 版登录页（桌面 UA），登录后 Cookie 自动进 CookieManager 并落盘到本地 */
+    void startDyProfileLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = false;
+        dyProfileLoginMode = true;
+        dyMobileLogin = false;
+        dyMobileHomeBlocked = false;
+        profileMode = false;
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        try{
+            WebSettings ws = web.getSettings();
+            ws.setUserAgentString(DyDetail.UA);   // 桌面 UA 必须，否则拿不到全量
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+        }catch(Throwable t){}
+        showDyLoginBar();
+        DiagLog.i(DiagLog.M_PARSE, "打开抖音登录页（桌面 UA，登录后 Cookie 自动存本地）");
+        web.loadUrl("https://www.douyin.com/");
+    }
+
+    /** 是否处于移动版登录模式 */
+    volatile boolean dyMobileLogin = false;
+    /** 移动版登录时已拦过一次 PC 跳转（只拦一次，避免死循环） */
+    volatile boolean dyMobileHomeBlocked = false;
+    /** 主页翻页是否夹带 uifid。默认 true：带 uifid 时第 1 页能拿到 18 条；不带会连第 1 页都空 */
+    volatile boolean dyWithUifid = true;
+    /** WebView 自己发出的那条 aweme/post 请求的原始 URL（翻页参数以它为模板） */
+    volatile String dyWebReqUrl = "";
+    /** 主页解析时是否已切到桌面 UA 并跳到 PC 主页 */
+    volatile boolean dyProfilePcUA = false;
+    /** 是否已拦过一次打回手机版的跳转 */
+    volatile boolean dyBlockedMobileShare = false;
+    /** PC 主页是否正在自动滚动收集 */
+    volatile boolean dyAutoScrolling = false;
+
+    /** 在 onPageStarted 时注入桌面伪装（必须每页都注入，且要早于页面脚本执行） */
+    void injectDesktopSpoof(android.webkit.WebView wv){
+        try{
+            String js =
+                "(function(){try{"
+                + "var def=function(o,k,v){try{Object.defineProperty(o,k,{get:function(){return v;},configurable:true});}catch(e){}};"
+                + "def(navigator,'platform','Win32');"
+                + "def(navigator,'vendor','Google Inc.');"
+                + "def(navigator,'maxTouchPoints',0);"
+                + "def(navigator,'hardwareConcurrency',8);"
+                + "try{def(screen,'width',1920);def(screen,'height',1080);}catch(e){}"
+                + "try{def(screen,'availWidth',1920);def(screen,'availHeight',1040);def(screen,'colorDepth',24);}catch(e){}"
+                + "try{if(navigator.userAgentData){def(navigator.userAgentData,'platform','Windows');}}catch(e){}"
+                + "window.__dySpoofed=1;"
+                + "}catch(e){}})();";
+            wv.evaluateJavascript(js, null);
+        }catch(Throwable t){
+            DiagLog.e(DiagLog.M_PARSE, "注入桌面伪装失败", t);
+        }
+    }
+
+    void clearDyProfileLogin(){
+        try{
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            String ck = cm.getCookie("https://www.douyin.com/");
+            if(ck != null){
+                for(String kv : ck.split(";")){
+                    String k = kv.trim();
+                    int e = k.indexOf('=');
+                    if(e > 0) k = k.substring(0, e);
+                    cm.setCookie("https://www.douyin.com/", k + "=; Max-Age=0; path=/");
+                    cm.setCookie("https://www.iesdouyin.com/", k + "=; Max-Age=0; path=/");
+                }
+                cm.flush();
+            }
+            // 本地文件也一起清掉，否则 dyEffectiveCookie 还会读出来继续用
+            CookieStore.clear(this, CookieStore.PLATFORM_DY);
+            dyCookieLast = "";
+            DiagLog.i(DiagLog.M_PARSE, "已清空抖音登录 Cookie（WebView + 本地文件）");
+            showHintToast("已清空抖音登录状态");
+        }catch(Throwable t){
+            DiagLog.e(DiagLog.M_PARSE, "清空抖音登录失败", t);
+        }
+    }
+
+/** 退出抖音登录页：和 YouTube 一样，直接回到解析页，不保留网页 */
+    void stopDyProfileLogin(){
+        if(!dyProfileLoginMode) return;
+        dyProfileLoginMode = false;
+        dyMobileLogin = false;
+        dyMobileHomeBlocked = false;
+        try{
+            if(web != null){
+                // 清掉登录页，避免下次解析时残留页面和 hook
+                web.loadUrl("about:blank");
+                web.setVisibility(View.GONE);
+                // 恢复成 1x1 占位（YouTube 也是这么收起的）
+                web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+            }
+        }catch(Throwable t){}
+        try{
+            if(pageParse != null) pageParse.setVisibility(View.VISIBLE);
+        }catch(Throwable t){}
+        // 恢复成手机 UA，避免影响后续正常解析
+        try{
+            if(web != null && webReady){
+                WebSettings ws = web.getSettings();
+                ws.setUserAgentString(
+                    "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+                    + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                if(android.os.Build.VERSION.SDK_INT >= 29){
+                    ws.setForceDark(WebSettings.FORCE_DARK_AUTO);
+                }
+                if(android.os.Build.VERSION.SDK_INT >= 33){
+                    ws.setAlgorithmicDarkeningAllowed(true);
+                }
+            }
+        }catch(Throwable t){}
+        int n = CookieStore.count(this, CookieStore.PLATFORM_DY);
+        DiagLog.i(DiagLog.M_PARSE, "退出抖音登录页 | 本地 Cookie " + n + " 项 | 已切回解析页");
+        showHintToast(n > 0 ? ("登录完成，已回到解析页（Cookie " + n + " 项）")
+                            : "已回到解析页（未抓到 Cookie）");
+        try{ refreshSettingRows(); }catch(Throwable t){}
+    }
+    /** 手动填写的抖音 Cookie 是否可用 */
+    boolean dyManualCookieOk(){
+        try{
+            String m = CookieStore.dump(this, CookieStore.PLATFORM_DY);
+            return m != null && m.trim().length() > 0;
+        }catch(Throwable t){ return false; }
+    }
+
+    /** 实际用的抖音 Cookie。
+     *  优先级：CookieManager（WebView 实时，会自动刷新 msToken / __ac_signature / ttwid）
+     *        → 本地文件（App 重启、WebView 数据被清后的兜底）
+     *  注意：顺序不能反。本地文件是登录那一刻的快照，里面的 msToken 等签名字段不会更新，
+     *  用它去翻页第 2 页就被服务端拒（这也是之前「第一次能拿 49 条、后面只 18 条」的原因）。 */
+    String dyEffectiveCookie(){
+        try{
+            String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+            if(cm != null && cm.length() > 0
+                    && (cm.indexOf("sessionid=") >= 0 || cm.indexOf("sid_tt=") >= 0)){
+                Log.i("DYP", "DY_CK_SOURCE webview(live) len=" + cm.length());
+                return cm;
+            }
+        }catch(Throwable t){}
+        try{
+            String local = CookieStore.header(this, CookieStore.PLATFORM_DY);
+            if(local != null && local.trim().length() > 0){
+                Log.i("DYP", "DY_CK_SOURCE local(fallback) len=" + local.length());
+                return local;
+            }
+        }catch(Throwable t){}
+        try{
+            return CookieManager.getInstance().getCookie("https://www.douyin.com/");
+        }catch(Throwable t){ return null; }
+    }
+
+    /** App 启动时：把本地保存的抖音 Cookie 灌回 CookieManager（WebView 数据被清后仍能用） */
+    void restoreDyCookieToWebView(){
+        try{
+            String local = CookieStore.header(this, CookieStore.PLATFORM_DY);
+            if(local == null || local.length() < 32) return;
+            String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+            boolean liveOk = cm != null && (cm.indexOf("sessionid=") >= 0 || cm.indexOf("sid_tt=") >= 0);
+            if(liveOk) {
+                Log.i("DYP", "DY_CK_RESTORE skip webview_already_ok");
+                return;
+            }
+            android.webkit.CookieManager c = android.webkit.CookieManager.getInstance();
+            int n = 0;
+            for(String kv : local.split(";")){
+                String s = kv.trim();
+                int e = s.indexOf('=');
+                if(e <= 0) continue;
+                String name = s.substring(0, e).trim();
+                String val = s.substring(e + 1).trim();
+                if(name.length() == 0 || val.length() == 0) continue;
+                c.setCookie("https://www.douyin.com/", name + "=" + val + "; path=/");
+                c.setCookie("https://www.iesdouyin.com/", name + "=" + val + "; path=/");
+                n++;
+            }
+            c.flush();
+            Log.i("DYP", "DY_CK_RESTORE ok n=" + n);
+        }catch(Throwable t){
+            Log.i("DYP", "DY_CK_RESTORE_ERR " + t);
+        }
+    }
+
+    /** 粗略判断是否像登录状态：有 sessionid 之类的登录票据 */
+    boolean dyProfileCookiesLikelyLoggedIn(){
+        try{
+            String ck = dyEffectiveCookie();
+            if(ck == null) return false;
+            return ck.indexOf("sessionid") >= 0 || ck.indexOf("sid_tt") >= 0
+                    || ck.indexOf("uid_tt") >= 0;
+        }catch(Throwable t){ return false; }
+    }
+
     /** Instagram 登录 WebView：加载 IG 登录页，抓 Cookie 后保持页面，等用户点「完成」 */
     void startInsLogin(){
         switchTab(0);
@@ -508,6 +807,40 @@ public class MainActivity extends Activity {
         }catch(Throwable t){ return false; }
     }
 
+    /** 取当前访客凭据值（没有返回空串） */
+    /** 当前 uifid：优先用 WebView 实时 Cookie 里的（登录后下发，最新最准），
+     *  没有再回落到本地文件，最后才用 SharedPreferences 里的访客凭据 */
+    String dyCurUifid(){
+        try{
+            // 1) WebView 实时 Cookie
+            try{
+                String ck = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+                String v = pickUifid(ck);
+                if(v.length() >= 32){ Log.i("DYP", "DY_UID_SRC webview len=" + v.length()); return v; }
+            }catch(Throwable t){}
+            // 2) 本地文件
+            try{
+                String ck = CookieStore.header(this, CookieStore.PLATFORM_DY);
+                String v = pickUifid(ck);
+                if(v.length() >= 32){ Log.i("DYP", "DY_UID_SRC local len=" + v.length()); return v; }
+            }catch(Throwable t){}
+            // 3) 访客凭据
+            if(!dyHasUifid()) return "";
+            String v2 = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_UIFID, "");
+            if(v2 != null && v2.length() > 0) Log.i("DYP", "DY_UID_SRC sp len=" + v2.length());
+            return v2 == null ? "" : v2;
+        }catch(Throwable t){ return ""; }
+    }
+
+    /** 从 cookie 串里挑 UIFID_TEMP / UIFID / uifid */
+    static String pickUifid(String ck){
+        if(ck == null) return "";
+        String v = cookieValueOf(ck, "UIFID_TEMP");
+        if(v.length() < 32) v = cookieValueOf(ck, "UIFID");
+        if(v.length() < 32) v = cookieValueOf(ck, "uifid");
+        return v;
+    }
+
     /** 抖音凭据状态文案（设置页副标题用） */
     String curDyUifidLabel(){
         if(dyHasUifid()){
@@ -706,12 +1039,99 @@ public class MainActivity extends Activity {
     TextView biliBarStatus;
     android.widget.Button biliBarDone;
 
+    /** 抖音登录页顶部操作条：显示 Cookie 抓取状态 + 完成/取消 */
+    void showDyLoginBar(){
+        try{
+            if(dyBarDone != null && dyBarDone.getParent() != null) return;
+            // web 的父容器可能是 LinearLayout / FrameLayout / RelativeLayout，不能硬转 FrameLayout
+            android.view.ViewGroup host = (web == null) ? null
+                    : (web.getParent() instanceof android.view.ViewGroup
+                        ? (android.view.ViewGroup) web.getParent() : null);
+            if(host == null) return;
+
+            LinearLayout bar = new LinearLayout(this);
+            bar.setOrientation(LinearLayout.HORIZONTAL);
+            bar.setBackgroundColor(curDark ? 0xFF22262E : 0xFFFFFFFF);
+            bar.setPadding(dp(12), dp(8), dp(8), dp(8));
+            bar.setId(900004);
+
+            dyBarStatus = new TextView(this);
+            dyBarStatus.setTextSize(12);
+            dyBarStatus.setTextColor(curDark ? 0xFFB8BEC9 : 0xFF4B5563);
+            int n0 = CookieStore.count(this, CookieStore.PLATFORM_DY);
+            dyBarStatus.setText(n0 > 0
+                ? ("已登录（" + n0 + " 项），可点「完成」")
+                : "登录成功后自动回解析页…");
+            LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            bar.addView(dyBarStatus, lp1);
+
+            dyBarDone = new android.widget.Button(this);
+            dyBarDone.setText("完成");
+            dyBarDone.setTextSize(13);
+            dyBarDone.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                int n = CookieStore.count(MainActivity.this, CookieStore.PLATFORM_DY);
+                hideDyLoginBar();
+                stopDyProfileLogin();
+                if(n <= 0) showHintToast("还没抓到 Cookie，可以改用「手动填 Cookie」");
+            }});
+            bar.addView(dyBarDone);
+
+            dyBarCancel = new android.widget.Button(this);
+            dyBarCancel.setText("取消");
+            dyBarCancel.setTextSize(13);
+            dyBarCancel.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                hideDyLoginBar();
+                stopDyProfileLogin();
+            }});
+            bar.addView(dyBarCancel);
+
+            // LayoutParams 类型必须和父容器匹配，否则 addView 会抛 ClassCastException
+            android.view.ViewGroup.LayoutParams flp;
+            if(host instanceof android.widget.FrameLayout){
+                android.widget.FrameLayout.LayoutParams p =
+                    new android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+                p.gravity = android.view.Gravity.TOP;
+                flp = p;
+            } else if(host instanceof LinearLayout){
+                flp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            } else {
+                flp = new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            }
+            host.addView(bar, flp);
+        }catch(Throwable t){ DiagLog.e(DiagLog.M_PARSE, "显示抖音登录操作条失败", t); }
+    }
+
+    void hideDyLoginBar(){
+        try{
+            if(dyBarDone != null && dyBarDone.getParent() instanceof android.view.ViewGroup){
+                ((android.view.ViewGroup) dyBarDone.getParent().getParent()).removeView(
+                    (View) dyBarDone.getParent());
+            }
+        }catch(Throwable t){}
+        dyBarDone = null;
+        dyBarStatus = null;
+        dyBarCancel = null;
+    }
+
+    android.widget.Button dyBarDone = null;
+    android.widget.Button dyBarCancel = null;
+    TextView dyBarStatus = null;
+
     void showBiliLoginBar(){
         try{
             if(biliBarDone != null && biliBarDone.getParent() != null) return;
-            android.widget.FrameLayout host = (android.widget.FrameLayout) web.getParent();
+            // 同抖音：父容器类型不固定，不能硬转 FrameLayout
+            android.view.ViewGroup host = (web == null) ? null
+                    : (web.getParent() instanceof android.view.ViewGroup
+                        ? (android.view.ViewGroup) web.getParent() : null);
             if(host == null) return;
-
             LinearLayout bar = new LinearLayout(this);
             bar.setOrientation(LinearLayout.HORIZONTAL);
             bar.setBackgroundColor(curDark ? 0xFF22262E : 0xFFFFFFFF);
@@ -742,10 +1162,23 @@ public class MainActivity extends Activity {
             }});
             bar.addView(biliBarDone);
 
-            android.widget.FrameLayout.LayoutParams flp = new android.widget.FrameLayout.LayoutParams(
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
-            flp.gravity = android.view.Gravity.TOP;
+            android.view.ViewGroup.LayoutParams flp;
+            if(host instanceof android.widget.FrameLayout){
+                android.widget.FrameLayout.LayoutParams p =
+                    new android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+                p.gravity = android.view.Gravity.TOP;
+                flp = p;
+            } else if(host instanceof LinearLayout){
+                flp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            } else {
+                flp = new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            }
             host.addView(bar, flp);
             bar.bringToFront();
         }catch(Throwable t){ Log.i("DYP", "BILI_BAR_ERR " + t); }
@@ -1069,6 +1502,13 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle b){
         super.onCreate(b);
         savedState = b;
+        // 日志系统：先初始化，后面所有失败信息才有地方落盘
+        DiagLog.init(this);
+        AppInfo.init(this);
+        installCrashHandler();
+        // 把本地保存的各平台 Cookie 灌回 WebView（不覆盖已有的实时 Cookie）
+        try{ restoreDyCookieToWebView(); }catch(Throwable t){}
+        DiagLog.i(DiagLog.M_APP, "=== App 启动 === " + AppInfo.versionLine() + " | " + AppInfo.deviceLine());
         Log.i("DYP", "SRV_DEBUG addr=[" + SrvSecret.serverAddr() + "] hmacLen=" + SrvSecret.hmacKey().length());
         appLog("启动", "v" + versionName() + " (build " + curVersionCode() + ") 内置服务器=" + (SrvSecret.serverAddr().length() > 0 ? "ON" : "OFF"));
         setContentView(R.layout.activity_main);
@@ -1184,6 +1624,14 @@ public class MainActivity extends Activity {
             int pageHits=0;
             public void onPageStarted(WebView v,String u,android.graphics.Bitmap f){
                 v.evaluateJavascript(HOOK_JS,null);
+                // 抖音主页登录模式：PC 版才注入桌面伪装（移动版不需要，注入了反而可能出问题）
+                if(dyProfileLoginMode && !dyMobileLogin && u != null && u.indexOf("douyin.com") >= 0){
+                    injectDesktopSpoof(v);
+                }
+                // 抖音主页解析模式：已跳到 PC 主页时也要伪装，否则前端检测到 Android 会退回手机版
+                if(profileMode && dyProfilePcUA && u != null && u.indexOf("douyin.com") >= 0){
+                    injectDesktopSpoof(v);
+                }
                 // 【临时探测】抖音首页加载后，把 cookie 里是否有 UIFID_TEMP 打出来
                 if(u != null && u.contains("douyin.com") && u.indexOf("/video/") < 0
                         && u.indexOf("/note/") < 0 && u.indexOf("share/") < 0){
@@ -1231,6 +1679,26 @@ public class MainActivity extends Activity {
             }
             public boolean shouldOverrideUrlLoading(WebView v,String u){
                 if(u==null) return false;
+                // 抖音主页模式：阻止被打回手机版名片页（m.douyin.com/share/user），
+                // 否则永远留在分享页 API 上，只能拿到一页数据
+                if(profileMode && dyProfilePcUA && u != null
+                        && u.indexOf("m.douyin.com") >= 0 && u.indexOf("/share/user/") >= 0){
+                    if(!dyBlockedMobileShare){
+                        dyBlockedMobileShare = true;
+                        Log.i("DYP", "DYPROF_BLOCK_M " + u.substring(0, Math.min(90, u.length())));
+                        DiagLog.i(DiagLog.M_PARSE, "阻止抖音把主页打回手机版，保持在 PC 主页");
+                    }
+                    return true;
+                }
+                // 抖音主页/登录模式：拦住所有唤起抖音 App 的 intent（snssdk / bytedance / aweme scheme）
+                // 否则抖音 App 会被拉到前台，WebView 里的页面被切走，翻页直接断掉
+                if((profileMode || dyProfileLoginMode) && u != null && (
+                        u.startsWith("snssdk") || u.startsWith("aweme") || u.startsWith("bytedance")
+                        || u.startsWith("intent:") || u.indexOf("snssdk1128") >= 0
+                        || u.indexOf("openapp.jdmobile") >= 0 || u.indexOf("package=com.ss.android.ugc.aweme") >= 0)){
+                    Log.i("DYP", "DYPROF_BLOCK_APP " + u.substring(0, Math.min(80, u.length())));
+                    return true;
+                }
                 if(u.startsWith("http://")||u.startsWith("https://")) return false;
                 Log.i("DYP","BLOCK_SCHEME "+u);
                 return true;
@@ -1314,34 +1782,77 @@ boolean isProfileList = u != null && profileMode && (
                           || (u.indexOf("instagram.com") >= 0 && u.indexOf("graphql") >= 0)
                           || (u.indexOf("instagram.com") >= 0 && u.indexOf("/api/v1/feed/user/") >= 0)
                           || (u.indexOf("instagram.com") >= 0 && u.indexOf("/api/v1/users/") >= 0));
-                     if(isProfileList && !profileFetching){
-                         profileFetching = true;
-                         final String lu = u;
-                         Log.i("DYP", "PROFILE_LIST_HIT " + u.substring(0, Math.min(200, u.length())));
-                         new Thread(new Runnable(){ public void run(){
-                             try{
-                                 String ck = CookieManager.getInstance().getCookie(lu);
-                                 java.net.HttpURLConnection c = MainActivity.openConn(MainActivity.this, lu);
-                                 c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
-                                 c.setRequestProperty("Referer", lu.contains("kuaishou") ? "https://live.kuaishou.com/"
-                                         : lu.contains("bilibili") ? "https://space.bilibili.com/" : "https://www.iesdouyin.com/");
-                                 c.setRequestProperty("Accept", "application/json,*/*");
-                                 if(ck != null) c.setRequestProperty("Cookie", ck);
-                                 c.setConnectTimeout(12000); c.setReadTimeout(15000);
-                                 java.io.InputStream in = c.getInputStream();
-                                 java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
-                                 byte[] buf = new byte[8192]; int n;
-                                 while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
-                                 in.close();
-                                 String body = new String(bo.toByteArray(), "UTF-8");
-                                 Log.i("DYP", "PROFILE_BODY len=" + body.length());
-                                 if(body.length() > 100){
-                                     parseProfileBody(body);
-                                 }
-                             }catch(Throwable t){ Log.i("DYP", "PROFILE_REQ_ERR " + t); }
-                             profileFetching = false;
-                         }}).start();
-                     }
+if(isProfileList && !profileFetching){
+                          // 同一个 sec_uid 只翻一次：页面会反复发 aweme/post（首屏 + 预加载 + 重试），
+                          // 每来一条就起一个翻页任务，多个任务并发会互相覆盖/截断，表现为「只出 20 条」
+                          String secNow = extractSecUid(u);
+                          if(secNow != null && secNow.length() > 10
+                                  && secNow.equals(dyProfileDoneSecUid)){
+                              Log.i("DYP", "DYPROF_SKIP_DUP sec_uid 已翻完，忽略重复请求");
+                              return null;
+                          }
+                          profileFetching = true;
+                          final String lu = u;
+                          Log.i("DYP", "PROFILE_LIST_HIT " + u.substring(0, Math.min(200, u.length())));
+                          // 诊断：WebView 自己发的抖音主页请求，把 cursor 和是否有 msToken/uifid 打出来
+                          if(u.indexOf("aweme/post") >= 0 || u.indexOf("/aweme/v1/web/aweme/post/") >= 0){
+                              String ck2 = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+                              Log.i("DYP", "DYPROF_WEBREQ hasMsToken=" + (u.indexOf("msToken=") >= 0 ? 1 : 0)
+                                  + " hasUifid=" + (u.indexOf("uifid=") >= 0 ? 1 : 0)
+                                  + " hasABogus=" + (u.indexOf("a_bogus=") >= 0 ? 1 : 0)
+                                  + " ckUifid=" + (ck2 != null && ck2.indexOf("UIFID") >= 0 ? 1 : 0));
+                              // 完整参数名列表 + count/max_cursor 实际值，用于和自建请求对比
+                              try{
+                                  int qq = u.indexOf('?');
+                                  if(qq > 0){
+                                      StringBuilder names = new StringBuilder();
+                                      String cursorVal = "?", countVal = "?";
+                                      for(String kv : u.substring(qq + 1).split("&")){
+                                          int ee = kv.indexOf('=');
+                                          String k = ee > 0 ? kv.substring(0, ee) : kv;
+                                          if(names.length() > 0) names.append(',');
+                                          names.append(k);
+                                          if(k.equals("max_cursor")) cursorVal = kv.substring(ee + 1);
+                                          if(k.equals("count")) countVal = kv.substring(ee + 1);
+                                      }
+                                      Log.i("DYP", "DYPROF_WEBKEYS cursor=" + cursorVal + " count=" + countVal
+                                          + " keys=" + names);
+                                  }
+                              }catch(Throwable t){}
+                          }
+                          new Thread(new Runnable(){ public void run(){
+                              try{
+                                  // 抖音主页：交回 WebView 自己翻页（PROFILE_HOOK_JS 会 hook fetch/XHR + 自动滚动），
+                                  // 这里不再重发请求——重发只会拿到第一页（a_bogus 签名含 cursor，匿名翻页被服务端掐掉）
+                                  boolean isDy = lu.indexOf("/aweme/post/") >= 0 && lu.indexOf("kuaishou") < 0;
+                                  if(isDy){
+                                      // 抖音主页：签名接口翻页（带 uifid + 登录 Cookie）
+                                      Log.i("DYP", "DYPROF_USE_SIGNED 先用签名接口翻页");
+                                      fetchAllDyProfilePages(lu);
+                                  } else {
+                                      String ck = CookieManager.getInstance().getCookie(lu);
+                                      java.net.HttpURLConnection c = MainActivity.openConn(MainActivity.this, lu);
+                                      c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                                      c.setRequestProperty("Referer", lu.contains("kuaishou") ? "https://live.kuaishou.com/"
+                                              : lu.contains("bilibili") ? "https://space.bilibili.com/" : "https://www.iesdouyin.com/");
+                                      c.setRequestProperty("Accept", "application/json,*/*");
+                                      if(ck != null) c.setRequestProperty("Cookie", ck);
+                                      c.setConnectTimeout(12000); c.setReadTimeout(15000);
+                                      java.io.InputStream in = c.getInputStream();
+                                      java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                                      byte[] buf = new byte[8192]; int n;
+                                      while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                                      in.close();
+                                      String body = new String(bo.toByteArray(), "UTF-8");
+                                      Log.i("DYP", "PROFILE_BODY len=" + body.length());
+                                      if(body.length() > 100){
+                                          parseProfileBody(body);
+                                      }
+                                  }
+                              }catch(Throwable t){ Log.i("DYP", "PROFILE_REQ_ERR " + t); }
+                              profileFetching = false;
+                          }}).start();
+                      }
                      if(u != null && u.indexOf("slidesinfo") >= 0){
                         Log.i("DYP", "INTERCEPT_HIT " + u.substring(0, Math.min(180, u.length())));
                         // 用同一份 Cookie 自己发一次，拿到 body
@@ -1379,7 +1890,22 @@ boolean isProfileList = u != null && profileMode && (
             public void onPageFinished(WebView v,String u){
                 pageHits++;
                 Log.i("DYP","onPageFinished#"+pageHits+" "+u);
-                // Instagram 登录模式：检测登录态，不跑抖音解析逻辑
+                // 抖音主页登录模式：每页加载完就尝试把登录 Cookie 落到本地；抓到就自动退出回解析页
+                if(dyProfileLoginMode){
+                    if(u != null && u.indexOf("douyin.com") >= 0){
+                        Log.i("DYP","DY_PROFILE_LOGIN_PAGE " + u.substring(0, Math.min(80, u.length())));
+                        final boolean got = saveDyCookieLocal(null);
+                        if(got){
+                            // 和 YouTube 一样：抓到 Cookie 就直接回解析页，不保留网页
+                            DiagLog.i(DiagLog.M_PARSE, "抖音登录成功，自动回到解析页");
+                            h.postDelayed(new Runnable(){ public void run(){
+                                hideDyLoginBar();
+                                stopDyProfileLogin();
+                            }}, 800);
+                        }
+                    }
+                    return;
+                }
                 // B站 登录模式：检测登录态，不跑抖音解析逻辑
                 if(biliLoginMode){
                     if(u != null && (u.contains("bilibili.com") || u.contains("bilivideo.com"))){
@@ -1408,8 +1934,14 @@ boolean isProfileList = u != null && profileMode && (
                                                         BiliParser.buvid3 = "";
                                                         BiliParser.biliLoginLogged = false;
                                                         Log.i("DYP","BILI_CK_GRAB len=" + full.length() + " saved=" + n);
-                                                        s("B站 Cookie 已保存（" + n + " 项）");
-                                                        updateBiliLoginBar();
+                                                        DiagLog.i(DiagLog.M_PARSE, "B站登录成功，Cookie 已存本地（" + n + " 项），自动回解析页");
+                                                        // 和 YouTube / 抖音一样：抓到就自动退出，不保留网页
+                                                        h.postDelayed(new Runnable(){ public void run(){
+                                                            hideBiliLoginBar();
+                                                            stopBiliLogin();
+                                                            buildSettingsPage();
+                                                            showHintToast("B站登录成功（" + n + " 项 Cookie），已回解析页");
+                                                        }}, 800);
                                                     }
                                                 }});
                                         }});
@@ -1501,16 +2033,55 @@ boolean isProfileList = u != null && profileMode && (
                     }
                     return;
                 }
-                // 页面级主页检测：短链跳转 / 用户自己改链都适用
-                if(isProfilePage(u) && !profileMode){
-                    Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
+// 页面级主页检测：短链跳转 / 用户自己改链都适用
+                 if(isProfilePage(u) && !profileMode){
+                     // 签名翻页已出结果：拒绝页面再触发新一轮，避免覆盖
+                     if(dyProfileRenderLocked){
+                         Log.i("DYP", "PROFILE_AUTO_SKIP 结果已锁定，忽略页面触发");
+                         return;
+                     }
+                     // 已经翻完并渲染出结果的主页，不再被页面的二次跳转覆盖
+                     String secSeen = extractSecUid(u);
+                     if(secSeen != null && secSeen.length() > 10
+                             && secSeen.equals(dyProfileDoneSecUid) && profileCollected.size() > 0){
+                         Log.i("DYP", "PROFILE_AUTO_SKIP 该主页已翻完，忽略重复触发");
+                         return;
+                     }
+                     Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                     profileMode = true;
+                    dyProfileJumped = false;
+                    dyProfilePcUA = false;
+                    dyBlockedMobileShare = false;
+                    dyProfileSignedOwned = false;
                     webDone = true;
                     synchronized(profileCollected){ profileCollected.clear(); } profilePage = 0;
                     synchronized(profileSeen){ profileSeen.clear(); }
                     s("主页网页加载中，自动收集作品…");
                 }
                 if(profileMode){
+                    // 抖音分享页（iesdouyin.com/share/user/）只是个人名片，没有作品列表。
+                    // 跳到 PC 主页 www.douyin.com/user/{sec_uid}，让页面自己加载列表 + 自己翻页
+                    if(u != null && u.indexOf("/share/user/") >= 0
+                            && (u.indexOf("iesdouyin.com") >= 0 || u.indexOf("douyin.com") >= 0)){
+                        final String sec = extractSecUid(u);
+                        if(sec != null && sec.length() > 10 && !dyProfileJumped){
+                            dyProfileJumped = true;
+                            Log.i("DYP", "DYPROF_JUMP_SEC " + sec);
+                            h.postDelayed(new Runnable(){ public void run(){
+                                try{
+                                    if(profileMode && web != null){
+                                        // 必须切桌面 UA，否则 www.douyin.com/user/ 会被 302 到
+                                        // m.douyin.com/share/user/（手机版名片页，没有作品列表）
+                                        try{
+                                            web.getSettings().setUserAgentString(DyDetail.UA);
+                                            dyProfilePcUA = true;
+                                        }catch(Throwable t){}
+                                        web.loadUrl("https://www.douyin.com/user/" + sec);
+                                    }
+                                }catch(Throwable t){}
+                            }}, 1500);
+                        }
+                    }
                     // 快手 fw/user 壳页 → 主动跳真实主页
                     if(u != null && u.contains("kuaishou.com/fw/user/")){
                         java.util.regex.Matcher km = java.util.regex.Pattern
@@ -1648,6 +2219,11 @@ boolean isProfileList = u != null && profileMode && (
     }
 
     /** 设置页：常驻页签版，每项独立入口 */
+    /** 重建设置页（Cookie 状态变化后刷新显示） */
+    void refreshSettingRows(){
+        try{ buildSettingsPage(); }catch(Throwable t){}
+    }
+
     void buildSettingsPage(){
         if(settingsWrap == null) return;
         settingsWrap.removeAllViews();
@@ -1707,12 +2283,246 @@ addSettingRow("B站 Cookie", curBiliCkLabel(), new View.OnClickListener(){
              public void onClick(View v){ showBiliLoginMenu(); }});
          addSettingRow("抖音访客凭据", curDyUifidLabel(), new View.OnClickListener(){
              public void onClick(View v){ showDyUifidMenu(); }});
+        addSettingRow("抖音主页登录", dyProfileCookiesLikelyLoggedIn()
+                ? "已登录 · 主页可解析全部作品"
+                : "未登录 · 主页最多 21 条，登录后拿全部", new View.OnClickListener(){
+             public void onClick(View v){ showDyProfileLoginMenu(); }});
         addSettingRow("Cookie 文件位置", "点开查看已保存的 cookie 名单", new View.OnClickListener(){
             public void onClick(View v){ showCookieFilesInfo(); }});
 
-        addSettingSection("平台支持");
-        addSettingRow("平台支持说明", "各平台解析方式与服务器依赖", new View.OnClickListener(){
-            public void onClick(View v){ showPlatformHelp(); }});
+addSettingSection("平台支持");
+         addSettingRow("平台支持说明", "各平台解析方式与服务器依赖", new View.OnClickListener(){
+             public void onClick(View v){ showPlatformHelp(); }});
+
+        addSettingSection("调试");
+        addSettingRow("调试日志", curDebugLogLabel(), new View.OnClickListener(){
+            public void onClick(View v){ toggleDebugLog(); }});
+        addSettingRow("查看日志", "复制 / 保存到 Download / 清除", new View.OnClickListener(){
+            public void onClick(View v){ showDebugLogView(); }});
+        addSettingRow("崩溃日志", curCrashLogLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showCrashLogView(); }});
+    }
+
+    // ================= 崩溃捕获 =================
+
+    static boolean crashHandlerInstalled = false;
+
+    /** 全局未捕获异常 → 写进崩溃日志，然后再交给系统默认处理（保证还能弹系统崩溃框） */
+    void installCrashHandler(){
+        if(crashHandlerInstalled) return;
+        crashHandlerInstalled = true;
+        final Thread.UncaughtExceptionHandler prev =
+                Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler(){
+            public void uncaughtException(Thread th, Throwable ex){
+                try{
+                    DiagLog.crash(DiagLog.M_APP,
+                        "未捕获异常导致崩溃 | 线程=" + th.getName(), ex);
+                }catch(Throwable t){}
+                if(prev != null) prev.uncaughtException(th, ex);
+            }
+        });
+Log.i("DYP", "CRASH_HANDLER_INSTALLED");
+    }
+
+    // ================= 存储权限 =================
+    static final int REQ_STORAGE = 1001;
+
+    /** 下载/保存前调用：没权限就申请，返回 false 表示已发起申请需等待 */
+    boolean ensureStoragePerm(){
+        if(AppInfo.hasStoragePerm(this)) return true;
+        DiagLog.w(DiagLog.M_PERM, "缺少存储权限 | API=" + android.os.Build.VERSION.SDK_INT
+            + " | 正在向用户申请 WRITE_EXTERNAL_STORAGE");
+        try{
+            requestPermissions(new String[]{
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                android.Manifest.permission.READ_EXTERNAL_STORAGE
+            }, REQ_STORAGE);
+        }catch(Throwable t){
+            DiagLog.e(DiagLog.M_PERM, "申请存储权限失败 | " + t);
+        }
+        return false;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] res){
+        super.onRequestPermissionsResult(code, perms, res);
+        if(code != REQ_STORAGE) return;
+        boolean granted = res != null && res.length > 0
+                && res[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if(granted){
+            DiagLog.i(DiagLog.M_PERM, "存储权限已授予");
+            showHintToast("存储权限已授予，可以正常下载了");
+        }else{
+            DiagLog.e(DiagLog.M_PERM, "存储权限被拒绝 | 下载将无法保存文件"
+                + " | 建议=到系统设置 → 应用 → 本应用 → 权限 → 存储，手动打开");
+            showStoragePermHelp();
+        }
+    }
+
+    /** 权限被拒后的引导弹窗，说清楚为什么需要、去哪开 */
+    void showStoragePermHelp(){
+        curDark = isDarkMode();
+        dypDlg()
+            .setTitle("需要存储权限")
+            .setMessage("下载文件必须能写入手机的 Download 目录，否则会出现"
+                + "「能解析、能播放，但下载失败」的情况。\n\n"
+                + "请按这个路径手动打开：\n"
+                + "系统设置 → 应用管理 → DY解析器 → 权限 → 存储 → 允许\n\n"
+                + "Android 11 及以上系统如果找不到「存储」权限项，"
+                + "通常是系统已经默认允许，可以直接再试一次下载。")
+            .setPositiveButton("去设置", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    try{
+                        android.content.Intent it = new android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                        it.setData(android.net.Uri.parse("package:" + getPackageName()));
+                        startActivity(it);
+                    }catch(Throwable t){
+                        showHintToast("请手动到系统设置里开启存储权限");
+                    }
+                }})
+            .setNegativeButton("知道了", null)
+            .show();
+    }
+
+    // ================= 调试日志 UI =================
+
+    String curDebugLogLabel(){
+        boolean on = DiagLog.isDebugOn();
+        long sz = 0;
+        try{ java.io.File f = DiagLog.debugFile(); if(f != null && f.exists()) sz = f.length(); }catch(Throwable t){}
+        return (on ? "已开启 · " : "已关闭 · ")
+                + (sz > 0 ? (sz / 1024) + " KB" : "暂无记录")
+                + " · 记录解析/下载/播放每一步";
+    }
+
+    String curCrashLogLabel(){
+        long sz = 0;
+        try{ java.io.File f = DiagLog.crashFile(); if(f != null && f.exists()) sz = f.length(); }catch(Throwable t){}
+        return (sz > 0 ? (sz / 1024) + " KB" : "暂无记录")
+                + " · 始终开启，不受调试开关影响";
+    }
+
+    void toggleDebugLog(){
+        boolean on = DiagLog.isDebugOn();
+        if(on){
+            DiagLog.setDebugOn(false);
+            showHintToast("调试日志已关闭（崩溃日志仍在记录）");
+        }else{
+            DiagLog.setDebugOn(true);
+            showHintToast("调试日志已开启，复现问题后回来「查看日志」");
+        }
+        buildSettingsPage();
+    }
+
+    void showDebugLogView(){
+        showLogDialog(false);
+    }
+
+    void showCrashLogView(){
+        showLogDialog(true);
+    }
+
+    /** 日志查看弹窗：内容 + 复制 / 保存到 Download / 清除 */
+    void showLogDialog(final boolean crash){
+        curDark = isDarkMode();
+        String content = crash ? DiagLog.readCrash() : DiagLog.readDebug();
+        if(content == null || content.trim().length() == 0){
+            content = crash
+                ? "崩溃日志还是空的。\n\n说明这段时间没有发生崩溃或失败。\n"
+                  + "崩溃日志是一直开着的，不需要你去打开开关；\n"
+                  + "一旦出现闪退、黑屏、下载失败这类问题，会自动记在这里。"
+                : "调试日志还是空的。\n\n"
+                  + "调试日志默认关闭（减少无谓写入）。\n"
+                  + "要排查问题的话，请先在上一行把「调试日志」打开，\n"
+                  + "然后回到 App 复现一次问题，再回来这里查看。";
+        }
+
+        int bgDlg   = curDark ? 0xFF191B21 : 0xFFFFFFFF;
+        int textDlg = curDark ? 0xFFF2F3F5 : 0xFF1A1A1F;
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setBackgroundColor(bgDlg);
+        wrap.setPadding(dp(16), dp(12), dp(16), dp(8));
+
+        TextView tip = new TextView(this);
+        tip.setText(crash
+            ? "崩溃日志：始终记录，不受调试日志开关影响。包含闪退堆栈与所有失败原因。"
+            : "调试日志：记录解析/下载/播放的每一步。发给我们可以快速定位问题。");
+        tip.setTextSize(12);
+        tip.setTextColor(textDlg & 0x99FFFFFF);
+        tip.setPadding(0, 0, 0, dp(8));
+        wrap.addView(tip);
+
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        TextView tv = new TextView(this);
+        tv.setText(content);
+        tv.setTextSize(11);
+        tv.setTextColor(textDlg);
+        tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+        tv.setTextIsSelectable(true);
+        tv.setPadding(dp(8), dp(8), dp(8), dp(8));
+        sv.addView(tv);
+        LinearLayout.LayoutParams svlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(360));
+        sv.setLayoutParams(svlp);
+        wrap.addView(sv);
+
+        final String finalContent = content;
+        dypDlg()
+            .setTitle(crash ? "崩溃日志" : "调试日志")
+            .setView(wrap)
+            .setPositiveButton("复制", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    copyToClipboard(finalContent);
+                    showHintToast("已复制到剪贴板");
+                }})
+            .setNeutralButton("保存到 Download", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(!AppInfo.hasStoragePerm(MainActivity.this)){
+                        DiagLog.e(DiagLog.M_PERM, "保存日志失败 | 缺少存储权限");
+                        showHintToast("没有存储权限，无法保存。请到系统设置里给本应用存储权限");
+                        return;
+                    }
+                    String p = DiagLog.exportToDownload(crash);
+                    if(p == null){
+                        DiagLog.e(DiagLog.M_APP, "保存日志失败 | 写入 Download 返回空");
+                        showHintToast("保存失败，试试先开启调试日志再复现一次");
+                    }else{
+                        DiagLog.i(DiagLog.M_APP, "日志已保存 | " + p);
+                        showHintToast("已保存到：\n" + p);
+                    }
+                }})
+            .setNegativeButton("清除", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    confirmClearLog(crash);
+                }})
+            .show();
+    }
+
+    void confirmClearLog(final boolean crash){
+        curDark = isDarkMode();
+        dypDlg()
+            .setTitle("清除日志")
+            .setMessage("确定清除" + (crash ? "崩溃日志" : "调试日志") + "吗？清除后无法恢复。")
+            .setPositiveButton("清除", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(crash) DiagLog.clearCrash(); else DiagLog.clearDebug();
+                    showHintToast("已清除");
+                    buildSettingsPage();
+                }})
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    void copyToClipboard(String text){
+        try{
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("DYParse日志", text));
+        }catch(Throwable t){}
     }
 
     /** 抖音访客凭据菜单：自动获取 / 手动填写 / 清空 */
@@ -1868,19 +2678,74 @@ addSettingRow("B站 Cookie", curBiliCkLabel(), new View.OnClickListener(){
         curDark = isDarkMode();
         StringBuilder b = new StringBuilder();
         b.append("Cookie 全部保存在手机本地，不上传任何服务器。\n\n");
-        b.append("YouTube：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_YT)).append("\n\n");
-b.append("Instagram：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_INS)).append("\n\n");
-         b.append("B站：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_BILI)).append("\n\n");
-         b.append("格式：一行一个 cookie，name=value，name 不能省略。\n");
-         b.append("例：\n");
-         b.append("sessionid=12345%3Aabc\n");
-         b.append("csrftoken=AbCdEf\n");
-         b.append("ds_user_id=67890\n\n");
-         b.append("B站填 SESSDATA 即可（有它才有 1080P，不填只有 720P）：\n");
-         b.append("SESSDATA=xxxxxxxx\n\n");
+        b.append("抖音：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_DY))
+            .append("（").append(CookieStore.count(this, CookieStore.PLATFORM_DY)).append(" 项）\n\n");
+        b.append("YouTube：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_YT))
+            .append("（").append(CookieStore.count(this, CookieStore.PLATFORM_YT)).append(" 项）\n\n");
+        b.append("Instagram：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_INS))
+            .append("（").append(CookieStore.count(this, CookieStore.PLATFORM_INS)).append(" 项）\n\n");
+        b.append("B站：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_BILI))
+            .append("（").append(CookieStore.count(this, CookieStore.PLATFORM_BILI)).append(" 项）\n\n");
+        b.append("格式：一行一个 cookie，name=value，name 不能省略。\n");
+        b.append("例：\n");
+        b.append("sessionid=12345%3Aabc\n");
+        b.append("csrftoken=AbCdEf\n");
+        b.append("ds_user_id=67890\n\n");
+        b.append("B站填 SESSDATA 即可（有它才有 1080P，不填只有 720P）：\n");
+        b.append("SESSDATA=xxxxxxxx\n\n");
+        b.append("抖音主页解析全量需要 sessionid / sid_tt / uid_tt：\n");
+        b.append("sessionid=xxxx\nsid_tt=xxxx\nuid_tt=xxxx\n\n");
         b.append("服务器到期 / 关闭内置代理时，这些 cookie 仍然可用。");
         dypDlg().setTitle("Cookie 存储位置").setMessage(b.toString())
             .setPositiveButton("知道了", null).create().show();
+    }
+
+    /** 抖音登录后：把 WebView 里的 Cookie 落到本地文件（sessionid 等是 HttpOnly，必须用 CookieManager 取）
+     *  只保存登录票据类字段：msToken / __ac_signature / ttwid 这类签名字段是短时效的，
+     *  存下来再拿去用一定失败，所以不落盘。 */
+    boolean saveDyCookieLocal(String src){
+        try{
+            String cm = null;
+            try{ cm = CookieManager.getInstance().getCookie("https://www.douyin.com/"); }catch(Throwable t){}
+            String ck = cm;
+            if((ck == null || ck.length() == 0) && src != null) ck = src;
+            if(ck == null || ck.length() == 0) return false;
+            if(!ck.contains("sessionid=") && !ck.contains("sid_tt=")) return false;
+            if(ck.equals(dyCookieLast)) return false;
+            dyCookieLast = ck;
+
+            // 只保留长期有效的登录票据，短时效签名字段不存
+            String[] keys = new String[]{
+                "sessionid", "sessionid_ss", "sid_tt", "uid_tt", "uid_tt_ss",
+                "sid_guard", "sid_ucp_v1", "ssid_ucp_v1", "passport_csrf_token",
+                "passport_auth_status", "ttwid", "odin_tt", "d_ticket",
+                "login_time", "is_staff_user"
+            };
+            java.util.Map<String,String> m = new java.util.LinkedHashMap<String,String>();
+            for(String kv : ck.split(";")){
+                String s = kv.trim();
+                int e = s.indexOf('=');
+                if(e <= 0) continue;
+                String k = s.substring(0, e).trim();
+                String v = s.substring(e + 1).trim();
+                if(k.length() == 0 || v.length() == 0) continue;
+                for(String want : keys){
+                    if(k.equals(want)){ m.put(k, v); break; }
+                }
+            }
+            if(m.isEmpty()) return false;
+            int n = m.size();
+            CookieStore.saveMap(this, CookieStore.PLATFORM_DY, m);
+            Log.i("DYP", "DY_CK_GRAB len=" + ck.length() + " saved=" + n + "（仅登录票据）"
+                    + " file=" + CookieStore.filePath(this, CookieStore.PLATFORM_DY));
+            DiagLog.i(DiagLog.M_PARSE, "抖音登录票据已存本地 | " + n + " 项 | "
+                    + CookieStore.filePath(this, CookieStore.PLATFORM_DY));
+            return true;
+        }catch(Throwable t){
+            Log.i("DYP", "DY_CK_GRAB_ERR " + t);
+            DiagLog.e(DiagLog.M_PARSE, "保存抖音 Cookie 失败", t);
+            return false;
+        }
     }
 
     /** 通用 Cookie 填写弹窗 */
@@ -1903,6 +2768,12 @@ b.append("Instagram：\n").append(CookieStore.filePath(this, CookieStore.PLATFOR
             tb.append("IG 至少要有：sessionid、csrftoken、ds_user_id\n");
         } else if(CookieStore.PLATFORM_BILI.equals(platform)){
             tb.append("B站填 SESSDATA 即可；填了可拿 1080P，不填只有 720P\n");
+        } else if(CookieStore.PLATFORM_DY.equals(platform)){
+            tb.append("抖音主页要拿全部作品，至少要有登录票据：\n"
+                + "sessionid、sid_tt、uid_tt（有 ttwid 更好）\n"
+                + "获取方法：电脑 Chrome 登录 www.douyin.com → F12 → "
+                + "Application → Cookies → www.douyin.com，复制对应值\n"
+                + "只存手机本地，不上传服务器。\n");
         } else {
             tb.append("YouTube 至少要有：SAPISID、__Secure-1PSID\n");
         }
@@ -1921,7 +2792,9 @@ b.append("Instagram：\n").append(CookieStore.filePath(this, CookieStore.PLATFOR
             ? "sessionid=...\ncsrftoken=...\nds_user_id=..."
             : (CookieStore.PLATFORM_BILI.equals(platform)
                 ? "SESSDATA=...\nbuvid3=..."
-                : "SAPISID=...\n__Secure-1PSID=...\nLOGIN_INFO=..."));
+                : (CookieStore.PLATFORM_DY.equals(platform)
+                    ? "sessionid=...; sid_tt=...; uid_tt=...\n（直接粘一整行也行）"
+                    : "SAPISID=...\n__Secure-1PSID=...\nLOGIN_INFO=...")));
         et.setTextColor(curDark ? 0xFFE6E8EC : 0xFF1F2937);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -2299,12 +3172,15 @@ b.append("Instagram：\n").append(CookieStore.filePath(this, CookieStore.PLATFOR
                  --ez dyprobe true                  打开抖音凭据抓取页（手动看 cookie 下发）
                  --es dyurl  https://www.douyin.com  指定抓取页地址
                  --ez localonly true                  强制跳过服务器，只用本地签名
+                 --ez nouifid true                    主页翻页强制不带 uifid（验证是否必需）
                */
             boolean dyPr = false;
             String dyUrl = null;
             try{
                 dyPr = it != null && it.getBooleanExtra("dyprobe", false);
                 dyUrl = it != null ? it.getStringExtra("dyurl") : null;
+                dyNoUifid = it != null && it.getBooleanExtra("nouifid", false);
+                if(dyNoUifid) Log.i("DYP", "DYPROF_DEBUG 强制不带 uifid");
             }catch(Throwable t){}
             if(dyUrl != null && dyUrl.length() > 0){
                 startDyProbeUrl(dyUrl);
@@ -2430,6 +3306,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     volatile boolean mixMode = false;
     /** 主页列表接口正在 native 重发中（防重入） */
     volatile boolean profileFetching = false;
+    /** 已经翻完的 sec_uid（同一主页重复请求时不再重复翻页，避免并发覆盖） */
+    volatile String dyProfileDoneSecUid = "";
+    /** 签名翻页已出结果并渲染，禁止 WebView 再触发新一轮（防覆盖） */
+    volatile boolean dyProfileRenderLocked = false;
     /** 合集视频列表：每项 [awemeId, 描述, 无水印地址, 封面] */
     final java.util.List<String[]> mixItems = new java.util.ArrayList<String[]>();
     String mixTitle = "", mixId = "";
@@ -2459,12 +3339,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
      +"var oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;"
      +"XMLHttpRequest.prototype.open=function(m,u){this.__du=u;return oo.apply(this,arguments);};"
      +"XMLHttpRequest.prototype.send=function(){var x=this;try{x.addEventListener('load',function(){try{rec(x.__du,x.responseText);}catch(e){}});}catch(e){}return os.apply(this,arguments);};"
-     +"var _n=0;var _iv=setInterval(function(){try{"
-     +"if(window.__dyStopScroll){clearInterval(_iv);return;}"
-     +"_n++;if(_n>40){clearInterval(_iv);return;}"
-     +"window.scrollTo(0, document.body.scrollHeight);"
-     +"}catch(e){}},2500);"
-     +"}catch(e){}})();";
+      +"var _n=0;"
+      +"}catch(e){}})();";
 
     /** 带 Referer 的 GET */
     byte[] httpGetBytesWithReferer(String url, String referer){
@@ -2527,6 +3403,458 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             }
             return u;
         }catch(Throwable t){ return url; }
+    }
+
+    /** 抖音主页：按 max_cursor 反复翻页（每页重新算 a_bogus 签名），直到 has_more=0 */
+    void fetchAllDyProfilePages(String firstUrl){
+        // 抖音主页：签名翻页接管，避免 WebView 那边重复收集
+        dyProfileSignedOwned = true;
+        dyProfileMoreHintShown = false;
+        // 从分享页 URL 里取 sec_uid（可能编码过）
+        String secUid = extractSecUid(firstUrl);
+        if(secUid == null || secUid.length() < 10){
+            Log.i("DYP", "DYPROF_NO_SECUID，回退单页");
+            // 已经翻完拿全的主页，不许再用「单页」结果把它覆盖掉
+            if(dyProfileRenderLocked){
+                Log.i("DYP", "DYPROF_NO_SECUID_SKIP 结果已锁定，忽略");
+                profileFetching = false;
+                return;
+            }
+            String b0 = fetchProfilePageRaw(firstUrl);
+            if(b0 != null && b0.length() > 100) parseProfileBody(b0);
+            profileFetching = false;
+            scheduleProfileRender();
+            return;
+        }
+        Log.i("DYP", "DYPROF_SECUID " + secUid);
+
+        String cookie = dyEffectiveCookie();
+        boolean loggedIn = dyProfileCookiesLikelyLoggedIn();
+        DiagLog.i(DiagLog.M_PARSE, "主页翻页开始 | sec_uid=" + secUid
+            + " | 登录态=" + (loggedIn ? "已登录" : "未登录")
+            + " | Cookie来源=" + (dyManualCookieOk() ? "手动填写" : "App 内 WebView")
+            + " | Cookie长度=" + (cookie == null ? 0 : cookie.length()));
+        // msToken 最佳来源：WebView 自己发的这条请求 URL（firstUrl）里就带真值
+        String msToken = pickMsTokenFromUrl(firstUrl);
+        if(msToken.length() == 0) msToken = dyRealMsToken(cookie);
+        Log.i("DYP", "DYPROF_MSTOKEN_USED len=" + msToken.length());
+        int page = 0;
+        long cursor = 0L;
+        int emptyStreak = 0;
+        final int MAX_PAGE = 40;
+        final int COUNT = 18;
+        while(page < MAX_PAGE){
+            page++;
+            String query;
+            String uifid = dyCurUifid();
+            if(dyNoUifid) uifid = "";
+            query = DyDetail.buildPostQuery(secUid, cursor, COUNT, msToken, uifid);
+            String signed = DyDetail.signPostQuery(query, cookie, uifid.length() > 0);
+            String url = DyDetail.API_POST + "?" + signed;
+            // 关键诊断：每页带上什么 uifid / msToken、cookie 多长、签名后 URL 多长
+            Log.i("DYP", "DYPROF_REQ page=" + page + " cursor=" + cursor
+                + " uifidLen=" + uifid.length() + " msLen=" + msToken.length()
+                + " ckLen=" + (cookie == null ? 0 : cookie.length())
+                + " secsdk=" + (uifid.length() > 0 ? 1 : 0));
+            Log.i("DYP", "DYPROF_URL page=" + page + " cursor=" + cursor + " len=" + url.length());
+            if(page <= 2){
+                Log.i("DYP", "DYPROF_FULLURL[" + page + "] " + url.substring(0, Math.min(260, url.length())));
+            }
+            String body = null;
+            for(int attempt = 1; attempt <= 3; attempt++){
+                body = fetchProfilePageRaw(url);
+                if(body != null && body.length() >= 60) break;
+                Log.i("DYP", "DYPROF_RETRY page=" + page + " attempt=" + attempt);
+                try{ Thread.sleep(700L * attempt); }catch(Throwable t){}
+            }
+            if(body == null || body.length() < 60){
+                Log.i("DYP", "DYPROF_PAGE_EMPTY page=" + page);
+                DiagLog.w(DiagLog.M_PARSE, "主页第 " + page + " 页为空 | cursor=" + cursor
+                    + " | 原因=" + (loggedIn
+                        ? "已登录但仍拿不到更多，可能是该账号设置了作品可见范围"
+                        : "未登录：抖音匿名只给第一页，后续翻页返回空"));
+                if(page > 1 && !loggedIn){
+                    final int have;
+                    synchronized(profileCollected){ have = profileCollected.size(); }
+                    h.post(new Runnable(){ public void run(){
+                        showDyProfileMoreHint(have);
+                    }});
+                }
+                break;
+            }
+            int added;
+            boolean hasMore;
+            long nextCursor;
+            try{
+                Object res = new JP(body).parse();
+                Map m = (Map) res;
+                Object listObj = m == null ? null : m.get("aweme_list");
+                List list = (listObj instanceof List) ? (List) listObj : null;
+                added = appendDyProfileItems(list);
+                hasMore = truthy(m == null ? null : m.get("has_more"));
+                nextCursor = parseLong(m == null ? null : m.get("max_cursor"), -1L);
+            }catch(Throwable t){
+                Log.i("DYP", "DYPROF_PAGE_PARSE_ERR " + t);
+                break;
+            }
+            int total;
+            synchronized(profileCollected){ total = profileCollected.size(); }
+            Log.i("DYP", "DYPROF_PAGE " + page + " added=" + added + " total=" + total
+                + " hasMore=" + hasMore + " next=" + nextCursor);
+            final int fPage = page; final int fTotal = total;
+            h.post(new Runnable(){ public void run(){
+                s("主页解析中 " + fTotal + " 条…（第" + fPage + "页）");
+            }});
+            if(!hasMore) break;
+            if(nextCursor <= 0 || added == 0){
+                if(++emptyStreak >= 2){
+                    Log.i("DYP", "DYPROF_STOP emptyStreak=" + emptyStreak);
+                    break;
+                }
+            } else {
+                emptyStreak = 0;
+            }
+            if(nextCursor <= 0) break;
+            cursor = nextCursor;
+            // 间隔给足：抖音对连续翻页有节流，太快会被当成爬虫直接返回空
+            try{ Thread.sleep(1500); }catch(Throwable t){}
+        }
+        int n;
+        synchronized(profileCollected){ n = profileCollected.size(); }
+        Log.i("DYP", "DYPROF_DONE n=" + n + " pages=" + page);
+        // 记录已翻完的 sec_uid，页面再发同一主页请求时直接忽略（避免并发翻页互相覆盖）
+        dyProfileDoneSecUid = secUid == null ? "" : secUid;
+        // 翻页结束必须把 fetching 放开，否则下一次解析主页会被 !profileFetching 挡住
+        profileFetching = false;
+        // 【关键】翻页已由签名接口接管，WebView 里的页面没有用了。
+        // 不关掉它的话，页面会继续自己加载、自己跳到别的用户主页，
+        // 触发新一轮 PROFILE_AUTO 把我们刚拿到的结果覆盖掉（实测 280 条被覆盖成 21/39 条）。
+        try{
+            // 注意：不能在这里把 profileMode 置 false ——
+            // scheduleProfileRender 内部有 `if(!profileMode) return;`，
+            // 置 false 会导致「翻页拿到的 280 条渲染不出去」，屏幕上停在 WebView 抢先渲染的 20/38 条。
+            // 用独立的标志来阻止页面再次接管。
+            dyProfileRenderLocked = true;
+            if(web != null){
+                web.evaluateJavascript(
+                    "(function(){try{window.__dyStopScroll=true;window.stop();"
+                    +"if(window.__dyScrollTimer)clearInterval(window.__dyScrollTimer);"
+                    +"}catch(e){}})()", null);
+                web.loadUrl("about:blank");
+                web.setVisibility(View.GONE);
+                web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+            }
+            Log.i("DYP", "DYPROF_WEB_CLOSED 已收起主页网页，防止后续跳转覆盖结果");
+        }catch(Throwable t){}
+        scheduleProfileRender();
+    }
+
+    /** 抖音主页：注入滚动脚本，让页面自己加载更多（每次加载都会命中 PROFILE_HOOK_JS 的 fetch hook） */
+    void startDyProfileScroll(){
+        if(web == null) return;
+        Log.i("DYP", "DYPROF_SCROLL_START");
+        // 抖音主页是内部滚动容器（body 高度恒为 1），必须找真正可滚的元素
+        web.evaluateJavascript(
+            "(function(){try{"
+            + "window.__dyStopScroll=false;"
+            + "if(window.__dyScrollTimer){clearInterval(window.__dyScrollTimer);}"
+            + "function scroller(){"
+            + "  var best=null,bestH=0;"
+            + "  var all=document.querySelectorAll('div,main,section');"
+            + "  for(var i=0;i<all.length;i++){"
+            + "    var e=all[i];"
+            + "    if(e.scrollHeight>e.clientHeight+80 && e.clientHeight>200){"
+            + "      if(e.scrollHeight>bestH){bestH=e.scrollHeight;best=e;}"
+            + "    }"
+            + "  }"
+            + "  return best;"
+            + "}"
+            + "var n=0,lastH=0,same=0;"
+            + "window.__dyScrollTimer=setInterval(function(){"
+            + "  try{"
+            + "    if(window.__dyStopScroll){clearInterval(window.__dyScrollTimer);return;}"
+            + "    n++;"
+            + "    var e=scroller();"
+            + "    var h=e?e.scrollHeight:0;"
+            + "    if(e){e.scrollTop=e.scrollHeight;}"
+            + "    var se=document.scrollingElement||document.documentElement;"
+            + "    if(se){se.scrollTop=se.scrollHeight;}"
+            + "    if(h===lastH){same++;}else{same=0;lastH=h;}"
+            + "    try{window.DyBridge.onDiag(JSON.stringify({sc:n,h:h,same:same,tag:e?e.tagName+'.'+e.className.slice(0,40):'none'}));}catch(err){}"
+            + "    if(n>200){clearInterval(window.__dyScrollTimer);}"
+            + "    if(same>15){window.__dyStopScroll=true;clearInterval(window.__dyScrollTimer);}"
+            + "  }catch(err){}"
+            + "},1500);"
+            + "}catch(e){}})()", null);
+    }
+
+    /** 停止抖音主页滚动 */
+    void stopDyProfileScroll(){
+        try{
+            if(web != null) web.evaluateJavascript(
+                "(function(){try{window.__dyStopScroll=true;"
+                + "if(window.__dyScrollTimer)clearInterval(window.__dyScrollTimer);}catch(e){}})()", null);
+        }catch(Throwable t){}
+    }
+
+    /** 未登录只能拿第一页时的提示：说清楚为什么、怎么解决 */
+    void showDyProfileMoreHint(final int have){
+        if(dyProfileMoreHintShown) return;
+        dyProfileMoreHintShown = true;
+        curDark = isDarkMode();
+        dypDlg()
+            .setTitle("只解析到 " + have + " 条")
+            .setMessage("抖音对未登录访客只返回第一页作品（通常是 15-18 条），"
+                + "后面几页接口会直接返回空，这不是解析失败。\n\n"
+                + "要看全部作品，请去：\n"
+                + "设置 → 抖音主页登录 → 去登录\n\n"
+                + "登录后重新解析这个主页，就能翻到全部。")
+            .setPositiveButton("去登录", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    startDyProfileLogin();
+                }})
+            .setNegativeButton("先这样", null)
+            .show();
+    }
+
+    volatile boolean dyProfileMoreHintShown = false;
+    /** 抖音主页签名翻页是否已接管（接管后丢弃 WebView 抓的列表，避免重复计数） */
+    volatile boolean dyProfileSignedOwned = false;
+    /** 调试：强制不带 uifid（验证 uifid 是否必需） */
+    boolean dyNoUifid = false;
+
+    /** 从各种抖音 URL 里抽 sec_uid */
+    static String extractSecUid(String url){
+        try{
+            if(url == null) return null;
+            // 注意：抖音有两种写法 —— 分享页是 sec_uid=，PC 主页接口是 sec_user_id=，
+            // 只匹配 sec_uid 会漏掉 PC 主页那条，导致「只能拿一页」。
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("sec_user_id=([A-Za-z0-9_\\-%=]+)").matcher(url);
+            if(m.find()) return java.net.URLDecoder.decode(m.group(1), "UTF-8");
+            m = java.util.regex.Pattern
+                .compile("sec_uid=([A-Za-z0-9_\\-%=]+)").matcher(url);
+            if(m.find()) return java.net.URLDecoder.decode(m.group(1), "UTF-8");
+            // PC 主页路径：/user/MS4wLjABAAAA...
+            m = java.util.regex.Pattern.compile("/user/(MS4wLjABAAAA[A-Za-z0-9_\\-]+)").matcher(url);
+            if(m.find()) return m.group(1);
+            m = java.util.regex.Pattern.compile("/share/user/([A-Za-z0-9_\\-]+)").matcher(url);
+            if(m.find()) return m.group(1);
+        }catch(Throwable t){}
+        return null;
+    }
+
+    /** 拉一页主页 JSON（UA 必须与签名一致，否则 a_bogus 失效） */
+    /** 取真实 msToken：Cookie 里真的有 msToken 才用，否则从 WebView 现取，最后才用假值。
+     *  注意：DyDetail.msTokenOf 在缺失时会返回 156 长假值，所以必须先自己查 cookie 里有没有。 */
+    String dyRealMsToken(String cookie){
+        try{
+            // 1) Cookie 里确实带 msToken 才用
+            if(cookie != null && cookie.indexOf("msToken=") >= 0){
+                String t = cookieValueOf(cookie, "msToken");
+                if(t != null && t.length() >= 60){
+                    Log.i("DYP", "DYPROF_MSTOKEN from_cookie len=" + t.length());
+                    return t;
+                }
+            }
+            // 2) CookieManager 里确实带 msToken
+            try{
+                String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+                if(cm != null && cm.indexOf("msToken=") >= 0){
+                    String t2 = cookieValueOf(cm, "msToken");
+                    if(t2 != null && t2.length() >= 60){
+                        Log.i("DYP", "DYPROF_MSTOKEN from_webview len=" + t2.length());
+                        return t2;
+                    }
+                }
+            }catch(Throwable t2){}
+            Log.i("DYP", "DYPROF_MSTOKEN none_use_fake");
+        }catch(Throwable t){}
+        return DyDetail.msTokenOf(cookie);
+    }
+
+    /** 从完整 URL 里取出 query（去掉 a_bogus，因为要重算） */
+    static String stripBogus(String url){
+        try{
+            int q = url.indexOf('?');
+            if(q < 0) return "";
+            String query = url.substring(q + 1);
+            int h = query.indexOf('#');
+            if(h >= 0) query = query.substring(0, h);
+            StringBuilder sb = new StringBuilder();
+            for(String kv : query.split("&")){
+                if(kv.length() == 0) continue;
+                int e = kv.indexOf('=');
+                String k = e > 0 ? kv.substring(0, e) : kv;
+                if(k.equals("a_bogus") || k.equals("X-Bogus") || k.equals("_signature")) continue;
+                if(sb.length() > 0) sb.append('&');
+                sb.append(kv);
+            }
+            return sb.toString();
+        }catch(Throwable t){ return ""; }
+    }
+
+    /** 替换 query 里某个参数的值（没有就追加） */
+    static String replaceQueryParam(String query, String key, String value){
+        try{
+            if(query == null) return "";
+            StringBuilder sb = new StringBuilder();
+            boolean hit = false;
+            for(String kv : query.split("&")){
+                if(kv.length() == 0) continue;
+                int e = kv.indexOf('=');
+                String k = e > 0 ? kv.substring(0, e) : kv;
+                if(sb.length() > 0) sb.append('&');
+                if(k.equals(key)){
+                    sb.append(key).append('=').append(value);
+                    hit = true;
+                } else {
+                    sb.append(kv);
+                }
+            }
+            if(!hit){
+                if(sb.length() > 0) sb.append('&');
+                sb.append(key).append('=').append(value);
+            }
+            return sb.toString();
+        }catch(Throwable t){ return query; }
+    }
+
+    /** 把 query（已含 a_bogus）拼成可请求的完整 URL */
+    static String queryPartToUrl(String query, String signed){
+        try{
+            String base = DyDetail.API_POST;
+            if(query != null && query.indexOf("/aweme/post/") >= 0){
+                int q = query.indexOf('?');
+                if(q > 0) base = query.substring(0, q);
+            }
+            return base + "?" + signed;
+        }catch(Throwable t){ return DyDetail.API_POST + "?" + signed; }
+    }
+
+    /** 从请求 URL 的 query 里取 msToken（URL 解码后返回，取不到给空串） */
+    static String pickMsTokenFromUrl(String url){
+        if(url == null) return "";
+        try{
+            int q = url.indexOf('?');
+            if(q < 0) return "";
+            String query = url.substring(q + 1);
+            int h = query.indexOf('#');
+            if(h >= 0) query = query.substring(0, h);
+            for(String kv : query.split("&")){
+                int e = kv.indexOf('=');
+                if(e <= 0) continue;
+                if(!kv.substring(0, e).equals("msToken")) continue;
+                String v = kv.substring(e + 1);
+                try{ v = java.net.URLDecoder.decode(v, "UTF-8"); }catch(Throwable t){}
+                if(v != null && v.length() >= 60){
+                    Log.i("DYP", "DYPROF_MSTOKEN from_url len=" + v.length());
+                    return v;
+                }
+            }
+        }catch(Throwable t){}
+        return "";
+    }
+
+    /** 从 cookie 串里取某个键的值（取不到返回空串） */
+    static String cookieValueOf(String cookie, String key){
+        if(cookie == null || key == null) return "";
+        for(String kv : cookie.split(";")){
+            String s = kv.trim();
+            int e = s.indexOf('=');
+            if(e > 0 && s.substring(0, e).trim().equals(key)){
+                return s.substring(e + 1).trim();
+            }
+        }
+        return "";
+    }
+
+    String fetchProfilePageRaw(String url){
+        java.io.InputStream is = null;
+        try{
+            String ck = dyEffectiveCookie();
+            // 诊断：确认关键 cookie 是否真的带上了（只打有没有，不打值）
+            StringBuilder ckb = new StringBuilder();
+            if(ck != null){
+                for(String need : new String[]{"sessionid","sid_tt","uid_tt","msToken","ttwid",
+                        "__ac_signature","__ac_nonce","s_v_web_id","UIFID","passport_csrf_token"}){
+                    ckb.append(need).append('=').append(ck.indexOf(need + "=") >= 0 ? "1" : "0").append(' ');
+                }
+            }
+            Log.i("DYP", "DYPROF_CK " + ckb);
+            java.net.HttpURLConnection uc = openConn(url);
+            uc.setInstanceFollowRedirects(true);
+            uc.setRequestProperty("User-Agent", DyDetail.UA);
+            uc.setRequestProperty("Referer", "https://www.douyin.com/");
+            uc.setRequestProperty("Accept", "application/json, text/plain, */*");
+            uc.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
+            if(ck != null) uc.setRequestProperty("Cookie", ck);
+            uc.setConnectTimeout(12000); uc.setReadTimeout(15000);
+            int code = uc.getResponseCode();
+            Log.i("DYP", "DYPROF_HTTP " + code);
+            if(code < 200 || code >= 300) return null;
+            is = uc.getInputStream();
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192]; int n; long got = 0;
+            while((n = is.read(buf)) > 0){
+                bo.write(buf, 0, n);
+                got += n;
+                if(got > 20L * 1024 * 1024) break;
+            }
+            Log.i("DYP", "DYPROF_READ " + got);
+            String rb = new String(bo.toByteArray(), "UTF-8");
+            if(rb.length() < 60) Log.i("DYP", "DYPROF_SHORT[" + rb + "]");
+            return rb;
+        }catch(Throwable t){
+            Log.i("DYP", "DYPROF_FETCH_ERR " + t);
+            return null;
+        }finally{
+            try{ if(is != null) is.close(); }catch(Throwable t){}
+        }
+    }
+
+    /** 把一页 aweme_list 追加进主页列表，返回本页新增条数 */
+    int appendDyProfileItems(List list){
+        if(list == null) return 0;
+        int added = 0;
+        for(Object o : list){
+            if(!(o instanceof Map)) continue;
+            Map aw = (Map) o;
+            String awemeId = gs(get(aw, "aweme_id"));
+            if(awemeId.length() == 0) continue;
+            synchronized(profileSeen){
+                if(!profileSeen.add(awemeId)) continue;
+            }
+            String desc = gs(get(aw, "desc"));
+            ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+            it.id = awemeId;
+            it.title = desc;
+            Object imgs = get(aw, "images");
+            boolean isImage = imgs instanceof List && !((List) imgs).isEmpty();
+            it.isImage = isImage;
+            if(!isImage){
+                Object video = get(aw, "video");
+                if(video instanceof Map){
+                    Object pa = get((Map) video, "play_addr");
+                    if(pa instanceof Map){
+                        String uu = firstUrl(get((Map) pa, "url_list"));
+                        if(uu.length() > 0 && !uu.equals("?")) it.directUrl = uu;
+                    }
+                }
+            }
+            if(isImage && it.directUrl.length() == 0){
+                Object firstImg = ((List) imgs).get(0);
+                if(firstImg instanceof Map){
+                    Object ul = get((Map) firstImg, "url_list");
+                    String uu = firstUrl(ul);
+                    if(uu.length() > 0 && !uu.equals("?")) it.directUrl = uu;
+                }
+            }
+            it.url = "https://www.iesdouyin.com/share/video/" + awemeId + "/";
+            synchronized(profileCollected){ profileCollected.add(it); }
+            added++;
+        }
+        return added;
     }
 
     /** 反复翻页直到 has_more=0，把所有作品塞进 mixItems */
@@ -5076,6 +6404,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     /** 主页 WebView 收集模式：页面发列表请求时，把响应体送回来（Bridge 已闭，这里拆成独立入口） */
     void onProfileDataFromWeb(final String body){
         if(!profileMode) return;
+        // 抖音主页已由签名翻页接管，WebView 自己抓到的数据会重复混进来（数量虚高、易重复下载）
+        if(dyProfileSignedOwned && body != null && body.indexOf("aweme_list") >= 0){
+            Log.i("DYP", "DYPROF_WEB_DROP 签名翻页已接管，丢弃 WebView 抓到的列表 len=" + body.length());
+            return;
+        }
         new Thread(new Runnable(){ public void run(){
             parseProfileBody(body);
         }}).start();
@@ -5216,6 +6549,17 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             Object root = new JP(body).parse();
             // 平台判定：按内容特征
             if(body.indexOf("aweme_list") >= 0){
+                // 临时诊断：确认分页字段
+                try{
+                    if(root instanceof Map){
+                        Map rm = (Map) root;
+                        Log.i("DYP", "PROFILE_PAGE_FIELDS has_more=" + rm.get("has_more")
+                            + " max_cursor=" + rm.get("max_cursor")
+                            + " cursor=" + rm.get("cursor")
+                            + " min_cursor=" + rm.get("min_cursor")
+                            + " status_code=" + rm.get("status_code"));
+                    }
+                }catch(Throwable t){}
                 parseDyProfile(root);
             } else if(body.indexOf("visionProfileWorkPhotoList") >= 0
                     || body.indexOf("visionProfileLikePhotoList") >= 0){
@@ -6544,9 +7888,27 @@ void parse(){
     /** 真正的解析流程（短链展开后调用，url 已是真实链接） */
     void doParseResolved(String url){
          if(url == null || url.length() == 0){ s("未找到链接"); return; }
-        webDone=false;
-        storyBlocked=false;
-        curRetry = 0;
+webDone=false;
+         storyBlocked=false;
+         curRetry = 0;
+         // ===== 主页模式状态必须一起重置 =====
+         // 否则连续解析两个主页时：profileMode 还是 true → PROFILE_AUTO 里的清空逻辑被跳过，
+         // 旧列表不清、profileFetching 一直是 true 把新的列表请求挡掉 → 第二个主页只出一部分。
+         profileMode = false;
+         profileFetching = false;
+         dyProfileDoneSecUid = "";
+         dyProfileRenderLocked = false;
+         dyProfileJumped = false;
+         dyProfilePcUA = false;
+         dyBlockedMobileShare = false;
+         dyProfileSignedOwned = false;
+         dyProfileMoreHintShown = false;
+         dyAutoScrolling = false;
+         profilePage = 0;
+         profileLastRender = 0;
+         synchronized(profileCollected){ profileCollected.clear(); }
+         synchronized(profileSeen){ profileSeen.clear(); }
+         try{ stopDyProfileScroll(); }catch(Throwable t){}
         // 清空上一次的合集状态，避免误判
         synchronized(mixItems){ mixItems.clear(); }
         mixFetching = false;
@@ -8513,6 +9875,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
 
     /** 主页作品列表：渲染到「列表」页签，每条可解析/下载（分页，每页 100 条） */
     static final int PROFILE_PAGE_SIZE = 100;
+    boolean dyProfileJumped = false;   // 抖音主页跳 PC 版只做一次
     int profilePage = 0;
 
     void showProfileList(final java.util.List<ProfileParser.ProfileItem> list){
@@ -8902,6 +10265,13 @@ boolean ttUrl = isTikTokUrl(curPlay);
 
     /** 下载：视频 → mp4；图集 → 多选列表；实况图 → 封装实况照片 */
     void doDownload(){
+        // 下载前先确保有存储权限（没有就申请，避免"能播不能下"）
+        if(!ensureStoragePerm()){
+            DiagLog.w(DiagLog.M_DOWNLOAD, "下载被暂缓 | 已向用户申请存储权限，授权后会提示重试");
+            showHintToast("需要存储权限才能保存文件，请在弹窗里点「允许」");
+            return;
+        }
+        DiagLog.i(DiagLog.M_DOWNLOAD, "开始下载 | 链接=" + (curUrl == null ? "?" : curUrl));
         // X 多视频：一条推带 2~4 个视频，先让用户选第几个
         if(curXVideos.size() > 1){
             showXVideoPicker();
