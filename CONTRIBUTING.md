@@ -49,4 +49,29 @@ adb shell am start -n com.re.douyinparse/.MainActivity \
 - 不要绕过平台风控（签名算法、验证码识别等）
 - 不要提交任何真实用户数据、Cookie、Token
 
+## 发布纪律（重要，防封号）
+
+历史教训：GitHub REST API 批量发布 / 高频 push 曾触发风控导致账号被封、Actions 被滥用导致账号受限。所以：
+
+- **两平台（Gitee + GitHub）一律慢节奏**：逐文件带间隔（≥15 秒），只推本次实际改动的文件，不整仓推
+- **不批量连发 API**，不写循环脚本连续创建 Release
+- **Actions 能不用就不用**：本地编译好后手动传 APK，不上传构建脚本
+- **GitHub 只在账号正常时发**；被封 / 申诉期间只发 Gitee
+- **开源仓库只放空壳版**：
+  - `java/com/re/douyinparse/Srv*.java` 是占位版（无真实地址 / 凭据 / 证书）
+  - 真版在 `secret_src/`，已 `.gitignore`，绝不进仓库
+  - `tools/inject_srv.py` 只在本地构建时注入，不作为仓库源码
+- **发布前必检**：`grep -rn "116.205.105.44" java/` 应为 0 命中；APK 用 `strings` 也应搜不到明文地址
+- Release 描述与 version.json 的 body 必须带反馈群号 995434160
+
+## 发布流程
+
+1. 更新 `CHANGELOG.md`（新增 / 变更 / 修复分节）与 App 内 `changelogText()`
+2. 更新 `README.md`（平台列表、功能列表、技术实现表、服务器依赖）
+3. 更新 `version.json`（tag / name / body / apk 链接），APK 文件名从 Manifest 读版本号
+4. 本地 `PLAIN=1 bash build.sh` 产原包留档，`bash build.sh` 产加密包
+5. 加密包装机实测，确认关键日志正常
+6. 按「发布纪律」慢节奏推 Gitee；GitHub 等通知后同样慢节奏补发
+7. 服务器 `/opt/dyparse/version.json` 同步更新（scp + chmod 640）
+
 本项目定位是 **Android 逆向与 WebView 数据提取的技术学习样本**，不是爬虫工具。
