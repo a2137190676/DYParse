@@ -2,6 +2,212 @@
 
 本文记录每个版本的变更内容。版本号遵循 `major.minor.patch`，对应 `versionCode = major*10000 + minor*100 + patch`。
 
+> 自 v1.3.7.1 起支持四位版本号 `major.minor.patch.sub`，`versionCode` 按数字段拼接生成：
+> `1.3.7` → `10307`，`1.3.7.1` → `103701`（sub 段两位补零）。纯数字单调递增，
+> 旧版本 App 的更新检查走数值比较，可正常识别为更新。
+
+---
+## v1.3.7.1 (2026-10-25)
+本次为 **抖音实况图凭据自动获取 + 本地解析** 小版本，主要是把「实况图必须靠服务器」这条依赖砍掉。
+
+版本号说明：本次开始支持四位版本号，`1.3.7.1` 对应 `versionCode = 103701`
+（沿用 `major*10000 + minor*100 + patch*1 + sub`，纯数字递增，旧版本可正常识别为更新）。
+
+### 新增
+- **抖音访客凭据自动获取**：首次解析实况图时，后台静默开一个 1×1 透明 WebView（桌面 UA）打开 `www.douyin.com`，
+  通过挑战后从 `CookieManager` 取 `UIFID_TEMP` 存本地。实测 **2.5 秒**拿到，全程无弹窗、无跳转、无需用户操作。
+- **设置 → 抖音访客凭据**：新增入口，副标题实时显示状态（`已有凭据（224 字符）  实况图可本地解析` / `未获取`）。
+  点开三选项：自动获取 / 手动填写 / 清空或查看原理。
+- **获取过程进度弹窗**：手动触发时显示「正在获取访客凭据…通常 5-10 秒，全程静默，无需你操作」，可取消。
+- **获取失败引导**：失败时弹窗说明原因，提供「重试 / 手动填写」两个按钮，不会静默失败。
+- **原理说明弹窗**：解释为什么这个值没有算法可伪造、为什么必须由真实浏览器签发。
+
+### 修复
+- **抖音实况图只出 1 张静态图、LIVE 角标不出来**
+  - 根因：`/aweme/v1/web/aweme/detail/` 接口强制要求 `uifid`，缺失时固定返回
+    `403 Blocked by ArgusSecurityPlugin Uifid Not Found`，与 UA（桌面/iPhone/安卓共 3 种）、
+    Cookie（无 / 仅 ttwid / 仅 msToken / ttwid+msToken 共 4 种）组合无关（12 组矩阵实测全部 403）。
+  - 无法用算法伪造，只能由真实浏览器内核通过 `__ac_signature` 挑战后由服务端签发。
+  - 修法：App 内静默获取凭据后本地签名请求，一次通过（`DYDETAIL local-first ok=true http=200 tries=1`）。
+- **实况图下载提示文案错误**：`imgTipText()` 一直写着「共N张实况，左右滑动切图，可存为 MP4」，
+  实际从 v1.3.3 起封装的就是 `.jpg`（JPEG 主体 + MP4 数据 + XMP 元数据）。
+  已改为「下载为 .jpg 实况照片，相册里长按可播放」。
+- **设置页手动填写弹窗文案过时**：原文写「必须真实浏览器，App 内抓不到」，实测已证明 App 内可以抓到，已更正为推荐自动获取。
+
+### 变更
+- **抖音实况解析优先顺序调整**
+  - 有凭据：本地签名（60ms 级）→ 失败回退服务器
+  - 无凭据：服务器中转 → 失败回退本地
+  - 实测第二次解析：`DYDETAIL local-first ok=true http=200 tries=1 len=51834`，**零服务器请求**，60 毫秒完成。
+- **平台支持说明 · 抖音一栏**补充实况图机制说明（自动获取耗时、手动入口位置、本地解析）。
+- **调试入口保留并注明**：`--ez dyprobe true`（打开凭据抓取页）、`--es dyurl <url>`（指定抓取页）、
+  `--ez localonly true`（强制跳过服务器）。代码里已加注释说明用法，不影响正常用户。
+
+### 依赖变化（重要）
+| 场景 | v1.3.7 及之前 | v1.3.7.1 |
+|---|---|---|
+| 抖音实况图 | **必须**走服务器取签名 | 有凭据完全本地，服务器仅兜底 |
+| 服务器宕机时 | 实况退化为静态图 | 提前拿过凭据的用户不受影响 |
+| 用户操作成本 | 免填（靠服务器） | 免填（App 自动获取，2-3 秒） |
+
+---
+## v1.3.7 (2026-10-25)
+
+本次为 **B站 DASH 画质 + App内登录 + 合集统一 + 纯号输入** 版本。
+### 修复
+
+**服务端热修（2026-10-25，无需升级 App）**
+
+**抖音 live 图（实况）解析不出来的真正原因**
+- 现象：解析只出 1 张静态图，`【图集】` 没有动图，`LIVE` 角标不出现
+- 根因在**服务器**，不在 App：`server.py` 把**监听 socket** 直接 `ctx.wrap_socket()` 包成 TLS
+  ```python
+  # 旧（错误）
+  https_srv = ThreadingHTTPServer(("0.0.0.0", HTTPS_PORT), Handler)
+  https_srv.socket = ctx.wrap_socket(https_srv.socket, server_side=True)
+  ```
+  这样 `accept()` 会在**主循环里同步做 TLS 握手**。只要有一个客户端连上但不发数据
+  （网络切换、代理半开、端口探测），整个 accept 就永久阻塞，后面所有连接在队列里排队超时
+  （表现为 `Recv-Q` 持续积压、`curl` 全部超时、端口"在监听但连不上"）
+- 后果：App 打 `/api/detail` 全部 `SocketTimeoutException`，回退到分享页 SSR；
+  而 **SSR 不含实况字段**（`live_photo` / `motion_photo` / `life_share_ext` 全为 0），
+  所以只能拿到静态图，实况退化
+- 修法：新增 `HttpsServer` 子类，把 TLS 握手下放到 `finish_request()`，每连接一个独立线程
+  - 握手加 10 秒超时，连上不发数据会被踢掉，不再拖死 accept
+  - 握手失败只影响那一个连接，不影响其他用户
+- 效果：`8443` 从「连不上（000 / 超时）」恢复为 `200`，响应 6ms；修复后 12 秒即有真实用户请求成功
+
+**服务端自愈守卫（`dyparse-watchdog`）**
+- 每 60 秒探测 8080 / 8443，连续 3 次失败（或监听队列积压超阈值）自动 `systemctl restart dyparse`
+- 避免同类单点阻塞需要人工发现 + 手工重启
+
+**说明：本次为纯服务端修复，App 端代码未改动，所有旧版本用户自动恢复，不需要升级。**
+
+**B 站视频播放（不再走服务器中转，直连更快）**
+
+- 根因：B 站 CDN 对**手机 UA** 一律返回 403，且现在强制校验 `buvid3` Cookie
+- 现在解析时自动从 `x/frontend/finger/spi` 取 `buvid3` 并缓存，拉流用桌面 UA + Referer + buvid3
+- 播放器与下载器都按 B 站分支走这套请求头
+- 直连失败时才自动回退 `/api/bili/dl` 中转（作为兜底，不再默认走中转）
+
+**YouTube 第二次解析不再回退（无画面无进度条后提示被 CDN 拒绝）**
+- 根因：`ytSrvFallbackDone` / `xSrvFallbackDone` / `biliSrvFallbackDone` 三个「已回退」标志只在首次解析后置位，从不复位
+- 结果：第一次解析回退成功后，第二次解析失败就直接放弃，表现为「没有画面没有进度条，过一会提示被 CDN 拒绝」
+- 已在 `loadForParse()` 开头统一复位，每次新解析都能正常回退
+
+**TikTok 图文加载不出来**
+- 根因一：服务器 `tt_module.fetch_media` 缩进错误，`return p, True` 把整个下载逻辑变成了死代码，缓存未命中时函数返回 `None`，报 `cannot unpack non-iterable NoneType object`
+- 根因二：App 端图片加载无缓存，同一张图被并发重复请求，服务器在同一 HTTPS 连接上重复写响应导致 `SSL: BAD_LENGTH` / `Software caused connection abort`
+- 已重写服务器 `fetch_media`；App 端 `loadImage` 增加图片内存缓存与并发去重；服务器图片响应后主动关闭连接
+
+### 新增
+
+**B 站合集（ugc_season）解析**
+- 以前只看 `pages`（分P），合集视频（如 `av1603124347` 的「游戏移植教程合集」17 集）只解析到当前一集
+- 现在读 `view` 接口返回的 `ugc_season.sections[].episodes[]`，把整个合集列成 17 集
+- 关键点：合集里**每集是独立视频，aid 各不相同**（如第 3 集 av1603124347、第 5 集 av1453701054）
+  - 下载/播放改为用「该集自己的 aid + cid」，不再统一用主 aid
+  - 列表标题显示集标题，列表页头显示「B站合集 · 共 17 集」
+- 合集优先于分P：同时存在时按合集展示（与 B 站网页一致）
+
+**合集统一进「列表」页（抖音 + B站）**
+- 抖音合集原来把列表灌到「解析」页替换详情；现在与 B站一致，全部列到「列表」页签
+- **抖音解析页不再空白**：渲染列表时把合集首集的标题/封面/直链填进「解析」页，可直接播放/下载第 1 集
+- 解析完自动 `switchTab(1)` 切到列表页，并弹提示告知用户去「列表」页找
+  - 抖音：「合集 N 集，已放进「列表」页」
+  - B站：「B站合集 N 集，已放进「列表」页」
+- B站 主「解析」页保留当前集详情，不再被覆盖
+
+**列表「选择下载」（抖音合集 + B站分P/合集）**
+- 右下按钮由「全部下载」改为「选择下载」，点开是多选弹窗
+- 可以勾选任意几条一起下，也有「全选」一键提交，不用一条条点
+- 文件名统一「标题_第N集」
+
+**B 站画质升级为 DASH（可到 1080P60 / 4K）**
+- 原来走 `fnval=1` 整段 mp4，B站对这条老路限制极严，实测匿名只发 480P
+- 改为优先 `fnval=4048`（DASH + 4K + Dolby + 8K），从 `dash.video` 里挑 id 最大的一档：
+  - 匿名：封顶 480P/720P（服务端决定）
+  - 登录（SESSDATA）：1080P（qn=80）
+  - 大会员：1080P60（qn=116）/ 1080P+（qn=112）
+  - 大会员 + 4K 视频：4K（qn=120），**前提是 UP 主上传的就是 4K**
+- 同画质优先 AVC(H.264)，避免部分设备解不了 HEVC/AV1
+- 播放用 `MergingMediaSource` 合并视频轨 + 音频轨（复用 YouTube 那套双轨逻辑）
+- 下载走 `enqueueDownloadWithAudio`，下完两轨用 `MediaMuxer` 无损合成 mp4
+- 拿不到 DASH 时自动回退 `fnval=1` 整段 mp4（老设备/老视频兼容）
+
+**B 站 Cookie 支持（App 内登录，1080P）**
+- 设置 → Cookie（本地保存）→ **B站 Cookie**，点开三个选项：
+  - **App 内登录**：打开 B站 登录页，登录后自动抓 `SESSDATA` 等，页面保留等点「完成」
+  - **手动填写**：粘贴 Cookie（支持浏览器整行 `a=1; b=2`）
+  - **清空**：删除本地 Cookie
+- 匿名只有 480P（`real=32`），登录后 1080P，大会员 1080P60 / 1080P+
+- 与 buvid3 自动合并成一个 Cookie 头，CDN 拉流与下载都生效
+- 文件位置：`files/cookies/bilibili.txt`，一行一个 `name=value`
+- **Cookie 完全本地，不上传服务器**：view / playurl / CDN 拉流 / 下载全部直连 B站；
+  `/api/bili/dl` 中转（仅在直连失败时兜底）只传 `src` 与 `key`，不携带任何 Cookie
+
+**B 站纯 av 号 / BV 号输入**
+- 输入框可以直接填 `av1603124347` 或 `BV17m421j7ad`，自动转成标准链接解析
+- 支持大小写混合的 BV 号（前缀规范为 BV，后面保持原样）
+
+**B 站 b23.tv 短链展开**
+- `https://b23.tv/xxxx` 不再直接丢给解析器，先跟 302 展开成真实链接
+  - 单视频：`b23.tv/tWzVg6M` → `bilibili.com/video/BV1Zk7Z66EVn`
+  - 合集：`b23.tv/8CbSQFY` → `bilibili.com/video/BV17m421j7ad`（识别 ugc_season 17 集）
+  - 主页：`b23.tv/tTxqxYM` → `m.bilibili.com/space/85420121`
+- 展开后自动清理追踪参数（`buvid` / `share_session_id` / `timestamp` 等），只保留 `p=` / `bvid=` / `aid=`
+- 展开在网络线程执行（主线程会抛 `NetworkOnMainThreadException`）
+- `extractUrl` 新增 b23.tv / `m.bilibili.com` 规则；`extractBiliMid` 兼容 `m.bilibili.com/space/{mid}`
+
+**输入区平台提示补全**
+- 输入框上方原先写死「支持 抖音 · 快手 · TikTok · X · YouTube」五个平台，B站 和 Instagram 一直没加进去
+- 现为「支持 抖音 · 快手 · TikTok · X · YouTube · B站 · Instagram」七个平台
+
+### 变更
+
+- B 站 CDN 拉流新增桌面 UA（`BiliParser.UA_DESKTOP`），仅用于 CDN 请求，不影响 API 请求
+
+---
+## v1.3.6 (2026-10-25)
+
+本次为 **Instagram 登录解析 + 代理简化** 版本。
+
+### 新增
+
+**Instagram 登录解析（全本地，不依赖服务器）**
+- App 内嵌 WebView 登录 Instagram，自动抓取 Cookie（含 HttpOnly 的 sessionid）保存到手机本地
+- Cookie 本地文件：`files/cookies/instagram.txt`，格式一行一个 `name=value`
+- 登录后带 Cookie 直连 IG 接口解析 Reel / 视频，拿到 CDN 视频直链，可播放可下载
+- 支持手动粘贴 Cookie（浏览器整行 `a=1; b=2` 会自动拆成一行一个）
+- **IG 主页解析**：用户名主页列出全部作品，每页 100 条带翻页，支持逐条下载与当页全部下载
+  - 优先走 `api/v1/users/web_profile_info`，被 IG 限流(429)时自动回退 WebView + 注入本地 Cookie 收集
+- 每次点击「Instagram Cookie」都会先弹**登录风险提示**，需点「已阅读并知晓风险」才进入登录
+
+**B 站解析（本地直连）**
+- 单视频 / av 号 / BV 号 / 分P合集解析
+- 空间主页列表解析
+- view / playurl 接口免签直连；CDN 403 时走 `/api/bili/dl` 中转
+
+**通用 Cookie 本地化**
+- 新增 `CookieStore`：`files/cookies/{platform}.txt`，一行一个 `name=value`，name 必须带
+- 设置页新增「Cookie（本地保存）」分区：YouTube Cookie / Instagram Cookie / Cookie 文件位置
+- YouTube 登录抓到的 Cookie 现在也会落一份到本地文件（服务器到期后仍可查看/复用）
+
+### 变更
+
+- **代理设置简化为单一「内置代理」开关**：
+  - 删掉「自动探测本机代理」和「手动自填代理地址」，不再检测用户代理、不再往用户流量上套 Proxy
+  - 开着 = 海外平台（TikTok/X/YouTube/IG）走服务器中转
+  - 关着（默认）= 全部直连，用户自己挂的代理 / TUN 由系统接管，App 完全不干预
+- X 解析优先级调整：内置代理开 → 服务器中转优先；关 → 直连 fxtwitter/syndication 优先，失败再兜底服务器
+- TikTok 下载 / 网页请求一律直连（不再有代理分支）
+- IG 主页列表改为分页展示（每页 100 条）
+
+### 修复
+
+- X 单推文链接（x.com/user/status/id）被主页判定误吞，恢复单视频解析
+- IG 视频直链错放进 `i_imgs` 字段导致走图片队列，改为 `i_play`
+
 ---
 ## v1.3.5 (2026-10-24)
 
