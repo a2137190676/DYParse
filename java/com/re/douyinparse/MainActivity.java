@@ -46,6 +46,9 @@ public class MainActivity extends Activity {
     String xSrvReason = "";
     /** X 直连播放失败 → 已回退过服务器中转，防止无限循环 */
     boolean xSrvFallbackDone = false;
+    /** YouTube 直连播放失败 → 已回退过服务器流式中转，防止无限循环 */
+    boolean ytSrvFallbackDone = false;
+    boolean biliSrvFallbackDone = false;
     // 小窗播放器（ExoPlayer + TextureView）
     android.view.TextureView video;
     android.view.Surface videoSurface;
@@ -72,6 +75,9 @@ public class MainActivity extends Activity {
     String curPlay="", curCover="", curWs="", curImgs="", curId="", curDesc="";
     /** YouTube direct：独立音轨直链（itag 140 m4a），与 curPlay 合并播放/下载 */
     String curAudio="";
+    /** YouTube 下载专用：解析拿到的 googlevideo 直链（播放可能 403 回退，下载仍优先直连） */
+    String ytDirectPlay="";
+    String ytDirectAudio="";
     /** 快手：分享页给的独立音轨 m4a，非空时优先用它转 MP3 */
     String curMusic="";
     String curShowImg="";
@@ -81,17 +87,19 @@ public class MainActivity extends Activity {
     String curResult = "";
     static final String SP = "dyp_pref";
     static final String KEY_DARK = "dark_mode";
-    static final String KEY_PROXY = "proxy_url";      // 形如 http://host:port 或 socks5://host:port
-    static final String KEY_PROXY_ON = "proxy_on";
-    static final String KEY_PROXY_TT_ONLY = "proxy_tt_only";   // 仅 TikTok 走代理
+    static final String KEY_PROXY_ON = "proxy_on";       // 内置代理（服务器中转）开关，默认关
     /** 抖音访客凭据 UIFID_TEMP：由真实浏览器通过挑战后签发，缺失时 detail 接口一律 403 */
     static final String KEY_UIFID = "dy_uifid_temp";
+    /** YouTube Cookie：WebView 登录后自动抓取（含 HttpOnly），服务器 yt-dlp 带登录态解析 */
+    static final String KEY_YT_COOKIE = "yt_cookie";
     /** 自建服务器地址（可配置）：用户自填值 > 内置默认 > 本地/Gitee 回退 */
     static final String KEY_DYP_SRV = "dyp_srv";
     /** 用户点了「下个版本再提醒」：记下跳过的版本号，该版本及以下不再弹窗 */
     static final String KEY_SKIP_VER = "skip_ver";
     /** 强制更新：version.json 里带 "force":1 或 "min_version"，低于 min_version 必须更新 */
     static final String KEY_FORCE_MIN = "force_min_ver";
+    /** 用户已同意免责声明（不同意无法使用） */
+    static final String KEY_AGREE = "agree_declare_v1";
     /** 分类下载路径（空 = 用默认 Download/DYParse/<分类>） */
     static final String KEY_DL_VIDEO = "dl_video";
     static final String KEY_DL_IMG   = "dl_img";
@@ -122,63 +130,805 @@ public class MainActivity extends Activity {
             || (url != null && (url.contains("twimg.com") || url.contains("fxtwitter.com")));
     }
 
-    /** 依据「仅 TikTok」开关决定这条 URL 要不要走代理 */
-    static boolean proxyFor(String url, SharedPreferences p){
-        if(p == null) return true;
-        if(!p.getBoolean(KEY_PROXY_TT_ONLY, false)) return true;   // 全局模式：都走
-        // 「仅境外平台」模式：TikTok、X、YouTube（含 googlevideo CDN）都算境外，走代理
+    /** 是否为海外平台链接（TikTok/X/YouTube/IG + CDN） */
+    static boolean isOverseasUrl(String url){
         return isTikTokUrl(url) || isXDomain(url) || YtParser.isYtUrl(url)
-            || (url != null && url.contains("googlevideo.com"));
+            || InsParser.isInsUrl(url)
+            || (url != null && (url.contains("googlevideo.com")
+                || url.contains("videoplayback")));
     }
 
-    /** 读代理配置：返回 null 表示不用代理 */
+    /** YouTube 登录模式（WebView 登录 → 抓 Cookie） */
+    volatile boolean ytLoginMode = false;
+    /** Instagram 登录模式（WebView 登录 → 抓 Cookie） */
+    volatile boolean insLoginMode = false;
+    /** B 站登录模式（WebView 登录 → 抓 SESSDATA） */
+    volatile boolean biliLoginMode = false;
+    /** 抖音登录/探测模式（WebView 打开抖音 → 抓 UIFID_TEMP） */
+    volatile boolean dyLoginMode = false;
+    /** 临时探测开关（非 null 时记录抖音请求头 Cookie） */
+    String dyProbe = null;
+    String dyCookieLast = "";   // 最近一次抓到的抖音完整 Cookie
+    /** Cookie 快照，用来判断内容是否变化（避免刷屏） */
+    String dyLastCkSnap = null;
+    /** 是否已经拿到过 UIFID_TEMP（只记录首次出现的时机） */
+    volatile boolean dyUifidGot = false;
+    volatile boolean dyWatchRun = false;
+    Thread dyWatchThread = null;
+    /** 静默自动获取凭据：是否正在跑 / 完成后回调 */
+    volatile boolean dyAutoRunning = false;
+    Runnable dyAutoCallback = null;
+    String biliCookieLast = "";  // 最近一次抓到的 B站 完整 Cookie
+    volatile boolean ytCkUploading = false;
+    String ytCookieLast = "";   // 最近一次抓到的完整 Cookie（含 HttpOnly）
+    String insCookieLast = "";  // 最近一次抓到的 IG 完整 Cookie
+
+    /** 设备唯一标识：上传 Cookie 时按 uid 归档 */
+    static String ytUid(Context ctx){
+        try{
+            android.content.SharedPreferences p = ctx.getSharedPreferences(SP, android.content.Context.MODE_PRIVATE);
+            String u = p.getString("yt_uid", "");
+            if(u.length() < 8){
+                u = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+                p.edit().putString("yt_uid", u).apply();
+            }
+            return u;
+        }catch(Throwable t){ return "anon"; }
+    }
+
+    /** 从 WebView 请求头里抓 YouTube 完整 Cookie（CookieManager 拿不到 HttpOnly 的 SID/HSID） */
+    void maybeGrabYtCookie(String url, java.util.Map<String,String> headers){
+        if(!ytLoginMode) return;
+        try{
+            if(url == null || !(url.contains("youtube.com") || url.contains("google.com")
+                    || url.contains("accounts.google") || url.contains("youtubei"))) return;
+            if(headers == null) return;
+            String ck = headers.get("Cookie");
+            if(ck == null) return;
+            String cm = null;
+            try{ cm = CookieManager.getInstance().getCookie("https://www.youtube.com/"); }catch(Throwable t){}
+            String full = ck;
+            // 合并 CookieManager 里可见的部分（SAPISID 等）
+            if(cm != null && cm.length() > 0){
+                String remain = cm;
+                for(String kv : ck.split(";")){
+                    int e = kv.indexOf('=');
+                    if(e > 0){
+                        String k = kv.substring(0, e).trim();
+                        if(!remain.contains(k + "=")) remain = remain + "; " + kv;
+                    }
+                }
+                full = remain;
+            }
+            // 登录成功判定：有 SAPISID + __Secure-* 之一
+            if(full.contains("SAPISID") && (full.contains("__Secure-3PAPISID")
+                    || full.contains("SID") || full.contains("LOGIN_INFO"))){
+                if(full.length() > ytCookieLast.length() || !full.equals(ytCookieLast)){
+                    ytCookieLast = full;
+                    getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_YT_COOKIE, full).apply();
+                    saveYtCookieLocal(full);
+                    Log.i("DYP", "YT_CK_GRAB len=" + full.length() + " head=" + full.substring(0, Math.min(60, full.length())));
+                    uploadYtCookie(full);
+                    h.post(new Runnable(){ public void run(){
+                        s("YouTube 登录成功！Cookie 已保存，解析时自动使用");
+                        showHintToast("YouTube 登录成功");
+                        stopYtLogin();
+                    }});
+                }
+            }
+        }catch(Throwable t){ Log.i("DYP", "YT_CK_GRAB_ERR " + t); }
+    }
+
+    // ================= Instagram Cookie（WebView 登录 → 抓取 → 本地直连） =================
+
+    /** 从 WebView 请求头里抓 Instagram 完整 Cookie（sessionid 常是 HttpOnly） */
+    void maybeGrabInsCookie(String url, java.util.Map<String,String> headers){
+        if(!insLoginMode) return;
+        try{
+            if(url == null) return;
+            String u = url.toLowerCase();
+            if(!(u.contains("instagram.com") || u.contains("cdninstagram.com")
+                    || u.contains("facebook.com"))) return;
+            if(headers == null) return;
+            String ck = headers.get("Cookie");
+            if(ck == null || ck.length() == 0) return;
+
+            // 合并 CookieManager 可见部分
+            String cm = null;
+            try{ cm = CookieManager.getInstance().getCookie("https://www.instagram.com/"); }catch(Throwable t){}
+            String full = ck;
+            if(cm != null && cm.length() > 0){
+                String remain = cm;
+                for(String kv : ck.split(";")){
+                    int e = kv.indexOf('=');
+                    if(e > 0){
+                        String k = kv.substring(0, e).trim();
+                        if(!remain.contains(k + "=")) remain = remain + "; " + kv;
+                    }
+                }
+                full = remain;
+            }
+            // 登录成功判定：必须有 sessionid
+            if(!full.contains("sessionid=")) return;
+            if(full.equals(insCookieLast)) return;
+            insCookieLast = full;
+
+            int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_INS, full);
+            Log.i("DYP", "INS_CK_GRAB len=" + full.length() + " saved=" + n
+                    + " file=" + CookieStore.filePath(MainActivity.this, CookieStore.PLATFORM_INS));
+            // 只保存，不退出登录页——用户可能还要在页面里完成安全验证 / 解除风控
+            h.post(new Runnable(){ public void run(){
+                s("Cookie 已保存（" + n + " 项），页面保留：需要的话先完成安全验证，再点右上「完成」");
+                updateInsLoginBar();
+            }});
+        }catch(Throwable t){ Log.i("DYP", "INS_CK_GRAB_ERR " + t); }
+    }
+
+    /** Instagram 登录 WebView：加载 IG 登录页，抓 Cookie 后保持页面，等用户点「完成」 */
+    void startInsLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = true;
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        showInsLoginBar();
+        try{
+            WebSettings ws = web.getSettings();
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+            ws.setUserAgentString(
+                "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+                + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+        }catch(Throwable t){}
+        web.loadUrl("https://www.instagram.com/accounts/login/");
+    }
+
+    /** IG 登录顶栏：悬浮在 WebView 上方（保存状态 + 完成按钮） */
+    TextView insBarStatus;
+    android.widget.Button insBarDone;
+
+    void showInsLoginBar(){
+        try{
+            if(insBarDone != null && insBarDone.getParent() != null) return;   // 已显示
+            android.widget.FrameLayout host = (android.widget.FrameLayout) web.getParent();
+            if(host == null) return;
+
+            LinearLayout bar = new LinearLayout(this);
+            bar.setOrientation(LinearLayout.HORIZONTAL);
+            bar.setBackgroundColor(curDark ? 0xFF22262E : 0xFFFFFFFF);
+            bar.setPadding(dp(12), dp(8), dp(8), dp(8));
+            bar.setId(900001);
+
+            insBarStatus = new TextView(this);
+            insBarStatus.setTextSize(12);
+            insBarStatus.setTextColor(curDark ? 0xFFB8BEC9 : 0xFF4B5563);
+            insBarStatus.setText("等待登录…登录后可继续在页面里完成安全验证");
+            LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            bar.addView(insBarStatus, lp1);
+
+            insBarDone = new android.widget.Button(this);
+            insBarDone.setText("完成");
+            insBarDone.setTextSize(13);
+            insBarDone.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                int n = CookieStore.count(MainActivity.this, CookieStore.PLATFORM_INS);
+                if(n <= 0){
+                    showHintToast("还没抓到 Cookie，请先在页面里登录");
+                    return;
+                }
+                showHintToast("Instagram Cookie 已保存（" + n + " 项）");
+                hideInsLoginBar();
+                stopInsLogin();
+                buildSettingsPage();
+            }});
+            bar.addView(insBarDone);
+
+            android.widget.FrameLayout.LayoutParams flp = new android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+            flp.gravity = android.view.Gravity.TOP;
+            host.addView(bar, flp);
+            bar.bringToFront();
+        }catch(Throwable t){ Log.i("DYP", "INS_BAR_ERR " + t); }
+    }
+
+    void hideInsLoginBar(){
+        try{
+            if(insBarDone != null && insBarDone.getParent() != null){
+                ((android.view.ViewGroup) insBarDone.getParent().getParent()).removeView(
+                    (View) insBarDone.getParent());
+            }
+        }catch(Throwable t){}
+        insBarStatus = null;
+        insBarDone = null;
+    }
+
+    void updateInsLoginBar(){
+        try{
+            if(insBarStatus == null) return;
+            int n = CookieStore.count(this, CookieStore.PLATFORM_INS);
+            insBarStatus.setText(n > 0
+                ? "Cookie 已保存 " + n + " 项 · 可继续完成安全验证，好了点「完成」"
+                : "等待登录…");
+        }catch(Throwable t){}
+    }
+
+    /** 退出 Instagram 登录模式 */
+    void stopInsLogin(){
+        insLoginMode = false;
+        hideInsLoginBar();
+        try{
+            if(web != null && webReady){
+                WebSettings ws = web.getSettings();
+                ws.setUserAgentString(
+                    "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+                    + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+            }
+        }catch(Throwable t){}
+        try{ if(pageParse != null) pageParse.setVisibility(View.VISIBLE); }catch(Throwable t){}
+        try{
+            web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+        }catch(Throwable t){}
+        web.setVisibility(View.GONE);
+    }
+
+    // ================= B站 Cookie（WebView 登录 → 抓 SESSDATA → 本地直连） =================
+
+    /** 从 WebView 请求头里抓 B站 完整 Cookie（SESSDATA 是 HttpOnly，只能从请求头拿） */
+    void maybeGrabBiliCookie(String url, java.util.Map<String,String> headers){
+        if(!biliLoginMode) return;
+        try{
+            if(url == null) return;
+            String u = url.toLowerCase();
+            if(!(u.contains("bilibili.com") || u.contains("bilivideo.com"))) return;
+            if(headers == null) return;
+            String ck = headers.get("Cookie");
+            if(ck == null || ck.length() == 0) return;
+
+            // 合并 CookieManager 可见部分（buvid3 等非 HttpOnly 的）
+            String cm = null;
+            try{ cm = CookieManager.getInstance().getCookie("https://www.bilibili.com/"); }catch(Throwable t){}
+            String full = ck;
+            if(cm != null && cm.length() > 0){
+                String remain = cm;
+                for(String kv : ck.split(";")){
+                    int e = kv.indexOf('=');
+                    if(e > 0){
+                        String k = kv.substring(0, e).trim();
+                        if(!remain.contains(k + "=")) remain = remain + "; " + kv;
+                    }
+                }
+                full = remain;
+            }
+            // 登录成功判定：必须有 SESSDATA
+            if(!full.contains("SESSDATA=")) return;
+            if(full.equals(biliCookieLast)) return;
+            biliCookieLast = full;
+
+            int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_BILI, full);
+            // 抓到新的 SESSDATA，作废旧的 buvid3 缓存，让下次请求重新拼
+            BiliParser.buvid3 = "";
+            BiliParser.biliLoginLogged = false;
+            Log.i("DYP", "BILI_CK_GRAB len=" + full.length() + " saved=" + n
+                    + " file=" + CookieStore.filePath(MainActivity.this, CookieStore.PLATFORM_BILI));
+            h.post(new Runnable(){ public void run(){
+                s("B站 Cookie 已保存（" + n + " 项），页面保留：需要的话先完成验证，再点右上「完成」");
+                updateBiliLoginBar();
+            }});
+        }catch(Throwable t){ Log.i("DYP", "BILI_CK_GRAB_ERR " + t); }
+    }
+
+    /** 抖音登录/凭据抓取模式：WebView 打开抖音网页，从请求头抓 UIFID_TEMP（HttpOnly） */
+    void startDyLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = false;
+        biliLoginMode = false;
+        dyLoginMode = true;
+        dyProbe = "";
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        try{
+            WebSettings ws = web.getSettings();
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+            // 桌面 UA：抖音 PC 站点才走 detail 接口那套
+            ws.setUserAgentString(DyDetail.UA);
+        }catch(Throwable t){}
+        web.loadUrl("https://www.douyin.com/");
+        startDyCookieWatch();
+        Log.i("DYP", "DY_LOGIN_START");
+    }
+
+    /** 探测指定页面的 Cookie 下发时机（--es dyurl <url> 启动） */
+    void startDyProbeUrl(String target){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = false;
+        biliLoginMode = false;
+        dyLoginMode = true;
+        dyUifidGot = false;
+        dyLastCkSnap = null;
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        try{
+            WebSettings ws = web.getSettings();
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+            ws.setUserAgentString(DyDetail.UA);
+        }catch(Throwable t){}
+        Log.i("DYP", "DY_PROBE_URL " + target);
+        web.loadUrl(target);
+        startDyCookieWatch();
+    }
+
+    /** 退出抖音凭据抓取模式 */
+    void stopDyLogin(){
+        dyLoginMode = false;
+        dyProbe = null;
+        stopDyCookieWatch();
+        Log.i("DYP", "DY_LOGIN_STOP");
+    }
+
+    /** 当前是否已有抖音访客凭据 */
+    boolean dyHasUifid(){
+        try{
+            String v = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_UIFID, "");
+            return v != null && v.length() >= 32;
+        }catch(Throwable t){ return false; }
+    }
+
+    /** 抖音凭据状态文案（设置页副标题用） */
+    String curDyUifidLabel(){
+        if(dyHasUifid()){
+            String v = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_UIFID, "");
+            return "已有凭据（" + v.length() + " 字符）  实况图可本地解析";
+        }
+        return "未获取  点击开始自动获取（约 5-10 秒）";
+    }
+
+    /** 静默自动获取抖音访客凭据：后台开一个隐藏 WebView 过挑战，拿到就存，不打扰用户。
+     *  返回 true 表示已发起；结果通过 dyAutoCallback 回报。 */
+    void autoFetchDyUifid(final Runnable onDone){
+        if(dyHasUifid()){
+            if(onDone != null) onDone.run();
+            return;
+        }
+        if(dyAutoRunning){
+            if(onDone != null) dyAutoCallback = onDone;
+            return;
+        }
+        dyAutoRunning = true;
+        dyAutoCallback = onDone;
+        Log.i("DYP", "DY_AUTO_START 开始静默获取访客凭据");
+
+        h.post(new Runnable(){ public void run(){
+            try{
+                final WebView w = new WebView(MainActivity.this);
+                // 隐藏但必须可见才能过 JS 挑战：挪到屏幕外、1x1
+                android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(1, 1);
+                lp.leftMargin = -10; lp.topMargin = -10;
+                w.setLayoutParams(lp);
+                w.setAlpha(0.01f);
+                try{
+                    WebSettings ws = w.getSettings();
+                    ws.setJavaScriptEnabled(true);
+                    ws.setDomStorageEnabled(true);
+                    ws.setUserAgentString(DyDetail.UA);
+                    if(android.os.Build.VERSION.SDK_INT >= 21){
+                        ws.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+                    }
+                }catch(Throwable t){}
+                CookieManager.getInstance().setAcceptCookie(true);
+                try{ CookieManager.getInstance().setAcceptThirdPartyCookies(w, true); }catch(Throwable t){}
+
+                final android.view.ViewGroup rootVg = (android.view.ViewGroup) findViewById(R.id.root);
+                if(rootVg != null) rootVg.addView(w);
+
+                w.setWebViewClient(new WebViewClient(){
+                    public void onPageFinished(WebView vw, String u){
+                        Log.i("DYP", "DY_AUTO_PAGE " + u);
+                    }
+                });
+
+                // 轮询 Cookie，最多 20 秒
+                final long t0 = System.currentTimeMillis();
+                final Runnable[] poll = new Runnable[1];
+                poll[0] = new Runnable(){ public void run(){
+                    boolean done = false;
+                    String got = "";
+                    try{
+                        String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+                        if(cm != null){
+                            for(String kv : cm.split(";")){
+                                int e4 = kv.indexOf('=');
+                                if(e4 <= 0) continue;
+                                String k4 = kv.substring(0, e4).trim();
+                                if(k4.equals("UIFID_TEMP")){ got = kv.substring(e4 + 1).trim(); }
+                            }
+                        }
+                    }catch(Throwable t){}
+
+                    if(got.length() >= 32){
+                        getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_UIFID, got).apply();
+                        Log.i("DYP", "DY_AUTO_OK len=" + got.length()
+                            + " cost=" + (System.currentTimeMillis() - t0) + "ms");
+                        done = true;
+                    } else if(System.currentTimeMillis() - t0 > 20000){
+                        Log.i("DYP", "DY_AUTO_TIMEOUT 20s 未拿到凭据");
+                        done = true;
+                    }
+
+                    if(done){
+                        dyAutoRunning = false;
+                        try{ if(rootVg != null) rootVg.removeView(w); }catch(Throwable t){}
+                        try{ w.destroy(); }catch(Throwable t){}
+                        Runnable cb = dyAutoCallback;
+                        dyAutoCallback = null;
+                        if(cb != null){ try{ cb.run(); }catch(Throwable t){} }
+                    } else {
+                        h.postDelayed(poll[0], 1500);
+                    }
+                }};
+                h.postDelayed(poll[0], 2500);
+                w.loadUrl("https://www.douyin.com/");
+            }catch(Throwable t){
+                Log.i("DYP", "DY_AUTO_ERR " + t);
+                dyAutoRunning = false;
+                Runnable cb = dyAutoCallback;
+                dyAutoCallback = null;
+                if(cb != null){ try{ cb.run(); }catch(Throwable t2){} }
+            }
+        }});
+    }
+
+    /** 读一次抖音 Cookie，打印全貌并记录 UIFID_TEMP 首次出现的时机。
+     *  tag 用来区分是「主页加载完」还是「点开视频后」下发的。 */
+    void checkDyCookie(String tag){
+        try{
+            String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+            String ufTemp = "";
+            String ufPlain = "";
+            StringBuilder nm = new StringBuilder();
+            if(cm != null){
+                for(String kv : cm.split(";")){
+                    int e3 = kv.indexOf('=');
+                    if(e3 <= 0) continue;
+                    String k3 = kv.substring(0, e3).trim();
+                    nm.append(k3).append(",");
+                    String v3 = kv.substring(e3 + 1).trim();
+                    if(k3.equals("UIFID_TEMP")) ufTemp = v3;
+                    else if(k3.equals("UIFID") || k3.equals("uifid")) ufPlain = v3;
+                }
+            }
+            // 只在内容有变化时打日志，避免刷屏
+            if(cm != null && cm.equals(dyLastCkSnap)) return;
+            dyLastCkSnap = cm;
+            Log.i("DYP","DY_CK[" + tag + "] len=" + (cm==null?-1:cm.length())
+                + " TEMP=" + ufTemp.length() + " UIFID=" + ufPlain.length()
+                + " names=" + nm);
+            // 优先用 UIFID_TEMP；没有时退回 UIFID
+            String uf = ufTemp.length() >= 32 ? ufTemp : ufPlain;
+            String src = ufTemp.length() >= 32 ? "TEMP" : "UIFID";
+            if(uf.length() >= 32 && !dyUifidGot){
+                dyUifidGot = true;
+                dyCookieLast = cm;
+                getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_UIFID, uf).apply();
+                Log.i("DYP","DY_UIFID_SAVED firstGotAt=" + tag + " src=" + src + " len=" + uf.length());
+            }
+        }catch(Throwable t5){ Log.i("DYP","DY_CK_ERR " + t5); }
+    }
+
+    /** 启动 Cookie 轮询（抖音凭据抓取期间每 3 秒查一次） */
+    void startDyCookieWatch(){
+        stopDyCookieWatch();
+        dyWatchRun = true;
+        dyWatchThread = new Thread(new Runnable(){ public void run(){
+            int sec = 0;
+            while(dyWatchRun && sec < 90){
+                try{ Thread.sleep(3000); }catch(Throwable t){ break; }
+                sec += 3;
+                if(!dyWatchRun) break;
+                final int s2 = sec;
+                h.post(new Runnable(){ public void run(){ checkDyCookie("t" + s2 + "s"); }});
+            }
+            Log.i("DYP","DY_WATCH_END");
+        }});
+        dyWatchThread.start();
+    }
+
+    void stopDyCookieWatch(){
+        dyWatchRun = false;
+        dyWatchThread = null;
+    }
+
+    void startBiliLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = false;
+        biliLoginMode = true;
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        showBiliLoginBar();
+        try{
+            WebSettings ws = web.getSettings();
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+            // B站 登录页用手机 UA 正常，但 CDN 拉流用桌面 UA（在 BiliParser.UA_DESKTOP）
+            ws.setUserAgentString(
+                "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+                + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+        }catch(Throwable t){}
+        web.loadUrl("https://passport.bilibili.com/login");
+    }
+
+    /** B站 登录顶栏 */
+    TextView biliBarStatus;
+    android.widget.Button biliBarDone;
+
+    void showBiliLoginBar(){
+        try{
+            if(biliBarDone != null && biliBarDone.getParent() != null) return;
+            android.widget.FrameLayout host = (android.widget.FrameLayout) web.getParent();
+            if(host == null) return;
+
+            LinearLayout bar = new LinearLayout(this);
+            bar.setOrientation(LinearLayout.HORIZONTAL);
+            bar.setBackgroundColor(curDark ? 0xFF22262E : 0xFFFFFFFF);
+            bar.setPadding(dp(12), dp(8), dp(8), dp(8));
+            bar.setId(900002);
+
+            biliBarStatus = new TextView(this);
+            biliBarStatus.setTextSize(12);
+            biliBarStatus.setTextColor(curDark ? 0xFFB8BEC9 : 0xFF4B5563);
+            biliBarStatus.setText("等待登录…登录后自动抓 SESSDATA");
+            LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            bar.addView(biliBarStatus, lp1);
+
+            biliBarDone = new android.widget.Button(this);
+            biliBarDone.setText("完成");
+            biliBarDone.setTextSize(13);
+            biliBarDone.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                int n = CookieStore.count(MainActivity.this, CookieStore.PLATFORM_BILI);
+                if(n <= 0){
+                    showHintToast("还没抓到 Cookie，请先在页面里登录");
+                    return;
+                }
+                showHintToast("B站 Cookie 已保存（" + n + " 项）");
+                hideBiliLoginBar();
+                stopBiliLogin();
+                buildSettingsPage();
+            }});
+            bar.addView(biliBarDone);
+
+            android.widget.FrameLayout.LayoutParams flp = new android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+            flp.gravity = android.view.Gravity.TOP;
+            host.addView(bar, flp);
+            bar.bringToFront();
+        }catch(Throwable t){ Log.i("DYP", "BILI_BAR_ERR " + t); }
+    }
+
+    void hideBiliLoginBar(){
+        try{
+            if(biliBarDone != null && biliBarDone.getParent() != null){
+                ((android.view.ViewGroup) biliBarDone.getParent().getParent()).removeView(
+                    (View) biliBarDone.getParent());
+            }
+        }catch(Throwable t){}
+        biliBarStatus = null;
+        biliBarDone = null;
+    }
+
+    void updateBiliLoginBar(){
+        try{
+            if(biliBarStatus == null) return;
+            int n = CookieStore.count(this, CookieStore.PLATFORM_BILI);
+            biliBarStatus.setText(n > 0
+                ? "Cookie 已保存 " + n + " 项 · 好了点「完成」"
+                : "等待登录…");
+        }catch(Throwable t){}
+    }
+
+    /** 退出 B站 登录模式 */
+    void stopBiliLogin(){
+        biliLoginMode = false;
+        hideBiliLoginBar();
+        try{ if(pageParse != null) pageParse.setVisibility(View.VISIBLE); }catch(Throwable t){}
+        try{
+            web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+        }catch(Throwable t){}
+        web.setVisibility(View.GONE);
+    }
+
+    /** 上传 Cookie 到服务器（POST /api/yt/cookie，HMAC 鉴权） */
+    void uploadYtCookie(final String ck){
+        if(ytCkUploading || ck == null || ck.length() < 16) return;
+        ytCkUploading = true;
+        new Thread(new Runnable(){ public void run(){
+            HttpURLConnection c = null;
+            try{
+                String srv = effSrvS(MainActivity.this);
+                if(srv.length() == 0){ ytCkUploading = false; return; }
+                String body = "{\"uid\":\"" + ytUid(MainActivity.this) + "\",\"cookie\":\""
+                        + ck.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
+                java.net.URL u = new java.net.URL(srv + "/api/yt/cookie");
+                c = (HttpURLConnection) u.openConnection(java.net.Proxy.NO_PROXY);
+                c.setRequestMethod("POST");
+                c.setDoOutput(true);
+                c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36");
+                // HMAC 鉴权（path=/api/yt/cookie）
+                try{
+                    String ts = String.valueOf(System.currentTimeMillis() / 1000);
+                    String nonce = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+                    String path = "/api/yt/cookie";
+                    String msg = path + "\n" + ts + "\n" + nonce;
+                    String key = srvHmacKeyS(MainActivity.this);
+                    if(key.length() > 0){
+                        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+                        mac.init(new javax.crypto.spec.SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
+                        byte[] raw = mac.doFinal(msg.getBytes("UTF-8"));
+                        StringBuilder sb = new StringBuilder();
+                        for(byte b : raw) sb.append(String.format("%02x", b));
+                        c.setRequestProperty("X-TS", ts);
+                        c.setRequestProperty("X-NONCE", nonce);
+                        c.setRequestProperty("X-SIGN", sb.toString());
+                    }
+                }catch(Throwable t){ Log.i("DYP", "YT_CK_SIGN_ERR " + t); }
+                c.setConnectTimeout(15000);
+                c.setReadTimeout(15000);
+                java.io.OutputStream os = c.getOutputStream();
+                os.write(body.getBytes("UTF-8"));
+                os.close();
+                int code = c.getResponseCode();
+                Log.i("DYP", "YT_CK_UPLOAD http=" + code);
+            }catch(Throwable t){ Log.i("DYP", "YT_CK_UPLOAD_ERR " + t); }
+            finally{
+                try{ if(c != null) c.disconnect(); }catch(Throwable t){}
+                ytCkUploading = false;
+            }
+        }}).start();
+    }
+
+    /** YouTube 登录 WebView：加载 YouTube 首页让用户自己点「登录」（YouTube 域登录 Google 不拦） */
+    void startYtLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = true;
+        // 登录页独占全屏
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        s("请点右上角 ⋮ → 登录");
+        try{
+            WebSettings ws = web.getSettings();
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+            // 安卓 UA——YouTube 域登录不拦，accounts.google.com 才拦
+            ws.setUserAgentString(
+                "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+                + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+        }catch(Throwable t){}
+        // 直接进 YouTube 首页，不跳 Google 登录页
+        web.loadUrl("https://m.youtube.com/");
+    }
+
+    /** 退出 YouTube 登录模式（恢复 UA 与暗色策略） */
+    void stopYtLogin(){
+        ytLoginMode = false;
+        try{
+            if(web != null && webReady){
+                WebSettings ws = web.getSettings();
+                ws.setUserAgentString(
+                    "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+                    + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                if(android.os.Build.VERSION.SDK_INT >= 29){
+                    ws.setForceDark(WebSettings.FORCE_DARK_AUTO);
+                }
+                if(android.os.Build.VERSION.SDK_INT >= 33){
+                    ws.setAlgorithmicDarkeningAllowed(true);
+                }
+            }
+            // 恢复解析页 + 缩回 web 占位
+            if(pageParse != null) pageParse.setVisibility(View.VISIBLE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+        }catch(Throwable t){}
+        web.setVisibility(View.GONE);
+    }
+
+    /** YouTube 登录抓到 cookie 后：拆成一行一个写本地文件（服务器到期也能用） */
+    void saveYtCookieLocal(String full){
+        try{
+            int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_YT, full);
+            Log.i("DYP", "YT_CK_LOCAL n=" + n + " file="
+                    + CookieStore.filePath(MainActivity.this, CookieStore.PLATFORM_YT));
+        }catch(Throwable t){ Log.i("DYP", "YT_CK_LOCAL_ERR " + t); }
+    }
+
+    /** 本地是否已有 YouTube Cookie */
+    String ytCookieLocal(){
+        try{
+            String c = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_YT_COOKIE, "");
+            return c != null && c.length() >= 16 ? c : "";
+        }catch(Throwable t){ return ""; }
+    }
+
+    /** 读代理配置：仅一个开关——内置代理（= 服务器中转）。
+     *  开了=海外平台走服务器中转，关了=全部直连（用户自己挂的系统代理/TUN 自然生效，App 不干预）。 */
     Proxy curProxy(){
         return curProxyFor(null);
     }
 
-    /** 按 URL 取代理：url 为 null 时只做全局判断 */
-    Proxy curProxyFor(String url){
+    /** 内置代理是否开启 */
+    static boolean builtinProxyOn(Context ctx){
         try{
-            SharedPreferences p = getSharedPreferences(SP, MODE_PRIVATE);
-            if(!p.getBoolean(KEY_PROXY_ON, false)) return null;
-            if(url != null && !proxyFor(url, p)) return null;
-            return parseProxy(p.getString(KEY_PROXY, ""));
-        }catch(Throwable t){ return null; }
+            SharedPreferences p = ctx.getSharedPreferences(SP, MODE_PRIVATE);
+            return p.getBoolean(KEY_PROXY_ON, false);
+        }catch(Throwable t){ return false; }
     }
 
-    /** 解析 "http://1.2.3.4:8080" / "socks5://1.2.3.4:1080" / "1.2.3.4:8080" */
-    static Proxy parseProxy(String s){
-        if(s == null) return null;
-        s = s.trim();
-        if(s.length() == 0) return null;
-        boolean socks = false;
-        if(s.startsWith("socks5://")){ socks = true; s = s.substring(9); }
-        else if(s.startsWith("socks://")){ socks = true; s = s.substring(8); }
-        else if(s.startsWith("http://")){ s = s.substring(7); }
-        else if(s.startsWith("https://")){ s = s.substring(8); }
-        int c = s.lastIndexOf(':');
-        if(c <= 0 || c == s.length() - 1) return null;
-        String host = s.substring(0, c);
-        String portS = s.substring(c + 1);
-        int port;
-        try{ port = Integer.parseInt(portS.trim()); }catch(Throwable t){ return null; }
-        if(port <= 0 || port > 65535) return null;
-        return new Proxy(socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP,
-                         InetSocketAddress.createUnresolved(host, port));
+    Proxy curProxyFor(String url){
+        return null; // 不再往用户流量上套代理；内置中转由各解析器自己决定走不走
     }
 
-    /** 静态版代理读取（给静态工具方法用）；url 非空时按「仅 TikTok」开关过滤 */
+    /** 静态版代理读取：内置代理（服务器中转）开关。 */
     static Proxy staticProxy(Context ctx){
         return staticProxyFor(ctx, null);
     }
 
     static Proxy staticProxyFor(Context ctx, String url){
-        try{
-            SharedPreferences p = ctx.getSharedPreferences(SP, MODE_PRIVATE);
-            if(!p.getBoolean(KEY_PROXY_ON, false)) return null;
-            if(url != null && !proxyFor(url, p)) return null;
-            return parseProxy(p.getString(KEY_PROXY, ""));
-        }catch(Throwable t){ return null; }
+        return null; // 不再往用户流量上套代理
     }
 
     /** 静态版：按需套代理（内置服务器走 SrvClient pin + HMAC） */
@@ -294,7 +1044,7 @@ public class MainActivity extends Activity {
     java.util.List<String> imgUrls=new java.util.ArrayList<String>();
     /** 实况照片：与 imgUrls 一一对应的短视频地址，空串表示该图不是实况 */
     java.util.List<String> dynUrls=new java.util.ArrayList<String>();
-    /** 所有图片都是实况（下载时可整体转 mp4） */
+    /** 所有图片都是实况（下载时逐张封装成 .jpg 实况照片） */
     boolean imgAllLive = false;
     int imgIdx=0; View scrollOut;
     boolean imgZoomed=false; float imgDownX=0, imgDownY=0;
@@ -326,6 +1076,10 @@ public class MainActivity extends Activity {
         if(b == null){
             try{ SplashOverlay.show(this, isDarkMode(), null); }catch(Throwable t){}
         }
+        // 免责声明：首次启动必须同意（5 秒后可点），不同意直接退出
+        if(b == null && !getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_AGREE, false)){
+            showAgreementDialog();
+        }
         input=(EditText)findViewById(R.id.input);
         btn=(TextView)findViewById(R.id.btn);
         status=(TextView)findViewById(R.id.status);
@@ -347,9 +1101,7 @@ public class MainActivity extends Activity {
         progressPct=(TextView)findViewById(R.id.progressPct);
         progressBar=(ProgressBar)findViewById(R.id.progressBar);
         video=(android.view.TextureView)findViewById(R.id.video);
-        // 「设置」：功能入口 + 代理 + 服务器 + 分类下载路径
-        View bs = findViewById(R.id.btnSettings);
-        if(bs != null) bs.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ showSettings(); }});
+        // 右上角「设置」按钮已移除：设置走「设置」页签（switchTab(3) 仍在 tab 栏）
         btnTheme=(TextView)findViewById(R.id.btnTheme);
         if(btnTheme != null){
             btnTheme.setText(isDarkMode() ? "亮" : "暗");
@@ -357,6 +1109,7 @@ public class MainActivity extends Activity {
                 boolean d = !isDarkMode();
                 applyTheme(d);
                 btnTheme.setText(d ? "亮" : "暗");
+                buildSettingsPage();
                 Toast.makeText(MainActivity.this, d ? "已切换夜间" : "已切换日间", Toast.LENGTH_SHORT).show();
             }});
         }
@@ -431,6 +1184,50 @@ public class MainActivity extends Activity {
             int pageHits=0;
             public void onPageStarted(WebView v,String u,android.graphics.Bitmap f){
                 v.evaluateJavascript(HOOK_JS,null);
+                // 【临时探测】抖音首页加载后，把 cookie 里是否有 UIFID_TEMP 打出来
+                if(u != null && u.contains("douyin.com") && u.indexOf("/video/") < 0
+                        && u.indexOf("/note/") < 0 && u.indexOf("share/") < 0){
+                    v.evaluateJavascript(
+                        "(function(){try{var c=document.cookie||'';"
+                        +"return 'DCK len='+c.length+' hasUIFID='+(c.indexOf('UIFID')>=0?1:0)"
+                        +"+' hasTtwid='+(c.indexOf('ttwid')>=0?1:0);}catch(e){return 'DCK_ERR '+e;}})()",
+                        new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
+                            Log.i("DYP","WS_PROBE_JS "+r);
+                            // CookieManager 能拿到 HttpOnly（UIFID_TEMP 就是 HttpOnly）
+                            try{
+                                String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
+                                StringBuilder nm = new StringBuilder();
+                                String uifidVal = "";
+                                if(cm != null){
+                                    for(String kv : cm.split(";")){
+                                        int e2 = kv.indexOf('=');
+                                        if(e2 <= 0) continue;
+                                        String k = kv.substring(0, e2).trim();
+                                        nm.append(k).append(",");
+                                        if(k.equals("UIFID_TEMP") || k.equals("UIFID") || k.equals("uifid")){
+                                            uifidVal = kv.substring(e2 + 1).trim();
+                                        }
+                                    }
+                                }
+                                Log.i("DYP","WS_PROBE_CM len=" + (cm == null ? -1 : cm.length())
+                                    + " uifidLen=" + uifidVal.length() + " names=" + nm);
+                            }catch(Throwable t3){ Log.i("DYP","WS_PROBE_CM_ERR " + t3); }
+                        }});
+                }
+                if(profileMode){
+                    v.evaluateJavascript(PROFILE_HOOK_JS,null);
+                }
+                // YouTube 页面解析：注入 JS 等 <video> 标签出现后取 src（Shorts 页 video 有完整直链）
+                if(curUrl != null && YtParser.isYtUrl(curUrl) && !ytLoginMode && u != null && u.contains("youtube.com")){
+                    v.evaluateJavascript(
+                        "(function(){try{window.__ytProbeDone=0;window.__ytProbeInt=setInterval(function(){"
+                        +"if(window.__ytProbeDone)return;"
+                        +"var v=document.querySelector('video');if(!v||!v.src||v.src.indexOf('blob:')>=0||v.src.indexOf(window.__ytLastSrc||'')>=0)return;"
+                        +"window.__ytProbeDone=1;window.__ytLastSrc=v.src;clearInterval(window.__ytProbeInt);"
+                        +"var t='';try{t=document.title||'';}catch(e){}"
+                        +"window.DyBridge.onYtData(v.src+'@@YT@@'+'@@YT@@'+t+'@@YT@@'+'@@YT@@0@@YT@@');"
+                        +"},800);}catch(e){}})()", null);
+                }
             }
             public boolean shouldOverrideUrlLoading(WebView v,String u){
                 if(u==null) return false;
@@ -445,6 +1242,41 @@ public class MainActivity extends Activity {
             public android.webkit.WebResourceResponse shouldInterceptRequest(WebView v, android.webkit.WebResourceRequest req){
                 try{
                     final String u = req.getUrl().toString();
+                    // 抖音登录/探测模式：从请求头抓完整 Cookie（含 HttpOnly 的 UIFID_TEMP）
+                    if(dyLoginMode && u != null && u.contains("douyin.com")){
+                        try{
+                            java.util.Map<String,String> hh = req.getRequestHeaders();
+                            String ckH = hh != null ? hh.get("Cookie") : null;
+                            if(ckH != null && ckH.length() > 0){
+                                boolean hasU = ckH.contains("UIFID");
+                                Log.i("DYP","DY_HDR uifid=" + (hasU?1:0) + " len=" + ckH.length()
+                                    + " url=" + u.substring(0, Math.min(70, u.length())));
+                                if(hasU){
+                                    java.util.regex.Matcher mm2 = java.util.regex.Pattern
+                                        .compile("UIFID_TEMP=([^;]+)|UIFID=([^;]+)|uifid=([^;]+)")
+                                        .matcher(ckH);
+                                    if(mm2.find()){
+                                        String ufVal = mm2.group(1) != null ? mm2.group(1)
+                                                 : (mm2.group(2) != null ? mm2.group(2) : mm2.group(3));
+                                        dyProbe = ufVal;
+                                        Log.i("DYP","DY_UIFID_HIT len=" + (ufVal==null?0:ufVal.length()));
+                                    }
+                                }
+                            }
+                        }catch(Throwable t4){}
+                    }
+                    // YouTube 登录模式：抓请求头里的完整 Cookie（含 HttpOnly）
+                    if(ytLoginMode && u != null){
+                        try{ maybeGrabYtCookie(u, req.getRequestHeaders()); }catch(Throwable t2){}
+                    }
+                    // Instagram 登录模式：抓请求头里的完整 Cookie
+                    if(insLoginMode && u != null){
+                        try{ maybeGrabInsCookie(u, req.getRequestHeaders()); }catch(Throwable t2){}
+                    }
+                    // B站 登录模式：抓请求头里的完整 Cookie（SESSDATA 是 HttpOnly）
+                    if(biliLoginMode && u != null){
+                        try{ maybeGrabBiliCookie(u, req.getRequestHeaders()); }catch(Throwable t2){}
+                    }
                     // 调试：记录所有 XHR/fetch 请求，用于发现合集接口
                     String ac = req.getRequestHeaders() != null ? req.getRequestHeaders().get("X-Requested-With") : null;
                     String acc = req.getRequestHeaders() != null ? req.getRequestHeaders().get("Accept") : null;
@@ -471,7 +1303,46 @@ public class MainActivity extends Activity {
                              }}).start();
                          }
                      }
-                    if(u != null && u.indexOf("slidesinfo") >= 0){
+                    // 主页列表接口：native 层拦截重发（比 JS hook 可靠，response 是 JSON）
+boolean isProfileList = u != null && profileMode && (
+                              u.indexOf("/aweme/v1/web/aweme/post/") >= 0
+                          || u.indexOf("/web/api/v2/aweme/post/") >= 0
+                          || u.indexOf("/aweme/post/") >= 0
+                          || (u.indexOf("graphql") >= 0 && u.indexOf("kuaishou") >= 0)
+                          || u.indexOf("/x/space/wbi/arc/search") >= 0
+                          || u.indexOf("youtube.com/youtubei/v1/browse") >= 0
+                          || (u.indexOf("instagram.com") >= 0 && u.indexOf("graphql") >= 0)
+                          || (u.indexOf("instagram.com") >= 0 && u.indexOf("/api/v1/feed/user/") >= 0)
+                          || (u.indexOf("instagram.com") >= 0 && u.indexOf("/api/v1/users/") >= 0));
+                     if(isProfileList && !profileFetching){
+                         profileFetching = true;
+                         final String lu = u;
+                         Log.i("DYP", "PROFILE_LIST_HIT " + u.substring(0, Math.min(200, u.length())));
+                         new Thread(new Runnable(){ public void run(){
+                             try{
+                                 String ck = CookieManager.getInstance().getCookie(lu);
+                                 java.net.HttpURLConnection c = MainActivity.openConn(MainActivity.this, lu);
+                                 c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                                 c.setRequestProperty("Referer", lu.contains("kuaishou") ? "https://live.kuaishou.com/"
+                                         : lu.contains("bilibili") ? "https://space.bilibili.com/" : "https://www.iesdouyin.com/");
+                                 c.setRequestProperty("Accept", "application/json,*/*");
+                                 if(ck != null) c.setRequestProperty("Cookie", ck);
+                                 c.setConnectTimeout(12000); c.setReadTimeout(15000);
+                                 java.io.InputStream in = c.getInputStream();
+                                 java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                                 byte[] buf = new byte[8192]; int n;
+                                 while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                                 in.close();
+                                 String body = new String(bo.toByteArray(), "UTF-8");
+                                 Log.i("DYP", "PROFILE_BODY len=" + body.length());
+                                 if(body.length() > 100){
+                                     parseProfileBody(body);
+                                 }
+                             }catch(Throwable t){ Log.i("DYP", "PROFILE_REQ_ERR " + t); }
+                             profileFetching = false;
+                         }}).start();
+                     }
+                     if(u != null && u.indexOf("slidesinfo") >= 0){
                         Log.i("DYP", "INTERCEPT_HIT " + u.substring(0, Math.min(180, u.length())));
                         // 用同一份 Cookie 自己发一次，拿到 body
                         new Thread(new Runnable(){ public void run(){
@@ -496,12 +1367,180 @@ public class MainActivity extends Activity {
                             }catch(Throwable t){ Log.i("DYP", "INTERCEPT_ERR " + t); }
                         }}).start();
                     }
+                    // 主页条目下载的 detail 请求：只记日志，不 native 重发。
+                    // 签名（a_bogus/msToken）绑定 WebView 浏览器环境，native 重发必 404；
+                    // 直链数据走 JS fetch 回调（onDetailData）。
+                    if(u != null && u.indexOf("/aweme/v1/web/aweme/detail/") >= 0 && pendingDetailId.length() > 0){
+                        Log.i("DYP", "DETAIL_NATIVE_HIT " + u.substring(0, Math.min(160, u.length())));
+                    }
                 }catch(Throwable t){}
                 return null;
             }
             public void onPageFinished(WebView v,String u){
                 pageHits++;
                 Log.i("DYP","onPageFinished#"+pageHits+" "+u);
+                // Instagram 登录模式：检测登录态，不跑抖音解析逻辑
+                // B站 登录模式：检测登录态，不跑抖音解析逻辑
+                if(biliLoginMode){
+                    if(u != null && (u.contains("bilibili.com") || u.contains("bilivideo.com"))){
+                        v.evaluateJavascript(
+                            "(function(){try{var ck=document.cookie||'';"
+                            +"var hasSj=ck.indexOf('DedeUserID')>=0||ck.indexOf('bili_jct')>=0;"
+                            +"var hasAv=!!document.querySelector('a[href*=\\'/space/\\'],.header-entry-mini,.bili-avatar');"
+                            +"return ck.length+'|'+(hasSj?1:0)+'|'+(hasAv?1:0);}catch(e){return '0|0|0';}})()",
+                            new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
+                                Log.i("DYP","BILI_LOGIN_PROBE "+r);
+                                try{
+                                    String[] p = r.replace("\"","").split("\\|");
+                                    if(p.length >= 3 && (p[1].equals("1") || p[2].equals("1"))){
+                                        final WebView vFinal = v;
+                                        h.post(new Runnable(){ public void run(){
+                                            final StringBuilder cm = new StringBuilder();
+                                            try{ cm.append(CookieManager.getInstance().getCookie("https://www.bilibili.com/")); }catch(Throwable t){}
+                                            final String base = cm.toString();
+                                            vFinal.evaluateJavascript("(function(){try{return document.cookie||'';}catch(e){return '';}})()",
+                                                new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String dc){
+                                                    try{ dc = dc.replace("\"","").trim(); }catch(Throwable t){}
+                                                    String full = base + (dc != null && dc.length() > 0 ? ("; " + dc) : "");
+                                                    if(full.contains("SESSDATA=") && !full.equals(biliCookieLast)){
+                                                        biliCookieLast = full;
+                                                        int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_BILI, full);
+                                                        BiliParser.buvid3 = "";
+                                                        BiliParser.biliLoginLogged = false;
+                                                        Log.i("DYP","BILI_CK_GRAB len=" + full.length() + " saved=" + n);
+                                                        s("B站 Cookie 已保存（" + n + " 项）");
+                                                        updateBiliLoginBar();
+                                                    }
+                                                }});
+                                        }});
+                                    }
+                                }catch(Throwable t2){ Log.i("DYP","BILI_LOGIN_PROBE_ERR " + t2); }
+                            }});
+                    }
+                    return;
+                }
+                if(insLoginMode){
+                    if(u != null && u.contains("instagram.com")){
+                        v.evaluateJavascript(
+                            "(function(){try{var m=document.cookie.match(/csrftoken=([^;]+)/);"
+                            +"var d=document.cookie.indexOf('ds_user_id')>=0;"
+                            +"var li=!!document.querySelector('a[href*=\\'/direct/inbox/\\'],svg[aria-label=\\'Home\\']');"
+                            +"return (m?m[1].length:0)+'|'+(d?1:0)+'|'+(li?1:0);}catch(e){return '0|0|0';}})()",
+                            new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
+                                Log.i("DYP","INS_LOGIN_PROBE "+r);
+                                try{
+                                    String[] p = r.replace("\"","").split("\\|");
+                                    if(p.length >= 3 && (p[1].equals("1") || p[2].equals("1"))){
+                                        final WebView vFinal = v;
+                                        h.post(new Runnable(){ public void run(){
+                                            final StringBuilder cm = new StringBuilder();
+                                            try{ cm.append(CookieManager.getInstance().getCookie("https://www.instagram.com/")); }catch(Throwable t){}
+                                            final String base = cm.toString();
+                                            vFinal.evaluateJavascript("(function(){try{return document.cookie||'';}catch(e){return '';}})()",
+                                                new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String dc){
+                                                    try{ dc = dc.replace("\"","").trim(); }catch(Throwable t){}
+                                                    String full = base + (dc != null && dc.length() > 0 ? ("; " + dc) : "");
+                                                    if(full.contains("sessionid=") && !full.equals(insCookieLast)){
+                                                        insCookieLast = full;
+                                                        int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_INS, full);
+                                                        Log.i("DYP","INS_CK_GRAB len=" + full.length() + " saved=" + n);
+                                                        s("Cookie 已保存（" + n + " 项），页面保留：完成安全验证后点「完成」");
+                                                        updateInsLoginBar();
+                                                    }
+                                                }});
+                                        }});
+                                    }
+                                }catch(Throwable t2){ Log.i("DYP","INS_LOGIN_PROBE_ERR " + t2); }
+                            }});
+                    }
+                    return;
+                }
+                // 抖音凭据抓取模式：持续监控 Cookie，记录每次变化（区分主页/视频页下发时机）
+                if(dyLoginMode){
+                    Log.i("DYP","DY_LOGIN_PROBE page=" + u);
+                    checkDyCookie("onPageFinished");
+                    return;
+                }
+                // YouTube 登录模式：检测登录态，不跑抖音解析逻辑
+                if(ytLoginMode){
+                    if(u != null && (u.contains("youtube.com") || u.contains("google.com"))){
+                        v.evaluateJavascript(
+                            "(function(){try{var ck=document.cookie||'';var hasLogin=ck.indexOf('SAPISID')>=0||ck.indexOf('LOGIN_INFO')>=0;return ck.length+'|'+(hasLogin?1:0)+'|'+((window.ytInitialPlayerResponse||window.ytcfg)?1:0);}catch(e){return '0|0|0';}})()",
+                            new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
+                                Log.i("DYP","YT_LOGIN_PROBE "+r);
+                                try{
+                                    String[] p=r.replace("\"","").split("\\|");
+                                    int len=Integer.parseInt(p[0]);
+                                    if(p[1].equals("1") || (len>80 && p[2].equals("1"))){
+                                        final WebView vFinal = v;
+                                        h.post(new Runnable(){ public void run(){
+                                            // 从 CookieManager + document.cookie 抓可见部分
+                                            final StringBuilder cm = new StringBuilder();
+                                            try{ cm.append(CookieManager.getInstance().getCookie("https://www.youtube.com/")); }catch(Throwable t){}
+                                            vFinal.evaluateJavascript("(function(){try{return document.cookie||'';}catch(e){return '';}})()",
+                                                new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String dc){
+                                                    try{ dc=dc.replace("\"","").trim(); }catch(Throwable t){}
+                                                    String full = cm.toString() + (dc!=null&&dc.length()>0?("; "+dc):"");
+                                                    if(full.length()>=16){
+                                                        ytCookieLast=full;
+                                                        getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_YT_COOKIE, full).apply();
+                                                        saveYtCookieLocal(full);
+                                                        Log.i("DYP","YT_CK_GRAB len="+full.length()+" head="+full.substring(0,Math.min(60,full.length())));
+                                                        uploadYtCookie(full);
+                                                        s("YouTube 登录成功！Cookie 已保存，解析时自动使用");
+                                                        showHintToast("YouTube 登录成功");
+                                                    } else {
+                                                        s("检测到登录态，但 Cookie 读取失败，请再点一次登录");
+                                                    }
+                                                    stopYtLogin();
+                                                }});
+                                        }});
+                                    }
+                                }catch(Throwable t){ Log.i("DYP","YT_LOGIN_PROBE_ERR "+t); }
+                            }});
+                    }
+                    return;
+                }
+                // 页面级主页检测：短链跳转 / 用户自己改链都适用
+                if(isProfilePage(u) && !profileMode){
+                    Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
+                    profileMode = true;
+                    webDone = true;
+                    synchronized(profileCollected){ profileCollected.clear(); } profilePage = 0;
+                    synchronized(profileSeen){ profileSeen.clear(); }
+                    s("主页网页加载中，自动收集作品…");
+                }
+                if(profileMode){
+                    // 快手 fw/user 壳页 → 主动跳真实主页
+                    if(u != null && u.contains("kuaishou.com/fw/user/")){
+                        java.util.regex.Matcher km = java.util.regex.Pattern
+                            .compile("/fw/user/([A-Za-z0-9_]+)").matcher(u);
+                        if(km.find()){
+                            final String real = "https://live.kuaishou.com/profile/" + km.group(1);
+                            Log.i("DYP", "KS_PROFILE_JUMP " + real);
+                            h.postDelayed(new Runnable(){ public void run(){
+                                try{
+                                    if(profileMode && web != null
+                                            && web.getUrl() != null
+                                            && web.getUrl().contains("fw/user")){
+                                        web.loadUrl(real);
+                                    }
+                                }catch(Throwable t){}
+                            }}, 1200);
+                        }
+                    }
+                    // 主页收集模式：注入收集脚本 + 诊断 SSR 数据
+                    v.evaluateJavascript(PROFILE_HOOK_JS, null);
+                    v.evaluateJavascript(
+                        "(function(){try{var out={rd:0,aw:0,keys:[]};"
+                        +"if(window._ROUTER_DATA){out.rd=JSON.stringify(window._ROUTER_DATA).length;"
+                        +"var s=JSON.stringify(window._ROUTER_DATA);out.aw=s.indexOf('aweme_list');"
+                        +"var c=0;for(var k in window._ROUTER_DATA){c++;if(c<8)out.keys.push(k);}}"
+                        +"var t=document.body?document.body.innerText.length:0;"
+                        +"window.DyBridge.onDiag(JSON.stringify({rd:out.rd,aw:out.aw,keys:out.keys.join(','),bodyLen:t}));"
+                        +"}catch(e){window.DyBridge.onDiag('err:'+e);}})()", null);
+                    return;
+                }
                 if(webDone) return;
                 if(mixMode){ Log.i("DYP", "SKIP_INJECT mixMode"); return; }
                 if(u==null || !(u.startsWith("http://")||u.startsWith("https://"))) return;
@@ -553,29 +1592,34 @@ public class MainActivity extends Activity {
         web.addJavascriptInterface(new Bridge(), "DyBridge");
     }
 
-    /** 三页签初始化：解析 / 列表 / 历史 */
-    View pageParse, pageHistory, pageList;
-    LinearLayout historyWrap, listWrap;
+    /** 四页签初始化：解析 / 列表 / 历史 / 设置 */
+    View pageParse, pageHistory, pageList, pageSettings;
+    LinearLayout historyWrap, listWrap, settingsWrap;
     TextView historyEmpty, listHead, btnDlAll;
-    TextView tabParse, tabHistory, tabList;
+    TextView tabParse, tabHistory, tabList, tabSettings;
 
     void setupTabs(){
         tabParse = (TextView)findViewById(R.id.tabParse);
         tabList = (TextView)findViewById(R.id.tabList);
         tabHistory = (TextView)findViewById(R.id.tabHistory);
+        tabSettings = (TextView)findViewById(R.id.tabSettings);
         pageParse = findViewById(R.id.pageParse);
         pageList = findViewById(R.id.pageList);
         pageHistory = findViewById(R.id.pageHistory);
+        pageSettings = findViewById(R.id.pageSettings);
         historyWrap = (LinearLayout)findViewById(R.id.historyWrap);
         historyEmpty = (TextView)findViewById(R.id.historyEmpty);
         listWrap = (LinearLayout)findViewById(R.id.listWrap);
         listHead = (TextView)findViewById(R.id.listHead);
         btnDlAll = (TextView)findViewById(R.id.btnDlAll);
+        settingsWrap = (LinearLayout)findViewById(R.id.settingsWrap);
         tabParse.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(0); }});
         tabList.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(1); }});
         tabHistory.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(2); }});
+        tabSettings.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(3); }});
         switchTab(0);
         refreshHistory();
+        buildSettingsPage();
     }
 
     void switchTab(int idx){
@@ -586,7 +1630,8 @@ public class MainActivity extends Activity {
             pageParse.setVisibility(idx == 0 ? View.VISIBLE : View.GONE);
             pageList.setVisibility(idx == 1 ? View.VISIBLE : View.GONE);
             pageHistory.setVisibility(idx == 2 ? View.VISIBLE : View.GONE);
-            TextView[] tabs = {tabParse, tabList, tabHistory};
+            pageSettings.setVisibility(idx == 3 ? View.VISIBLE : View.GONE);
+            TextView[] tabs = {tabParse, tabList, tabHistory, tabSettings};
             for(int i = 0; i < tabs.length; i++){
                 if(i == idx){
                     tabs[i].setBackground(makeRoundRect(0x1AFE2C55, 0, 10));
@@ -602,7 +1647,496 @@ public class MainActivity extends Activity {
         }catch(Throwable t){ Log.i("DYP", "TAB_ERR " + t); }
     }
 
-    /** 历史页刷新：显示下载记录（文件名 + 时间） */
+    /** 设置页：常驻页签版，每项独立入口 */
+    void buildSettingsPage(){
+        if(settingsWrap == null) return;
+        settingsWrap.removeAllViews();
+
+        addSettingRow("更新日志", "每个版本改了什么", new View.OnClickListener(){
+            public void onClick(View v){ showChangelog(); }});
+        addSettingRow("关于", "版本信息与免责声明", new View.OnClickListener(){
+            public void onClick(View v){ showAbout(); }});
+        addSettingRow("用户协议", "免责声明与使用条款", new View.OnClickListener(){
+            public void onClick(View v){ showAgreementText(); }});
+        addSettingRow("检查更新", "手动检查新版本", new View.OnClickListener(){
+            public void onClick(View v){ checkUpdate(false); }});
+        addSettingRow("反馈群 " + APP_QQ_GROUP, "点击加入 QQ 群", new View.OnClickListener(){
+            public void onClick(View v){
+                try{
+                    startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                            Uri.parse(APP_QQ_GROUP_URL)));
+                }catch(Throwable t){
+                    s("无法打开浏览器");
+                }
+            }});
+
+        addSettingSection("代理");
+        addSettingRow("内置代理", "海外平台走服务器中转的开关", new View.OnClickListener(){
+            public void onClick(View v){ showProxyDialog(); }});
+
+        addSettingSection("下载路径");
+        addSettingRow("视频目录", curDlDirLabel("视频"), new View.OnClickListener(){
+            public void onClick(View v){ showDlDirDialog("视频", KEY_DL_VIDEO, "Download/DYParse/视频"); }});
+        addSettingRow("图片目录", curDlDirLabel("图片"), new View.OnClickListener(){
+            public void onClick(View v){ showDlDirDialog("图片", KEY_DL_IMG, "Download/DYParse/图片"); }});
+        addSettingRow("音频目录", curDlDirLabel("音频"), new View.OnClickListener(){
+            public void onClick(View v){ showDlDirDialog("音频", KEY_DL_AUDIO, "Download/DYParse/音频"); }});
+        addSettingRow("合集目录", curDlDirLabel("合集"), new View.OnClickListener(){
+            public void onClick(View v){ showDlDirDialog("合集", KEY_DL_MIX, "Download/DYParse/合集"); }});
+        addSettingRow("动图目录", curDlDirLabel("动图"), new View.OnClickListener(){
+            public void onClick(View v){ showDlDirDialog("动图", KEY_DL_ANIM, "Download/DYParse/动图"); }});
+        addSettingRow("修复媒体库", "相册里看不到已下载文件？点这里补录", new View.OnClickListener(){
+            public void onClick(View v){ fixMediaLibrary(); }});
+
+        addSettingSection("服务器");
+        addSettingRow("服务器地址", "自建服务器 / 内置服务器状态", new View.OnClickListener(){
+            public void onClick(View v){ showSettings(); }});
+        addSettingRow("机场流量", "点击查询剩余流量", new View.OnClickListener(){
+            public void onClick(View v){
+                loadAirInfo(new TextView(MainActivity.this));
+            }});
+        addSettingRow("YouTube 登录", "YouTube 风控时，登录后可解析更多视频", new View.OnClickListener(){
+            public void onClick(View v){ showYtLoginDialog(); }});
+
+        addSettingSection("Cookie（本地保存）");
+        addSettingRow("YouTube Cookie", curYtCkLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showCookieDialog(CookieStore.PLATFORM_YT, "YouTube"); }});
+        addSettingRow("Instagram Cookie", curInsCkLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showInsLoginDialog(); }});
+addSettingRow("B站 Cookie", curBiliCkLabel(), new View.OnClickListener(){
+             public void onClick(View v){ showBiliLoginMenu(); }});
+         addSettingRow("抖音访客凭据", curDyUifidLabel(), new View.OnClickListener(){
+             public void onClick(View v){ showDyUifidMenu(); }});
+        addSettingRow("Cookie 文件位置", "点开查看已保存的 cookie 名单", new View.OnClickListener(){
+            public void onClick(View v){ showCookieFilesInfo(); }});
+
+        addSettingSection("平台支持");
+        addSettingRow("平台支持说明", "各平台解析方式与服务器依赖", new View.OnClickListener(){
+            public void onClick(View v){ showPlatformHelp(); }});
+    }
+
+    /** 抖音访客凭据菜单：自动获取 / 手动填写 / 清空 */
+    void showDyUifidMenu(){
+        curDark = isDarkMode();
+        boolean has = dyHasUifid();
+        String[] items = {
+            has ? "重新自动获取（约 5-10 秒）" : "自动获取（约 5-10 秒）",
+            "手动填写（从浏览器复制）",
+            has ? "清空凭据" : "查看原理说明"
+        };
+        dypDlg()
+            .setTitle("抖音访客凭据（UIFID_TEMP）")
+            .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(w == 0) startDyUifidFetchWithUi();
+                    else if(w == 1) showUifidDialog();
+                    else if(dyHasUifid()){
+                        getSharedPreferences(SP, MODE_PRIVATE).edit().remove(KEY_UIFID).apply();
+                        showHintToast("抖音凭据已清空");
+                        buildSettingsPage();
+                    } else {
+                        showDyUifidWhy();
+                    }
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 带界面提示的自动获取（用户主动点击时用） */
+    void startDyUifidFetchWithUi(){
+        curDark = isDarkMode();
+        final android.app.AlertDialog prog = dypDlg()
+            .setTitle("正在获取访客凭据")
+            .setMessage("正在用内置浏览器访问抖音并完成校验，请稍候…\n\n"
+                + "· 通常 5-10 秒\n"
+                + "· 全程静默，无需你操作\n"
+                + "· 成功后抖音实况图可本地解析，不再依赖服务器")
+            .setCancelable(false)
+            .create();
+        prog.show();
+        final long t0 = System.currentTimeMillis();
+        autoFetchDyUifid(new Runnable(){ public void run(){
+            long cost = System.currentTimeMillis() - t0;
+            try{ prog.dismiss(); }catch(Throwable t){}
+            if(dyHasUifid()){
+                showHintToast("凭据已获取（" + (cost / 1000) + " 秒），实况图可本地解析");
+                s("抖音访客凭据已就绪");
+            } else {
+                showDyUifidFail();
+            }
+            buildSettingsPage();
+        }});
+    }
+
+    /** 自动获取失败提示 */
+    void showDyUifidFail(){
+        curDark = isDarkMode();
+        dypDlg()
+            .setTitle("获取失败")
+            .setMessage("没能自动拿到凭据，可能原因：\n\n"
+                + "· 抖音页面加载超时（网络慢或代理不通）\n"
+                + "· 触发了人机验证\n\n"
+                + "你可以：\n"
+                + "1. 重试一次\n"
+                + "2. 手动填写（从电脑浏览器 F12 复制）\n\n"
+                + "注意：不填也能解析普通视频和图文，只是实况图会退化成静态图。")
+            .setPositiveButton("重试", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ startDyUifidFetchWithUi(); }})
+            .setNeutralButton("手动填写", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ showUifidDialog(); }})
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 凭据原理说明 */
+    void showDyUifidWhy(){
+        curDark = isDarkMode();
+        dypDlg()
+            .setTitle("为什么需要这个")
+            .setMessage("抖音实况图（Live Photo）的动图轨道，只有 PC 版详情接口会下发；"
+                + "这个接口在风控网关后面，缺少访客凭据时固定返回：\n\n"
+                + "403 Blocked by ArgusSecurityPlugin Uifid Not Found\n\n"
+                + "该凭据由抖音服务端签发、只发给通过浏览器挑战的客户端，"
+                + "没有算法可以伪造。\n\n"
+                + "本 App 的做法：在后台开一个隐藏浏览器打开抖音首页，"
+                + "让它通过挑战并拿到凭据，然后存到你手机本地。\n"
+                + "凭据不会上传到任何服务器。\n\n"
+                + "有效期：通常几周到几个月，失效后重新获取即可。")
+            .setPositiveButton("知道了", null)
+            .create().show();
+    }
+
+    /** 统一弹窗 Builder：主题强制跟随 App 内主题（不受 ROM DeviceDefault 影响） */
+    android.app.AlertDialog.Builder dypDlg(){
+        return new android.app.AlertDialog.Builder(this, curDark
+            ? android.app.AlertDialog.THEME_DEVICE_DEFAULT_DARK
+            : android.app.AlertDialog.THEME_DEVICE_DEFAULT_LIGHT);
+    }
+
+    /** 设置页：YouTube Cookie 状态标签 */
+    String curYtCkLabel(){
+        int n = CookieStore.count(this, CookieStore.PLATFORM_YT);
+        if(n <= 0) return "未填写 · 点这里粘贴 / 登录自动抓取";
+        return "已保存 " + n + " 项" + (CookieStore.ytReady(this) ? "（登录态完整）" : "（缺少关键项）");
+    }
+
+    /** 设置页：Instagram Cookie 状态标签 */
+    String curInsCkLabel(){
+        int n = CookieStore.count(this, CookieStore.PLATFORM_INS);
+        if(n <= 0) return "未填写 · IG 视频必须登录才能解析";
+        return "已保存 " + n + " 项" + (CookieStore.insReady(this) ? "（含 sessionid）" : "（缺 sessionid）");
+    }
+
+    /** 设置页：B站 Cookie 状态标签 */
+    String curBiliCkLabel(){
+        int n = CookieStore.count(this, CookieStore.PLATFORM_BILI);
+        if(n <= 0) return "未填写 · 匿名只有 480P/720P";
+        return "已保存 " + n + " 项" + (CookieStore.biliReady(this) ? "（含 SESSDATA，可拿 1080P）" : "（缺 SESSDATA，仍是 720P）");
+    }
+
+    /** B站 Cookie 入口：App 内登录 / 手动填写 */
+    void showBiliLoginMenu(){
+        curDark = isDarkMode();
+        int n = CookieStore.count(this, CookieStore.PLATFORM_BILI);
+        String[] items = {
+            "App 内登录（自动抓 SESSDATA）",
+            "手动填写 Cookie",
+            n > 0 ? ("清空 Cookie（当前 " + n + " 项）") : "清空 Cookie（无）"
+        };
+        dypDlg()
+            .setTitle("B站 Cookie")
+            .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(w == 0) startBiliLogin();
+                    else if(w == 1) showCookieDialog(CookieStore.PLATFORM_BILI, "B站");
+                    else {
+                        CookieStore.clear(MainActivity.this, CookieStore.PLATFORM_BILI);
+                        BiliParser.buvid3 = "";
+                        BiliParser.biliLoginLogged = false;
+                        showHintToast("B站 Cookie 已清空");
+                        buildSettingsPage();
+                    }
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** Cookie 文件位置说明 */
+    void showCookieFilesInfo(){
+        curDark = isDarkMode();
+        StringBuilder b = new StringBuilder();
+        b.append("Cookie 全部保存在手机本地，不上传任何服务器。\n\n");
+        b.append("YouTube：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_YT)).append("\n\n");
+b.append("Instagram：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_INS)).append("\n\n");
+         b.append("B站：\n").append(CookieStore.filePath(this, CookieStore.PLATFORM_BILI)).append("\n\n");
+         b.append("格式：一行一个 cookie，name=value，name 不能省略。\n");
+         b.append("例：\n");
+         b.append("sessionid=12345%3Aabc\n");
+         b.append("csrftoken=AbCdEf\n");
+         b.append("ds_user_id=67890\n\n");
+         b.append("B站填 SESSDATA 即可（有它才有 1080P，不填只有 720P）：\n");
+         b.append("SESSDATA=xxxxxxxx\n\n");
+        b.append("服务器到期 / 关闭内置代理时，这些 cookie 仍然可用。");
+        dypDlg().setTitle("Cookie 存储位置").setMessage(b.toString())
+            .setPositiveButton("知道了", null).create().show();
+    }
+
+    /** 通用 Cookie 填写弹窗 */
+    void showCookieDialog(final String platform, final String label){
+        curDark = isDarkMode();
+        final String cur = CookieStore.dump(this, platform);
+        boolean has = cur.length() > 0;
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(16);
+        box.setPadding(pad, dp(8), pad, 0);
+
+        TextView tip = new TextView(this);
+        tip.setTextSize(12);
+        tip.setTextColor(curDark ? 0xFF9AA0AC : 0xFF6B7280);
+        StringBuilder tb = new StringBuilder();
+        tb.append("一行一个 cookie，name=value，必须带名字。\n");
+        if(CookieStore.PLATFORM_INS.equals(platform)){
+            tb.append("IG 至少要有：sessionid、csrftoken、ds_user_id\n");
+        } else if(CookieStore.PLATFORM_BILI.equals(platform)){
+            tb.append("B站填 SESSDATA 即可；填了可拿 1080P，不填只有 720P\n");
+        } else {
+            tb.append("YouTube 至少要有：SAPISID、__Secure-1PSID\n");
+        }
+        tb.append("支持直接粘贴浏览器的一整行 a=1; b=2，会自动拆开。");
+        tip.setText(tb.toString());
+        box.addView(tip);
+
+        final EditText et = new EditText(this);
+        et.setTextSize(12);
+        et.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
+        et.setMinLines(8);
+        et.setMaxLines(14);
+        et.setHorizontallyScrolling(false);
+        et.setText(cur);
+        et.setHint(CookieStore.PLATFORM_INS.equals(platform)
+            ? "sessionid=...\ncsrftoken=...\nds_user_id=..."
+            : (CookieStore.PLATFORM_BILI.equals(platform)
+                ? "SESSDATA=...\nbuvid3=..."
+                : "SAPISID=...\n__Secure-1PSID=...\nLOGIN_INFO=..."));
+        et.setTextColor(curDark ? 0xFFE6E8EC : 0xFF1F2937);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(10);
+        box.addView(et, lp);
+
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle(label + " Cookie")
+            .setView(box)
+            .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    String txt = et.getText() == null ? "" : et.getText().toString();
+                    int n = CookieStore.save(MainActivity.this, platform, txt);
+                    if(n <= 0){
+                        showHintToast("没解析到有效 cookie，格式应为 name=value");
+                        return;
+                    }
+                    showHintToast(label + " Cookie 已保存（" + n + " 项）");
+                    buildSettingsPage();
+                }})
+            .setNeutralButton("清空", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    CookieStore.clear(MainActivity.this, platform);
+                    showHintToast(label + " Cookie 已清空");
+                    buildSettingsPage();
+                }})
+            .setNegativeButton("取消", null)
+            .create();
+        dlg.show();
+    }
+
+    /** Instagram 登录弹窗：每次登录都先弹风险确认 */
+    void showInsLoginDialog(){
+        curDark = isDarkMode();
+        showInsRiskDialog();
+    }
+
+    /** Instagram 登录风险提示（每次登录都提示，同意后才进入登录流程） */
+    void showInsRiskDialog(){
+        curDark = isDarkMode();
+        StringBuilder b = new StringBuilder();
+        b.append("⚠ 登录前必读\n\n");
+        b.append("1. 请先在手机上的 Instagram 官方 App 里正常登录一次这个账号，")
+         .append("确认能正常使用、能收验证码。\n\n");
+        b.append("2. 然后再回到本解析器登录。\n\n");
+        b.append("3. 绝对不要用新注册的账号、或从未在官方 App 登录过的账号直接在本解析器登录——")
+         .append("极大概率触发风控、被限制或被封号。\n\n");
+        b.append("4. 如果你是 +86 手机号且收不到短信验证码，请改用其他方式登录授权")
+         .append("（例如邮箱验证、已登录设备的授权确认）。\n\n");
+        b.append("本工具仅做本地 Cookie 保存与解析，登录行为发生在 Instagram 官方网页上。")
+         .append("账号风控 / 封禁由 Instagram 判定，与本工具无关，")
+         .append("因不当使用导致的封号由使用者自行承担，作者不负责。");
+
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle("登录风险提示")
+            .setMessage(b.toString())
+            .setPositiveButton("已阅读并知晓风险", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    showInsLoginMenu();
+                }})
+            .setNegativeButton("拒绝", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    showHintToast("已取消：未同意风险提示，不会打开登录页");
+                }})
+            .setCancelable(false)
+            .create();
+        dlg.show();
+        // 正文较长，允许滚动
+        try{
+            android.widget.TextView msg = dlg.findViewById(android.R.id.message);
+            if(msg != null) msg.setTextSize(12);
+        }catch(Throwable t){}
+    }
+
+    /** Instagram 登录方式选择（风险提示同意后进入） */
+    void showInsLoginMenu(){
+        curDark = isDarkMode();
+        int n = CookieStore.count(this, CookieStore.PLATFORM_INS);
+        boolean ready = CookieStore.insReady(this);
+        StringBuilder tip = new StringBuilder();
+        if(n > 0){
+            tip.append("已保存 ").append(n).append(" 项")
+               .append(ready ? "（含 sessionid，可直接解析视频）" : "（缺 sessionid，解析不了视频）")
+               .append("\n\n");
+        }else{
+            tip.append("Instagram 不登录只能拿封面，视频流一律 403。\n\n");
+        }
+        tip.append("方式一：点「App 内登录」，在页面里登录你自己的 IG 账号，登录成功后 Cookie 会自动保存到手机本地（不上传服务器）。\n\n");
+        tip.append("方式二：点「手动填写」，粘贴 sessionid / csrftoken / ds_user_id。");
+
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle("Instagram 登录")
+            .setMessage(tip.toString())
+            .setPositiveButton("App 内登录", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    startInsLogin();
+                    s("已打开 Instagram 登录页，登录成功后自动保存 Cookie");
+                }})
+            .setNeutralButton("手动填写", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    showCookieDialog(CookieStore.PLATFORM_INS, "Instagram");
+                }})
+            .setNegativeButton("取消", null)
+            .create();
+        dlg.show();
+    }
+
+    /** YouTube 登录弹窗：内嵌 WebView 登录 Google，自动抓 Cookie 上传服务器 */
+    void showYtLoginDialog(){
+        curDark = isDarkMode();   // 同步主题，避免弹窗用了旧主题色
+        final String local = ytCookieLocal();
+        String tip = local.length() > 0
+                ? "已登录（Cookie " + local.length() + " 字符）。重新登录或清除登录态？"
+                : "YouTube 风控时，登录 Google 账号可解除限制。\n"
+                  + "登录后 Cookie 会发送到解析服务器（仅用于 YouTube 解析）。";
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle("YouTube 登录")
+            .setMessage(tip)
+            .setPositiveButton("登录", new android.content.DialogInterface.OnClickListener(){ public void onClick(android.content.DialogInterface d, int w){
+                startYtLogin();
+                s("已打开登录页，登录成功后会自动保存 Cookie");
+            }})
+            .setNegativeButton("关闭", null)
+            .create();
+        dlg.show();
+    }
+
+    /** 分组标题 */
+    void addSettingSection(String title){
+        TextView g = new TextView(this);
+        g.setText("── " + title + " ──");
+        g.setTextSize(12);
+        g.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+        g.setPadding(0, dp(14), 0, dp(6));
+        settingsWrap.addView(g);
+    }
+
+    /** 当前下载目录标签 */
+    String curDlDirLabel(String cat){
+        String key = dlKeyOf(cat);
+        String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+        if(v != null && v.length() > 0) return "当前：" + v;
+        return "默认：Download/DYParse/" + cat;
+    }
+
+    /** 下载目录设置弹窗（独立对话框，直接输入路径） */
+    void showDlDirDialog(final String cat, final String key, final String def){
+        curDark = isDarkMode();
+        dypDlg()
+            .setTitle("设置「" + cat + "」目录")
+            .setMessage("输入完整路径：\n\n默认：/storage/emulated/0/" + def + "\n\n"
+                + "留空则恢复默认。\n"
+                + "修改后立即生效，已下载的文件不会自动迁移。")
+            .setView(new android.widget.EditText(this){{
+                setText(getSharedPreferences(SP, MODE_PRIVATE).getString(key, ""));
+                setHint(def);
+                setSingleLine(true);
+            }})
+            .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    android.widget.EditText et = (android.widget.EditText) ((android.app.AlertDialog)d).findViewById(android.R.id.custom);
+                    if(et == null) return;
+                    String v = et.getText().toString().trim();
+                    if(v.length() == 0) v = "";
+                    getSharedPreferences(SP, MODE_PRIVATE).edit().putString(key, v).apply();
+                    buildSettingsPage();
+                    Toast.makeText(MainActivity.this, "已设置" + cat + "目录", Toast.LENGTH_SHORT).show();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /** 用户协议文字弹窗（只读） */
+    void showAgreementText(){
+        curDark = isDarkMode();   // 同步主题，避免弹窗用了旧主题色
+        showLongTextDialog("用户协议与免责声明",
+            "1. 本软件全程免费，无任何收费项目；\n"
+          + "   若您是通过付费购买获得，请立即申请退款。\n\n"
+          + "2. 本软件仅供个人学习与技术研究使用，\n"
+          + "   严禁用于任何商业用途、批量抓取或侵犯\n"
+          + "   他人权益的场景。\n\n"
+          + "3. 所有解析内容版权归原作者所有，\n"
+          + "   请勿传播、转售或用于盈利。\n\n"
+          + "4. 如内容涉及侵权，请联系删除：\n"
+          + "   2137190676@qq.com\n\n"
+          + "同意即表示您已阅读并接受以上全部条款。",
+          null, null);
+    }
+
+    /** 设置页行 */
+    void addSettingRow(String title, String sub, View.OnClickListener l){
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(12), dp(10), dp(12), dp(10));
+        row.setBackground(makeRoundRect(curDark ? 0xFF24272F : 0xFFFFFFFF,
+                curDark ? 0xFF333842 : 0xFFE1E4E9, 12));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(8);
+        row.setLayoutParams(lp);
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(13);
+        t.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+        TextView s2 = new TextView(this);
+        s2.setText(sub);
+        s2.setTextSize(11);
+        s2.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+        s2.setPadding(0, dp(2), 0, 0);
+        row.addView(t);
+        row.addView(s2);
+        row.setOnClickListener(l);
+        settingsWrap.addView(row);
+    }
     void refreshHistory(){
         if(historyWrap == null || historyEmpty == null) return;
         // 清掉除空状态外的所有子 view
@@ -650,7 +2184,49 @@ public class MainActivity extends Activity {
             row.addView(name);
             row.addView(meta);
             row.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-                showHintToast("文件：" + f.getAbsolutePath());
+                // 历史页点击：视频直接播，图片弹大图
+                String name = f.getName().toLowerCase();
+                if(name.endsWith(".mp4") || name.endsWith(".m4a")){
+                    curPlay = "file://" + f.getAbsolutePath();
+                    curImgs = "";
+                    curId = f.getName();
+                    switchTab(0);
+                    actions.setVisibility(View.VISIBLE);
+                    videoBox.setVisibility(View.VISIBLE);
+                    img.setVisibility(View.GONE);
+                    doPlay();
+                    s("播放本地文件：" + f.getName());
+                } else if(name.endsWith(".mp3")){
+                    // MP3 用系统播放器
+                    try{
+                        android.net.Uri u = android.net.Uri.fromFile(f);
+                        Intent it = new Intent(Intent.ACTION_VIEW);
+                        it.setDataAndType(u, "audio/mpeg");
+                        it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(it);
+                    }catch(Throwable t){
+                        showHintToast("无法打开：" + f.getAbsolutePath());
+                    }
+                } else if(name.endsWith(".jpg") || name.endsWith(".png")){
+                    // 图片：加载到图片区 + 切回解析页
+                    curShowImg = f.getAbsolutePath();
+                    curImgs = f.getAbsolutePath();
+                    imgUrls.clear();
+                    imgUrls.add(f.getAbsolutePath());
+                    switchTab(0);
+                    actions.setVisibility(View.VISIBLE);
+                    img.setVisibility(View.VISIBLE);
+                    videoBox.setVisibility(View.GONE);
+                    try{
+                        android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+                        if(bm != null) img.setImageBitmap(bm);
+                    }catch(Throwable t){
+                        showHintToast("图片加载失败");
+                    }
+                    s("查看本地图片：" + f.getName());
+                } else {
+                    showHintToast("文件：" + f.getAbsolutePath());
+                }
             }});
             historyWrap.addView(row);
         }
@@ -718,6 +2294,26 @@ public class MainActivity extends Activity {
         try{
             Intent it=getIntent();
             String u=it!=null?it.getStringExtra("url"):null;
+            /* 调试入口（保留，便于后续排查抖音凭据/解析问题，不影响正常使用）
+               adb shell am start -n com.re.douyinparse/.MainActivity \
+                 --ez dyprobe true                  打开抖音凭据抓取页（手动看 cookie 下发）
+                 --es dyurl  https://www.douyin.com  指定抓取页地址
+                 --ez localonly true                  强制跳过服务器，只用本地签名
+               */
+            boolean dyPr = false;
+            String dyUrl = null;
+            try{
+                dyPr = it != null && it.getBooleanExtra("dyprobe", false);
+                dyUrl = it != null ? it.getStringExtra("dyurl") : null;
+            }catch(Throwable t){}
+            if(dyUrl != null && dyUrl.length() > 0){
+                startDyProbeUrl(dyUrl);
+                return;
+            }
+            if(dyPr){
+                startDyLogin();
+                return;
+            }
             if(u!=null && u.length()>0){
                 input.setText(u);
                 // Activity 重建（如切主题）时不重新解析
@@ -832,9 +2428,43 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     // ===== 合集 =====
     volatile boolean mixFetching = false;
     volatile boolean mixMode = false;
+    /** 主页列表接口正在 native 重发中（防重入） */
+    volatile boolean profileFetching = false;
     /** 合集视频列表：每项 [awemeId, 描述, 无水印地址, 封面] */
     final java.util.List<String[]> mixItems = new java.util.ArrayList<String[]>();
     String mixTitle = "", mixId = "";
+
+    // ---- 主页 WebView 收集模式（抖音/快手/B站统一方案） ----
+    volatile boolean profileMode = false;
+    final java.util.List<ProfileParser.ProfileItem> profileCollected =
+            new java.util.ArrayList<ProfileParser.ProfileItem>();
+    final java.util.Set<String> profileSeen = new java.util.HashSet<String>();
+    long profileLastRender = 0;
+    static final String PROFILE_HOOK_JS =
+     "(function(){try{if(window.__dyProfileHooked)return;window.__dyProfileHooked=1;"
+     +"window.__dyOrigFetch=window.fetch;"
+     +"function send(b){try{if(b&&b.length>500)window.DyBridge.onProfileData(b);}catch(e){}}"
+     +"function rec(u,b){try{if(!b||b.length<500)return;"
++"var hit=(b.indexOf('aweme_list')>=0)"
+      +"||(b.indexOf('visionProfileWorkPhotoList')>=0)"
+      +"||(b.indexOf('visionProfileLikePhotoList')>=0)"
+      +"||(b.indexOf('bvid')>=0&&b.indexOf('vlist')>=0)"
+      +"||(b.indexOf('videoId')>=0&&b.indexOf('thumbnail')>=0)"
+      +"||(b.indexOf('edge_owner_to_timeline_media')>=0)"
+      +"||(b.indexOf('xdt_api__v1__feed__user_timeline_graphql_connection')>=0)"
+      +"||(b.indexOf('xdt_shortcode_media')>=0)"
+      +"||(b.indexOf('\"shortcode\"')>=0&&b.indexOf('display_url')>=0);"
+     +"if(hit)send(b);}catch(e){}}"
+     +"var of=window.fetch;if(of){window.fetch=function(){var a=arguments;var url=(typeof a[0]==='string')?a[0]:(a[0]&&a[0].url);var pr=of.apply(this,a);try{pr.then(function(r){try{r.clone().text().then(function(t){rec(url,t);});}catch(e){}});}catch(e){}return pr;};}"
+     +"var oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;"
+     +"XMLHttpRequest.prototype.open=function(m,u){this.__du=u;return oo.apply(this,arguments);};"
+     +"XMLHttpRequest.prototype.send=function(){var x=this;try{x.addEventListener('load',function(){try{rec(x.__du,x.responseText);}catch(e){}});}catch(e){}return os.apply(this,arguments);};"
+     +"var _n=0;var _iv=setInterval(function(){try{"
+     +"if(window.__dyStopScroll){clearInterval(_iv);return;}"
+     +"_n++;if(_n>40){clearInterval(_iv);return;}"
+     +"window.scrollTo(0, document.body.scrollHeight);"
+     +"}catch(e){}},2500);"
+     +"}catch(e){}})();";
 
     /** 带 Referer 的 GET */
     byte[] httpGetBytesWithReferer(String url, String referer){
@@ -1088,130 +2718,256 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         return added;
     }
 
-    /** 把合集列表渲染成卡片 + 批量下载按钮 */
+    /** 把合集列表渲染到「列表」页签（与 B 站合集一致），
+     *  同时把合集首集填进「解析」页，保证解析页不是空白（有封面/标题/视频可播） */
     void renderMixList(final int n){
         mixMode = true;
         h.post(new Runnable(){ public void run(){
             try{
                 webDone = true;
                 if(web != null) web.setVisibility(View.GONE);
-                out.removeAllViews();
-                actions.setVisibility(View.GONE);
-                img.setVisibility(View.GONE);
-                videoBox.setVisibility(View.GONE);
-
-                LinearLayout head = new LinearLayout(MainActivity.this);
-                head.setOrientation(LinearLayout.VERTICAL);
-                head.setBackground(makeRoundRect(curDark ? C_DARK_SURFACE : C_LIGHT_SURFACE,
-                        curDark ? C_DARK_STROKE : C_LIGHT_STROKE, 16));
-                head.setPadding(dp(16), dp(14), dp(16), dp(14));
-
-                TextView t = new TextView(MainActivity.this);
-                t.setText("合集 · " + n + " 个作品");
-                t.setTextSize(15);
-                t.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-                t.setTextColor(0xFFFE2C55);
-                head.addView(t);
-
-                TextView sub = new TextView(MainActivity.this);
-                sub.setText("点下方按钮可一次性下载全部视频");
-                sub.setTextSize(12);
-                sub.setTextColor(curDark ? C_DARK_SUB : C_LIGHT_SUB);
-                sub.setPadding(0, dp(6), 0, dp(10));
-                head.addView(sub);
-
-                TextView dlAll = new TextView(MainActivity.this);
-                dlAll.setText("批量下载全部（" + n + "）");
-                dlAll.setTextSize(14);
-                dlAll.setGravity(android.view.Gravity.CENTER);
-                dlAll.setTextColor(0xFFFFFFFF);
-                dlAll.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-                dlAll.setBackground(makeRoundRect(0xFFFE2C55, 0, 12));
-                dlAll.setPadding(0, dp(12), 0, dp(12));
-                dlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ downloadAllMix(); }});
-                head.addView(dlAll);
-
-                LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                hlp.bottomMargin = dp(10);
-                head.setLayoutParams(hlp);
-                out.addView(head);
 
                 java.util.List<String[]> snapshot;
                 synchronized(mixItems){ snapshot = new java.util.ArrayList<String[]>(mixItems); }
+
+                // ===== 把合集首集灌进「解析」页（否则解析页一片空白） =====
+                if(snapshot.size() > 0){
+                    String[] f0 = snapshot.get(0);
+                    String fid = f0[0] != null ? f0[0] : "";
+                    String fdesc = f0[1] != null ? f0[1] : "";
+                    String fplay = f0[2] != null ? f0[2] : "";
+                    String fcover = f0[3] != null ? f0[3] : "";
+                    if(fid.length() > 0) curId = fid;
+                    if(fplay.length() > 0) curPlay = fplay;
+                    if(fcover.length() > 0) curCover = fcover;
+                    String mt = mixTitle.length() > 0 ? mixTitle : "合集";
+                    curDesc = mt + " 第1集" + (fdesc.length() > 0 ? "　" + fdesc : "");
+                    // 拼一段结果文本给卡片渲染（与单视频解析格式一致）
+                    StringBuilder rb = new StringBuilder();
+                    rb.append("【平台】抖音\n");
+                    if(fid.length() > 0) rb.append("【作品ID】").append(fid).append("\n");
+                    rb.append("【合集】").append(mt).append("（共 ").append(snapshot.size()).append(" 集）\n");
+                    rb.append("【描述】").append(fdesc).append("\n");
+                    if(fcover.length() > 0) rb.append("【封面】").append(fcover).append("\n");
+                    if(fplay.length() > 0) rb.append("【视频直链】").append(fplay).append("\n");
+                    final String rt = rb.toString();
+                    curResult = rt;
+                    renderCards(rt);
+                    // 恢复操作栏，让用户能直接播放/下载首集
+                    actions.setVisibility(View.VISIBLE);
+                    Log.i("DYP", "MIX_FILL_PARSE 首集 id=" + fid + " hasPlay=" + (fplay.length() > 0));
+                }
+
+                java.util.List<ProfileParser.ProfileItem> itemList =
+                        new java.util.ArrayList<ProfileParser.ProfileItem>();
                 for(int i = 0; i < snapshot.size(); i++){
-                    final String[] it = snapshot.get(i);
-                    final int idx = i;
-                    LinearLayout card = new LinearLayout(MainActivity.this);
-                    card.setOrientation(LinearLayout.VERTICAL);
-                    card.setBackground(makeRoundRect(curDark ? C_DARK_SURFACE : C_LIGHT_SURFACE,
-                            curDark ? C_DARK_STROKE : C_LIGHT_STROKE, 14));
-                    card.setPadding(dp(14), dp(12), dp(14), dp(12));
-                    LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
-                            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                    clp.bottomMargin = dp(8);
-                    card.setLayoutParams(clp);
-
-                    TextView no = new TextView(MainActivity.this);
+                    String[] it = snapshot.get(i);
+                    ProfileParser.ProfileItem pi = new ProfileParser.ProfileItem();
+                    pi.id = it[0] != null ? it[0] : "";
                     String d = it[1] != null ? it[1] : "";
-                    if(d.length() > 60) d = d.substring(0, 60) + "…";
-                    no.setText((i + 1) + ". " + (d.length() > 0 ? d : (it[0])));
-                    no.setTextSize(13);
-                    no.setTextColor(curDark ? C_DARK_TEXT : C_LIGHT_TEXT);
-                    no.setLineSpacing(dp(3), 1f);
-                    card.addView(no);
+                    // 合集条目统一「标题 + 第几集」格式
+                    String mt = mixTitle.length() > 0 ? mixTitle : "合集";
+                    pi.title = mt + " 第" + (i + 1) + "集" + (d.length() > 0 ? "　" + d : "");
+                    pi.url = it[2] != null ? it[2] : "";
+                    pi.directUrl = it[2] != null ? it[2] : "";
+                    itemList.add(pi);
+                }
+                final java.util.List<ProfileParser.ProfileItem> items = itemList;
 
-                    LinearLayout btnRow = new LinearLayout(MainActivity.this);
-                    btnRow.setOrientation(LinearLayout.HORIZONTAL);
-                    btnRow.setPadding(0, dp(8), 0, 0);
+                listHead.setText("抖音合集 · 共 " + n + " 集 · 点「下载」下该集，或点右下「选择下载」批量选");
+                btnDlAll.setVisibility(View.VISIBLE);
+                btnDlAll.setText("选择下载");
+                btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                    // 合集独立文件夹
+                    final String safeT = (mixTitle.length() > 0 ? mixTitle : curId)
+                            .replaceAll("[\\\\/:*?\"<>|\\s]+", "_");
+                    final String dirT = safeT + "_" + System.currentTimeMillis();
+                    showListPicker(items, mixTitle.length() > 0 ? mixTitle : "合集", "合集", dirT);
+                }});
+                listWrap.removeAllViews();
 
-                    TextView one = new TextView(MainActivity.this);
-                    one.setText("下载这条");
-                    one.setTextSize(12);
-                    one.setTextColor(curDark ? C_DARK_SUB : C_LIGHT_SUB);
-                    one.setBackground(makeRoundRect(curDark ? C_DARK_ALT : C_LIGHT_ALT, 0, 8));
-                    one.setPadding(dp(10), dp(5), dp(10), dp(5));
-                    one.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-                        if(it[2] != null && it[2].length() > 0){
-                            // 合集单条：进 合集/标题_时间戳 专属文件夹
-                            String t = mixTitle.length() > 0 ? mixTitle : curId;
-                            String mixDir = t + "_" + System.currentTimeMillis();
-                            enqueueDownload(it[2], "合集" + (idx + 1), "mp4", "合集", mixDir);
+                // 合集独立文件夹（同一批进同一个 合集/标题_时间戳）
+                final String safeTitle = (mixTitle.length() > 0 ? mixTitle : curId)
+                        .replaceAll("[\\\\/:*?\"<>|\\s]+", "_");
+                final String mixDir = safeTitle + "_" + System.currentTimeMillis();
+
+                for(int i = 0; i < items.size(); i++){
+                    final ProfileParser.ProfileItem it = items.get(i);
+                    final int idx = i;
+                    LinearLayout row = new LinearLayout(MainActivity.this);
+                    row.setOrientation(LinearLayout.VERTICAL);
+                    row.setPadding(dp(12), dp(10), dp(12), dp(10));
+                    row.setBackground(makeRoundRect(curDark ? 0xFF24272F : 0xFFFFFFFF,
+                            curDark ? 0xFF333842 : 0xFFE1E4E9, 12));
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                    lp.bottomMargin = dp(8);
+                    row.setLayoutParams(lp);
+
+                    TextView title = new TextView(MainActivity.this);
+                    String d = it.title != null ? it.title : "";
+                    if(d.length() > 70) d = d.substring(0, 70) + "…";
+                    title.setText((i + 1) + ". " + d);
+                    title.setTextSize(13);
+                    title.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+                    title.setPadding(0, 0, 0, dp(6));
+                    row.addView(title);
+
+                    LinearLayout btns = new LinearLayout(MainActivity.this);
+                    btns.setOrientation(LinearLayout.HORIZONTAL);
+
+                    TextView btnDl = new TextView(MainActivity.this);
+                    btnDl.setText("下载");
+                    btnDl.setTextSize(12);
+                    btnDl.setTextColor(0xFFFE2C55);
+                    btnDl.setPadding(dp(10), dp(5), dp(10), dp(5));
+                    btnDl.setBackground(makeRoundRect(0x1AFE2C55, 0, 8));
+                    btnDl.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                        if(it.directUrl != null && it.directUrl.length() > 0){
+                            enqueueDownload(it.directUrl, "第" + (idx + 1) + "集", "mp4", "合集", mixDir);
+                            s("已加入下载队列：第 " + (idx + 1) + " 集");
+                            showHintToast("已加入下载队列");
                         } else s("该条无视频地址");
                     }});
-                    btnRow.addView(one);
+                    btns.addView(btnDl);
 
-                    TextView playBtn = new TextView(MainActivity.this);
-                    playBtn.setText("播放");
-                    playBtn.setTextSize(12);
-                    playBtn.setTextColor(curDark ? C_DARK_SUB : C_LIGHT_SUB);
+                    TextView btnPlay = new TextView(MainActivity.this);
+                    btnPlay.setText("播放");
+                    btnPlay.setTextSize(12);
+                    btnPlay.setTextColor(curDark ? 0xFF8AB4F8 : 0xFF1A73E8);
+                    btnPlay.setPadding(dp(10), dp(5), dp(10), dp(5));
                     LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
                             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
                     plp.leftMargin = dp(8);
-                    playBtn.setLayoutParams(plp);
-                    playBtn.setBackground(makeRoundRect(curDark ? C_DARK_ALT : C_LIGHT_ALT, 0, 8));
-                    playBtn.setPadding(dp(10), dp(5), dp(10), dp(5));
-                    playBtn.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-                        if(it[2] == null || it[2].length() == 0){ s("该条无视频地址"); return; }
-                        curPlay = it[2];
-                        curId = it[0];
+                    btnPlay.setLayoutParams(plp);
+                    btnPlay.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                        if(it.directUrl == null || it.directUrl.length() == 0){ s("该条无视频地址"); return; }
+                        curPlay = it.directUrl;
+                        curId = it.id;
                         curImgs = "";
                         startedUrl = "";
+                        switchTab(0);
                         actions.setVisibility(View.VISIBLE);
                         videoBox.setVisibility(View.VISIBLE);
                         img.setVisibility(View.GONE);
                         doPlay();
+                        s("播放 第 " + (idx + 1) + " 集");
                     }});
-                    btnRow.addView(playBtn);
+                    btns.addView(btnPlay);
 
-                    card.addView(btnRow);
-                    out.addView(card);
+                    row.addView(btns);
+                    listWrap.addView(row);
                 }
-                s("合集解析完成：" + n + " 个作品");
+
+                switchTab(1);   // 自动切到「列表」页
+                s("抖音合集 " + n + " 集已列到「列表」页");
+                showHintToast("合集 " + n + " 集，已放进「列表」页");
             }catch(Throwable t){
                 Log.i("DYP", "MIX_RENDER_ERR " + t);
             }
         }});
+    }
+
+    /** 通用列表多选下载：category = 分类目录，dirOverride = 统一子目录（可空）。
+     *  B站 DASH 条目需要每集单独解析音频轨，用 isBili 标记走双轨入队。 */
+    void showListPicker(final java.util.List<ProfileParser.ProfileItem> items,
+                        final String titlePrefix,
+                        final String category,
+                        final String dirOverride){
+        showListPicker(items, titlePrefix, category, dirOverride, false);
+    }
+
+    void showListPicker(final java.util.List<ProfileParser.ProfileItem> items,
+                        final String titlePrefix,
+                        final String category,
+                        final String dirOverride,
+                        final boolean isBili){
+        final int n = items.size();
+        if(n == 0){ s("列表为空"); return; }
+        final boolean[] sel = new boolean[n];
+        String[] labels = new String[n];
+        for(int i = 0; i < n; i++){
+            String t = items.get(i).title;
+            if(t == null) t = "";
+            if(t.length() > 30) t = t.substring(0, 30) + "…";
+            labels[i] = (i + 1) + ". " + (t.length() > 0 ? t : items.get(i).id);
+        }
+        dypDlg()
+            .setTitle("选择要下载的（共 " + n + " 条）")
+            .setMultiChoiceItems(labels, sel,
+                new android.content.DialogInterface.OnMultiChoiceClickListener(){
+                    public void onClick(android.content.DialogInterface d, int which, boolean isChecked){
+                        sel[which] = isChecked;
+                    }
+                })
+            .setPositiveButton("下载所选", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    doListDownload(items, sel, titlePrefix, category, dirOverride, isBili);
+                }
+            })
+            .setNeutralButton("全选", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    for(int i = 0; i < n; i++) sel[i] = true;
+                    doListDownload(items, sel, titlePrefix, category, dirOverride, isBili);
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 列表多选实际入队。B站条目要单独解析音频轨（DASH 双轨） */
+    void doListDownload(final java.util.List<ProfileParser.ProfileItem> items,
+                        final boolean[] sel,
+                        final String titlePrefix,
+                        final String category,
+                        final String dirOverride,
+                        final boolean isBili){
+        if(!isBili){
+            int cnt = 0;
+            for(int i = 0; i < items.size(); i++){
+                if(!sel[i]) continue;
+                ProfileParser.ProfileItem it = items.get(i);
+                String u = (it.directUrl != null && it.directUrl.length() > 0) ? it.directUrl : it.url;
+                if(u == null || u.length() == 0) continue;
+                String nb = (titlePrefix.length() > 0 ? titlePrefix + "_" : "") + "第" + (i + 1) + "集";
+                if(dirOverride != null && dirOverride.length() > 0){
+                    enqueueDownload(u, nb, "mp4", category, dirOverride);
+                } else {
+                    enqueueDownload(u, nb, "mp4", category);
+                }
+                cnt++;
+            }
+            if(cnt == 0){ s("未选择任何条目"); return; }
+            s("已加入下载队列：" + cnt + " 条");
+            showHintToast("已加入 " + cnt + " 条");
+            return;
+        }
+        // B 站：逐条解析（拿视频轨 + 音频轨）
+        s("正在解析所选剧集（B站 DASH）…");
+        new Thread(new Runnable(){ public void run(){
+            int cnt = 0;
+            String lastQ = "";
+            for(int i = 0; i < items.size(); i++){
+                if(!sel[i]) continue;
+                ProfileParser.ProfileItem it = items.get(i);
+                String epAid = biliEpAid(it, curBili);
+                String v = BiliParser.getPlayUrl(MainActivity.this, epAid, it.id);
+                String a = BiliParser.lastAudioUrl;
+                lastQ = BiliParser.lastQualityDesc;
+                if(v == null || v.length() == 0) continue;
+                String nb = (titlePrefix.length() > 0 ? titlePrefix + "_" : "") + "第" + (i + 1) + "集";
+                enqueueDownloadWithAudio(v, nb, "mp4", category,
+                        dirOverride != null ? dirOverride : "", a != null ? a : "");
+                cnt++;
+            }
+            final int fc = cnt;
+            final String fq = lastQ;
+            h.post(new Runnable(){ public void run(){
+                if(fc == 0){ s("未选择任何条目"); return; }
+                s("已加入下载队列：" + fc + " 条" + (fq.length() > 0 ? "（" + fq + "）" : ""));
+                showHintToast("已加入 " + fc + " 条");
+            }});
+        }}).start();
     }
 
     /** 批量下载合集内全部视频：同一批进同一个 合集/标题_时间戳 文件夹 */
@@ -2110,6 +3866,57 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             .show();
     }
 
+    /** 免责声明弹窗：必须同意才能用；5 秒倒计时后可点同意，不同意退出 */
+    void showAgreementDialog(){
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+            .setTitle("用户协议与免责声明")
+            .setMessage(
+                "1. 本软件全程免费，无任何收费项目；\n"
+              + "   若您是通过付费购买获得，请立即申请退款。\n\n"
+              + "2. 本软件仅供个人学习与技术研究使用，\n"
+              + "   严禁用于任何商业用途、批量抓取或侵犯\n"
+              + "   他人权益的场景。\n\n"
+              + "3. 所有解析内容版权归原作者所有，\n"
+              + "   请勿传播、转售或用于盈利。\n\n"
+              + "4. 如内容涉及侵权，请联系删除：\n"
+              + "   2137190676@qq.com\n\n"
+              + "同意即表示您已阅读并接受以上全部条款。")
+            .setCancelable(false)
+            .setPositiveButton("同意（5秒）", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    // 5 秒倒计时结束前点同意无效：关闭弹窗但不记录，下次启动重新弹
+                }
+            })
+            .setNegativeButton("不同意并退出", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    finishAffinity();
+                }
+            })
+            .show();
+        // 5 秒倒计时（每秒更新按钮文案：5→4→3→2→1→我同意）
+        final int[] count = {5};
+        final Runnable tick = new Runnable(){ public void run(){
+            try{
+                final android.widget.Button pos = dlg.getButton(android.app.AlertDialog.BUTTON_POSITIVE);
+                if(pos == null) return;
+                count[0]--;
+                if(count[0] > 0){
+                    pos.setText("同意（" + count[0] + "秒）");
+                    h.postDelayed(this, 1000);
+                } else {
+                    pos.setText("我同意");
+                    pos.setEnabled(true);
+                    pos.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                        getSharedPreferences(SP, MODE_PRIVATE).edit()
+                                .putBoolean(KEY_AGREE, true).commit();
+                        dlg.dismiss();
+                    }});
+                }
+            }catch(Throwable t){}
+        }};
+        h.postDelayed(tick, 1000);
+    }
+
     /** 年月日時分 */
     void showAbout(){
         String txt =
@@ -2200,7 +4007,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         sv.setLayoutParams(new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, maxH));
 
-        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog.Builder b = dypDlg()
             .setTitle(title)
             .setView(sv);
         if(posBtn != null && posAction != null){
@@ -2228,26 +4035,73 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v1.3.4】主页列表 + 三页签 + 境外直连优化\n"
-           + "新增\n"
-           + "· 主页列表：YouTube 频道 / TikTok 用户 / X 主页\n"
-           + "· 主页作品逐条下载 + 全部下载（自动解析直链）\n"
-           + "· 三页签布局：解析 / 列表 / 历史\n"
-           + "· 历史页：下载记录卡片（文件名 + 时间 + 大小）\n"
-           + "· X 外链卡片深挖：纯卡片推也能挖出视频\n"
-           + "· 安装权限授权后自动继续安装 + 「立即安装」按钮\n"
-           + "· 各平台最高画质：X formats 挑最高码率\n"
-           + "优化\n"
-           + "· X 挂代理 → 直连解析/下载，不烧机场流量\n"
-           + "· X 直连失败自动回退服务器中转\n"
-           + "· 服务器中转强制直连（不套用户代理）\n"
-           + "· 大视频下载前提醒（代理优先 / 服务器兜底）\n"
-           + "· 服务器 fetch_media 并发锁（修复 502）\n"
-           + "修复\n"
-           + "· X 视频没画面没时长（Referer + 代理失效回退）\n"
-           + "· TikTok 主页下载 502（服务器并发竞态）\n"
-           + "· 更新安装权限二次调用失败\n"
-            + "· 播放器 googlevideo Referer 错误";
+            "【v1.3.7.1】抖音实况图凭据自动获取 + 本地解析\n"
+             + "新增\n"
+             + "· 抖音访客凭据自动获取：首次解析实况图时后台静默获取，实测 2-3 秒，全程无需操作\n"
+             + "· 设置 → 抖音访客凭据：可手动重新获取、手动粘贴、清空，并显示当前凭据状态\n"
+             + "· 抖音实况图改为「本地优先」解析：有凭据时直接本地签名，不再经过服务器\n"
+             + "· 获取失败时弹窗说明原因，提供「重试 / 手动填写」两个入口\n"
+             + "修复\n"
+             + "· 抖音实况图只有 1 张静态图、没有动图（LIVE 角标不出来）：详情接口强制要求访客凭据，\n"
+             + "  缺少时固定返回 403 Blocked by ArgusSecurityPlugin；现改为自动获取凭据后本地签名\n"
+             + "· 实况图下载提示文案错误：之前写「可存为 MP4」，实际一直是 .jpg 实况照片，已改正\n"
+             + "· 平台支持说明里抖音一栏补充实况图机制说明\n"
+             + "变更\n"
+             + "· 解析优先级调整：无凭据走服务器，有凭据走本地（本地失败自动回退服务器）\n"
+             + "· 服务端 8443 TLS 阻塞热修 + 自愈守卫（详见更新日志 v1.3.7）\n"
+             + "· 版本号规则支持四位（1.3.7.1 = build 103701）\n\n"
+             + "──────────────\n"
+             + "【v1.3.7】B站直连提速 + 合集解析 + YouTube回退修复 + TikTok图文修复\n"
+             + "修复\n"
+             + "· B站视频播放不再走服务器中转：CDN 现强制校验 buvid3 且拒绝手机 UA，已改为自动取 buvid3 + 桌面 UA 直连，秒开\n"
+             + "· B站下载同步改为直连，速度不再受服务器带宽限制\n"
+             + "· YouTube 第二次解析不再回退（没画面没进度条、过一会提示被 CDN 拒绝）：回退标志从不复位，已改为每次解析前重置\n"
+             + "· TikTok 图文加载不出来：服务器 fetch_media 缩进错误，缓存未命中时返回 None，已重写\n"
+             + "· TikTok 图文同一张图被并发重复请求导致连接被写坏，已加图片内存缓存与去重\n"
+             + "新增\n"
+             + "· B站合集解析：整个合集的每一集都列出来，每集用自己的 aid 下载/播放（合集里各集 aid 不同）\n"
+             + "· 抖音/B站合集统一进「列表」页，解析完自动切过去并提示，主解析页保留原详情\n"
+             + "· 列表「选择下载」：可勾选任意几集一起下，也有「全选」\n"
+             + "· B站画质升级 DASH：匿名 480P/720P，登录 1080P，大会员 1080P60，4K 原片可拿 4K\n"
+             + "· B站 Cookie（设置 → Cookie → B站 Cookie），填 SESSDATA 提画质；不填也能用\n"
+             + "变更\n"
+             + "· B站 CDN 拉流使用桌面 UA（仅 CDN，不影响 API）\n"
+             + "· B站播放下载改为视频轨+音频轨双轨，播放器合并、下载后无损合成 mp4\n\n"
+             + "──────────────\n"
+             + "【v1.3.6】Instagram 登录解析 + 代理简化\n"
+             + "新增\n"
+             + "· Instagram 登录解析：App 内登录 IG，Cookie 存手机本地（不上传），可解析 Reel 视频并下载\n"
+             + "· Instagram 主页解析：用户名主页列出全部作品，每页 100 条带翻页\n"
+             + "· Instagram 登录前风险提示（每次登录都会弹出，需确认后才进入）\n"
+             + "· B站解析：单视频 / av / BV / 分P合集 + 空间主页，本地直连\n"
+             + "· Cookie 本地保存：设置 → Cookie，一行一个 name=value，可手动填可清空\n"
+             + "· 设置页新增「Cookie（本地保存）」分区\n"
+             + "变更\n"
+             + "· 代理简化为单一「内置代理」开关（默认关）：开=海外平台走服务器中转，关=全部直连\n"
+             + "· 不再自动探测/套用用户代理，App 不干预你自己的 TUN / 代理\n"
+             + "· X 解析：内置代理关时优先直连，失败再兜底服务器\n"
+             + "· TikTok 请求与下载一律直连\n"
+             + "修复\n"
+             + "· X 单推文链接被主页判定误吞\n"
+             + "· IG 视频直链错放图集字段导致走图片队列\n\n"
+             + "──────────────\n"
+             + "【v1.3.5】YouTube 登录解析 + 下载提速\n"
+             + "新增\n"
+             + "· YouTube 登录：App 内登录 Google 账号，自动抓取 Cookie 上传服务器，解 YouTube 风控\n"
+             + "· YouTube 服务器流式中转（/api/yt/stream），带进度条拖动\n"
+            + "· YouTube 主页列表下载自动入队（解析完不用再点一次）\n"
+            + "优化\n"
+            + "· YouTube 下载走服务器中转（直链绑解析 IP 会 403），已缓存视频秒下\n"
+            + "· YouTube 播放直连优先，403 自动回退服务器中转\n"
+            + "· YouTube 优先 H.264（AV1 部分设备解码不了）\n"
+            + "· YouTube 解析合并 yt-dlp 调用（60s → 22s，二次解析 0s）\n"
+            + "· 服务器 yt-dlp-ejs + node 解 n-challenge（新格式全恢复）\n"
+            + "· 所有弹窗跟随 App 主题（修复暗色弹窗）\n"
+            + "修复\n"
+            + "· YouTube 下载空文件（403 时残留半成品）\n"
+            + "· 下载失败文件名空指针崩溃\n"
+            + "· 服务器地址弹窗精简为只有服务器地址\n"
+            + "· 用户协议/YouTube 登录弹窗暗色显示异常";
     }
     static String changelogOld(){
         return
@@ -2292,39 +4146,52 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
           + "· 首个公开版本：抖音解析 + 独立播放器";
     }
 
-    /** 平台支持说明：三个平台各自怎么解析、需要什么条件 */
+    /** 平台支持说明：各平台支持清单 */
     void showPlatformHelp(){
         String txt =
             "【抖音】\n"
-          + "方式：WebView 加载分享页，注入 JS 拦截 fetch/XHR 里的 aweme_detail。\n"
-          + "备选：解析页面 SSR 的 window._ROUTER_DATA。\n"
-          + "条件：无需登录。抖音有 a_bogus / X-Bogus 签名风控，所以走真实浏览器让它自己算签名。\n"
-          + "支持：视频、图集、动图、合集、短剧合集。\n\n"
+          + "支持：✓ 视频解析  ✓ 图文解析  ✓ 实况(live图)解析\n"
+          + "　　　✓ 合集解析  ✓ 短剧合集  ✓ 主页解析+批量下载\n"
+          + "不支持：✗ 付费/私密视频  ✗ 限时日常\n"
+          + "方式：WebView 加载页面 + JS 注入抽取数据（无需登录/签名）\n"
+          + "　　　实况动轨走 PC 详情接口，需要「访客凭据」：\n"
+          + "　　　　首次解析时自动后台获取（2-10 秒，静默无感）\n"
+          + "　　　　也可在 设置 → 抖音访客凭据 里手动获取/重取\n"
+          + "　　　拿到凭据后走本地签名，不再依赖服务器\n\n"
           + "【快手】\n"
-          + "方式：纯 HTTP，不依赖 WebView。短链 302 到 v.m.chenzhongtech.com 后，\n"
-          + "　　　解析页面里的 window.INIT_STATE。\n"
-          + "要点：INIT_STATE 的顶层 key 被逐字符 -1 混淆（tusjoh → string，qipup → photo），\n"
-          + "　　　但 value 全是明文，所以按结构递归找「有 photoId + manifest」的节点，不认 key 名。\n"
-          + "条件：无需登录，无需签名。视频直链本身无水印。\n"
-          + "音频：分享页额外给一条独立音轨 m4a（soundTrack），转 MP3 比抽视频音轨快得多。\n\n"
+          + "支持：✓ 视频解析  ✓ 图文解析  ✓ 单集解析\n"
+          + "　　　✓ 独立音轨  ✓ 实况图（分享页下发动图轨道时）\n"
+          + "不支持：✗ 主页解析（需滑块验证码）  ✗ 合集列表\n"
+          + "方式：纯 HTTP 解析 INIT_STATE（无需登录/签名）\n\n"
           + "【TikTok】\n"
-          + "方式：纯 HTTP + 自管 Cookie 会话，两条页面模板互为兜底。\n"
-          + "　模板 A（@用户名/video/ID）：__UNIVERSAL_DATA_FOR_REHYDRATION__\n"
-          + "　　　→ __DEFAULT_SCOPE__ / webapp.video-detail 或 webapp.reflow.video.detail\n"
-          + "　模板 B（@i/video/ID，@i 是占位用户名）：<script id=\"api-data\">\n"
-          + "　　　→ {\"videoDetail\":...}\n"
-          + "要点：模板 A 有时会返回 HTTP 400，自动切模板 B 兜底。\n"
-          + "关键：playAddr 里带 tk=tt_chain_token，CDN 会拿它比对请求头的 Cookie。\n"
-          + "　　　页面和视频必须来自同一次会话，否则一律 403。\n"
-          + "下载：两套 CDN 行为相反 ——\n"
-          + "　　　*.tiktokcdn.com 直连（走代理反而 SSL 失败）\n"
-          + "　　　*v-webapp-prime.tiktok.com 走代理\n"
-          + "　　　程序按 host 自动选，失败自动换另一种。\n"
-          + "条件：需要能访问 TikTok 的网络环境。若直连不通，请在「代理设置」填境外代理。\n\n"
+          + "支持：✓ 视频解析  ✓ 图文解析  ✓ 主页解析+批量下载\n"
+          + "不支持：✗ 付费/私密视频\n"
+          + "方式：服务器中转（需机场代理出口）\n\n"
+          + "【X（推特）】\n"
+          + "支持：✓ 视频解析  ✓ 图文解析  ✓ 多视频选择\n"
+          + "　　　✓ 主页列表  ✓ 外链卡片深挖\n"
+          + "不支持：✗ 私密账号\n"
+          + "方式：fxtwitter + syndication 双源，优先直连，失败再兜底服务器\n\n"
+          + "【YouTube】\n"
+          + "支持：✓ 视频解析（最高 4K）  ✓ 主页解析+批量下载\n"
+          + "不支持：✗ 会员专享  ✗ 付费频道\n"
+          + "方式：服务器 yt-dlp 中转解析（po_token 校验只能在服务器过）\n\n"
++ "【B 站】\n"
+           + "支持：✓ 视频解析（DASH，可到 1080P60/4K）  ✓ 合集(ugc_season)  ✓ 分P\n"
+           + "　　　✓ 主页解析+批量下载  ✓ 纯 av号/BV号 直接输入  ✓ b23.tv 短链\n"
+           + "不支持：✗ 大会员专享  ✗ 付费视频\n"
+           + "方式：view/playurl API 本地直连免签；CDN 拉流用桌面 UA + buvid3\n"
+           + "　　　匿名封顶 480P/720P，登录（填 SESSDATA）1080P，大会员 1080P60\n"
+           + "　　　可在 App 内登录 B站 自动抓 Cookie（只存本地，不上传）\n\n"
+           + "【Instagram】\n"
+           + "支持：✓ Reel/视频解析  ✓ 图文多图  ✓ 主页解析+批量下载\n"
+           + "不支持：✗ 私密账号  ✗ 快拍(Stories)\n"
+           + "方式：需在 App 内登录 IG（Cookie 存本地不上传），带登录态直连解析；\n"
+           + "　　　匿名只能拿封面，视频流一律 403。\n"
+           + "　　　登录前请先在官方 App 登录过该账号，否则有封号风险。\n\n"
           + "【通用】\n"
-          + "· 只解析公开分享页，不解密任何加密内容，不存储账号信息。\n"
-          + "· 音频统一转 192kbps MP3，存到 Download/DYParse/音频。\n"
-          + "· 文件名前缀区分来源：dy_（抖音）/ ks_（快手）/ tt_（TikTok）。\n"
+          + "· 只解析公开分享页，不解密加密内容，不存储账号信息。\n"
+          + "· 文件名前缀：dy_抖音 ks_快手 tt_TikTok x_X yt_YouTube bl_B站 ins_IG\n"
           + "· CDN 直链有时效，过期需重新解析。";
 
         int bgDlg   = curDark ? 0xFF191B21 : 0xFFFFFFFF;
@@ -2372,16 +4239,12 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         }catch(Throwable t){}
     }
 
-    /** 当前这条 URL 的代理指纹：开关/地址/仅TT 任一变化都要重建播放器 */
+    /** 当前这条 URL 的代理指纹：开关状态变化要重建播放器 */
     String proxyCacheKey(String url){
         try{
             SharedPreferences p = getSharedPreferences(SP, MODE_PRIVATE);
             boolean on = p.getBoolean(KEY_PROXY_ON, false);
-            String addr = p.getString(KEY_PROXY, "");
-            boolean ttOnly = p.getBoolean(KEY_PROXY_TT_ONLY, false);
-            boolean applies = on && (!ttOnly || isTikTokUrl(url) || isXDomain(url) || YtParser.isYtUrl(url)
-                || (url != null && url.contains("googlevideo.com")));
-            return on + "|" + applies + "|" + addr;
+            return on ? "builtin" : "off";
         }catch(Throwable t){ return "err"; }
     }
 
@@ -2651,9 +4514,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             + "该接口在风控网关后面，缺少访客凭据时固定返回：\n"
             + "403 Blocked by ArgusSecurityPlugin Uifid Not Found\n\n"
             + "这个值没有算法可以伪造，必须由真实浏览器通过挑战后签发。\n\n"
-            + "获取方式（必须真实浏览器，App 内抓不到，原因见下方说明）：\n"
+            + "推荐直接用「设置 → 抖音访客凭据 → 自动获取」，"
+            + "App 内会开一个隐藏浏览器，2-10 秒自动拿到，不用手动折腾。\n\n"
+            + "手动填写方式（自动获取失败时用）：\n"
             + "· 电脑 Chrome：打开 www.douyin.com，等页面加载完\n"
-            + "　　F12 → Application → Cookies → www.douyin.com\n"
++ "　　F12 → Application → Cookies → www.douyin.com\n"
             + "· 手机 Chrome：打开 www.douyin.com，用 Cookie 查看类插件导出\n"
             + "· 找到 UIFID_TEMP，复制值（约 160 字符）粘贴到下面。\n\n"
             + "有效期不固定，取决于抖音的风控策略，一般能长期复用；\n"
@@ -2746,10 +4611,64 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         dlg.show();
     }
 
-    /** 代理设置弹窗 */
+    /** 代理设置弹窗：只有一个「内置代理」开关（= 服务器中转），默认关 */
     void showProxyDialog(){
-        // 代理设置已并入「设置」弹窗
-        showSettings();
+        curDark = isDarkMode();   // 同步主题
+        SharedPreferences p = getSharedPreferences(SP, MODE_PRIVATE);
+        boolean on = p.getBoolean(KEY_PROXY_ON, false);
+
+        int bgDlg = curDark ? 0xFF17191F : 0xFFFFFFFF;
+        int textDlg = curDark ? 0xFFE6E8EE : 0xFF1A1A1F;
+        int subDlg = curDark ? 0xFF9AA0AC : 0xFF6B6F7A;
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setBackgroundColor(bgDlg);
+        wrap.setPadding(dp(20), dp(16), dp(20), dp(12));
+
+        // 只有一个开关：内置代理（服务器中转）
+        final CheckBox cbOn = new CheckBox(this);
+        cbOn.setText("启用内置代理");
+        cbOn.setChecked(on);
+        cbOn.setTextColor(textDlg);
+        cbOn.setTextSize(15);
+        wrap.addView(cbOn);
+
+        TextView tip = new TextView(this);
+        tip.setText("内置代理 = 海外平台（TikTok/X/YouTube/IG）走我们的服务器中转。\n"
+                  + "打开后不烧你自己代理的流量，但受服务器带宽限制。\n"
+                  + "关闭后：海外平台全部直连，你自己挂的代理 / TUN 会自动生效，App 不干预。");
+        tip.setTextSize(12);
+        tip.setTextColor(subDlg);
+        tip.setLineSpacing(dp(2), 1f);
+        tip.setPadding(0, dp(10), 0, dp(4));
+        wrap.addView(tip);
+
+        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+            .setTitle("代理设置")
+            .setView(wrap)
+            .setPositiveButton("保存", null)
+            .setNegativeButton("取消", null)
+            .create();
+
+        dlg.setOnShowListener(new android.content.DialogInterface.OnShowListener(){
+            public void onShow(android.content.DialogInterface d){
+                dlg.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener(
+                    new View.OnClickListener(){ public void onClick(View vv){
+                        getSharedPreferences(SP, MODE_PRIVATE).edit()
+                            .putBoolean(KEY_PROXY_ON, cbOn.isChecked())
+                            .apply();
+                        Toast.makeText(MainActivity.this,
+                            cbOn.isChecked() ? "内置代理已开启（海外走服务器中转）" : "内置代理已关闭（全部直连）",
+                            Toast.LENGTH_SHORT).show();
+                        dlg.dismiss();
+                    }});
+            }});
+        try{
+            android.view.Window win = dlg.getWindow();
+            if(win != null) win.setBackgroundDrawable(makeRoundRect(bgDlg, curDark ? 0xFF2B2F39 : 0xFFE3E5EA, 16));
+        }catch(Throwable t){}
+        dlg.show();
     }
 
     /**
@@ -2797,12 +4716,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         showLongTextDialog("为什么 App 内抓不到", txt, null, null);
     }
 
-    /** 统一设置弹窗：代理 + 服务器 + 分类下载路径 */
+    /** 服务器地址弹窗：只含服务器地址（其他设置项都在设置页独立入口） */
     void showSettings(){
         SharedPreferences p = getSharedPreferences(SP, MODE_PRIVATE);
-        String cur = p.getString(KEY_PROXY, "");
-        boolean on = p.getBoolean(KEY_PROXY_ON, false);
-        boolean ttOnly = p.getBoolean(KEY_PROXY_TT_ONLY, true);
+        curDark = isDarkMode();   // 同步主题
 
         int bgDlg     = curDark ? 0xFF17191F : 0xFFFFFFFF;
         int textDlg   = curDark ? 0xFFE6E8EE : 0xFF1A1A1F;
@@ -2813,118 +4730,15 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         wrap.setBackgroundColor(bgDlg);
         wrap.setPadding(dp(20), dp(16), dp(20), dp(12));
 
-        // ===== 独立入口区 =====
-        TextView miscHead = new TextView(this);
-        miscHead.setText("── 功能入口 ──");
-        miscHead.setTextSize(13);
-        miscHead.setTextColor(0xFFFE2C55);
-        miscHead.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        wrap.addView(miscHead);
-
-        wrap.addView(settingRow("平台支持说明", "抖音 / 快手 / TikTok 解析原理",
-            new View.OnClickListener(){ public void onClick(View v){ showPlatformHelp(); }}));
-        wrap.addView(settingRow("更新日志", "每个版本改了什么",
-            new View.OnClickListener(){ public void onClick(View v){ showChangelog(); }}));
-        wrap.addView(settingRow("运行日志", "下载 / 解析 / 报错记录",
-            new View.OnClickListener(){ public void onClick(View v){ showLogViewer(); }}));
-        wrap.addView(settingRow("关于", "版本信息与免责声明",
-            new View.OnClickListener(){ public void onClick(View v){ showAbout(); }}));
-wrap.addView(settingRow("检查更新", "手动检查新版本",
-             new View.OnClickListener(){ public void onClick(View v){ checkUpdate(false); }}));
-        wrap.addView(settingRow("更新源：" + platformName(), "点此切换 Gitee / GitHub",
-             new View.OnClickListener(){ public void onClick(View v){ showUpdSrcDialog(); }}));
-        wrap.addView(settingRow("反馈群 " + APP_QQ_GROUP, "点击加入 QQ 群",
-            new View.OnClickListener(){ public void onClick(View v){
-                try{
-                    startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
-                        Uri.parse(APP_QQ_GROUP_URL)));
-                }catch(Throwable t){
-                    s("无法打开浏览器");
-                }
-            }}));
-        // 访客凭据：始终显示。有服务器时说明「可不填」，但保留手动入口，
-        // 用户想自己抓/自己填随时能进。
-        String effSrv = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DYP_SRV, DYP_SRV_DEFAULT);
-        boolean hasSrv = effSrv != null && effSrv.length() > 0;
-        String uifidNow = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_UIFID, "");
-        boolean hasUifid = uifidNow != null && uifidNow.length() >= 32;
-        wrap.addView(settingRow("抖音访客凭据",
-            hasUifid ? "已填写（实况照片可用）"
-                     : (hasSrv ? "服务器池代签；也可自己填" : "实况照片必需"),
-            new View.OnClickListener(){ public void onClick(View v){ showUifidDialog(); }}));
-
-        // ===== 代理区 =====
-        TextView pxHead = new TextView(this);
-        pxHead.setText("── 代理 ──");
-        pxHead.setTextSize(13);
-        pxHead.setTextColor(curDark ? 0xFFFE2C55 : 0xFFFE2C55);
-        pxHead.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        wrap.addView(pxHead);
-
         TextView tip = new TextView(this);
-        tip.setText("支持格式：http://1.2.3.4:8080 / socks5://1.2.3.4:1080");
+        tip.setText("默认使用内置服务器；留空恢复内置地址。\n自建就填你的地址：http://1.2.3.4:8080");
         tip.setTextSize(12);
         tip.setTextColor(subDlg);
         tip.setLineSpacing(dp(3), 1f);
         wrap.addView(tip);
 
-        final EditText et = new EditText(this);
-        et.setText(cur);
-        et.setHint("http://host:port");
-        et.setTextSize(14);
-        et.setTextColor(textDlg);
-        et.setHintTextColor(subDlg);
-        et.setSingleLine(true);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(10);
-        wrap.addView(et, lp);
-
-        final CheckBox cb = new CheckBox(this);
-        cb.setText("启用代理");
-        cb.setChecked(on);
-        cb.setTextColor(textDlg);
-        cb.setTextSize(13);
-        wrap.addView(cb);
-
-        final CheckBox cbTT = new CheckBox(this);
-        cbTT.setText("仅 TikTok 走代理（抖音直连更快）");
-        cbTT.setChecked(ttOnly);
-        cbTT.setTextColor(textDlg);
-        cbTT.setTextSize(13);
-        wrap.addView(cbTT);
-
-        // ===== 服务器区 =====
-        TextView srvHead = new TextView(this);
-        srvHead.setText("── 服务器 ──");
-        srvHead.setTextSize(13);
-        srvHead.setTextColor(0xFFFE2C55);
-        srvHead.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        srvHead.setPadding(0, dp(14), 0, 0);
-        wrap.addView(srvHead);
-
-        TextView srvTip = new TextView(this);
-        srvTip.setText("用于自更新 / 抖音实况中转 / 短链解析 / TikTok 加速。\n默认使用内置服务器；留空恢复内置地址。\n自建就填你的地址：http://1.2.3.4:8080");
-        srvTip.setTextSize(12);
-        srvTip.setTextColor(subDlg);
-        srvTip.setLineSpacing(dp(3), 1f);
-        wrap.addView(srvTip);
-
-        // 机场流量状态（点击刷新；服务器不可用时提示走本地代理）
-        final TextView tvAir = new TextView(this);
-        tvAir.setText("机场流量：点击查询");
-        tvAir.setTextSize(13);
-        tvAir.setTextColor(curDark ? 0xFF8AB4F8 : 0xFF1A73E8);
-        tvAir.setPadding(0, dp(8), 0, dp(4));
-        tvAir.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-            loadAirInfo(tvAir);
-        }});
-        wrap.addView(tvAir);
-        loadAirInfo(tvAir);
-
         final EditText etSrv = new EditText(this);
-        // 用户没自填过（用内置）时不显示内置地址，只提示"已启用"；
-        // 自填过的显示他填的地址。内置地址不暴露给用户/抓屏者。
+        // 用户没自填过（用内置）时不显示内置地址，只提示"已启用"；内置地址不暴露给用户
         String savedSrv = p.getString(KEY_DYP_SRV, "");
         if(savedSrv != null && savedSrv.length() > 0){
             etSrv.setText(savedSrv);
@@ -2938,177 +4752,26 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
         etSrv.setSingleLine(true);
         LinearLayout.LayoutParams lpSrv = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lpSrv.topMargin = dp(8);
+        lpSrv.topMargin = dp(10);
         wrap.addView(etSrv, lpSrv);
 
-        // 媒体库修复：历史下载的文件没进相册的，一键补录
-        wrap.addView(settingRow("修复媒体库", "相册里看不到已下载的文件？点这里补录",
-            new View.OnClickListener(){ public void onClick(View v){ fixMediaLibrary(); }}));
-
-        // ===== 下载路径区 =====
-        TextView dlHead = new TextView(this);
-        dlHead.setText("── 下载路径 ──");
-        dlHead.setTextSize(13);
-        dlHead.setTextColor(0xFFFE2C55);
-        dlHead.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        dlHead.setPadding(0, dp(14), 0, 0);
-        wrap.addView(dlHead);
-
-        TextView dlTip = new TextView(this);
-        dlTip.setText("每类可单独自定义，留空 = 默认 Download/DYParse/<分类>。\n合集会在所选目录下再建「标题_时间」子文件夹。");
-        dlTip.setTextSize(12);
-        dlTip.setTextColor(subDlg);
-        dlTip.setLineSpacing(dp(3), 1f);
-        wrap.addView(dlTip);
-
-        final EditText etDlRoot = new EditText(this);
-        etDlRoot.setHint("根目录（默认 Download/DYParse）");
-        etDlRoot.setText(p.getString(KEY_DL_PATH, ""));
-        etDlRoot.setTextSize(14);
-        etDlRoot.setTextColor(textDlg);
-        etDlRoot.setHintTextColor(subDlg);
-        etDlRoot.setSingleLine(true);
-        LinearLayout.LayoutParams lpDl0 = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lpDl0.topMargin = dp(8);
-        wrap.addView(etDlRoot, lpDl0);
-
-        final EditText etDlVideo = new EditText(this);
-        etDlVideo.setHint("视频目录（默认 <根目录>/视频）");
-        etDlVideo.setText(p.getString(KEY_DL_VIDEO, ""));
-        etDlVideo.setTextSize(14);
-        etDlVideo.setTextColor(textDlg);
-        etDlVideo.setHintTextColor(subDlg);
-        etDlVideo.setSingleLine(true);
-        LinearLayout.LayoutParams lpDlV = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lpDlV.topMargin = dp(6);
-        wrap.addView(etDlVideo, lpDlV);
-
-        final EditText etDlImg = new EditText(this);
-        etDlImg.setHint("图片目录（默认 <根目录>/图片）");
-        etDlImg.setText(p.getString(KEY_DL_IMG, ""));
-        etDlImg.setTextSize(14);
-        etDlImg.setTextColor(textDlg);
-        etDlImg.setHintTextColor(subDlg);
-        etDlImg.setSingleLine(true);
-        wrap.addView(etDlImg, lpDlV);
-
-        final EditText etDlAnim = new EditText(this);
-        etDlAnim.setHint("动图目录（默认 <根目录>/动图）");
-        etDlAnim.setText(p.getString(KEY_DL_ANIM, ""));
-        etDlAnim.setTextSize(14);
-        etDlAnim.setTextColor(textDlg);
-        etDlAnim.setHintTextColor(subDlg);
-        etDlAnim.setSingleLine(true);
-        wrap.addView(etDlAnim, lpDlV);
-
-        final EditText etDlAudio = new EditText(this);
-        etDlAudio.setHint("音频目录（默认 <根目录>/音频）");
-        etDlAudio.setText(p.getString(KEY_DL_AUDIO, ""));
-        etDlAudio.setTextSize(14);
-        etDlAudio.setTextColor(textDlg);
-        etDlAudio.setHintTextColor(subDlg);
-        etDlAudio.setSingleLine(true);
-        wrap.addView(etDlAudio, lpDlV);
-
-        final EditText etDlMix = new EditText(this);
-        etDlMix.setHint("合集目录（默认 <根目录>/合集）");
-        etDlMix.setText(p.getString(KEY_DL_MIX, ""));
-        etDlMix.setTextSize(14);
-        etDlMix.setTextColor(textDlg);
-        etDlMix.setHintTextColor(subDlg);
-        etDlMix.setSingleLine(true);
-        wrap.addView(etDlMix, lpDlV);
-
-        final TextView testRes = new TextView(this);
-        testRes.setTextSize(12);
-        testRes.setTextColor(subDlg);
-        testRes.setPadding(0, dp(8), 0, 0);
-        wrap.addView(testRes);
-
-        TextView btnTest = new TextView(this);
-        btnTest.setText("测试代理连通性");
-        btnTest.setTextSize(13);
-        btnTest.setTextColor(curDark ? 0xFF6FA8FF : 0xFF2F6FEB);
-        btnTest.setPadding(0, dp(10), 0, 0);
-        wrap.addView(btnTest);
-
-        TextView btnNet = new TextView(this);
-        btnNet.setText("节点体检（判断能否拿到视频）");
-        btnNet.setTextSize(13);
-        btnNet.setTextColor(curDark ? 0xFF6FA8FF : 0xFF2F6FEB);
-        btnNet.setPadding(0, dp(10), 0, 0);
-        wrap.addView(btnNet);
-        btnNet.setOnClickListener(new View.OnClickListener(){ public void onClick(View vv){
-            showNetCheck();
-        }});
-
         android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
-            .setTitle("设置")
-            .setView(new android.widget.ScrollView(this){{ addView(wrap); }})
+            .setTitle("服务器地址")
+            .setView(wrap)
             .setPositiveButton("保存", null)
             .setNegativeButton("取消", null)
             .create();
-
-        btnTest.setOnClickListener(new View.OnClickListener(){ public void onClick(View vv){
-            final String s = et.getText().toString().trim();
-            final Proxy px = parseProxy(s);
-            if(px == null){ testRes.setText("格式不对，例：http://1.2.3.4:8080"); return; }
-            testRes.setText("测试中…");
-            new Thread(new Runnable(){ public void run(){
-                String msg;
-                long t0 = System.currentTimeMillis();
-                try{
-                    java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                        new URL("https://www.tiktok.com/").openConnection(px);
-                    c.setRequestProperty("User-Agent", MUA);
-                    c.setConnectTimeout(12000); c.setReadTimeout(12000);
-                    int code = c.getResponseCode();
-                    long ms = System.currentTimeMillis() - t0;
-                    if(code == 200) msg = "✓ 连通，tiktok.com " + code + "（" + ms + "ms）";
-                    else msg = "⚠ 代理可达，返回 " + code + "（" + ms + "ms）";
-                }catch(Throwable t){
-                    msg = "✗ 失败：" + t.getClass().getSimpleName() + " " + t.getMessage();
-                }
-                final String fm = msg;
-                h.post(new Runnable(){ public void run(){ testRes.setText(fm); }});
-            }}).start();
-        }});
-
         dlg.show();
         dlg.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener(
             new View.OnClickListener(){ public void onClick(View vv){
-                String s = et.getText().toString().trim();
-                if(s.length() > 0 && parseProxy(s) == null){
-                    Toast.makeText(MainActivity.this, "代理格式不对，例：http://1.2.3.4:8080", Toast.LENGTH_SHORT).show();
-                    return;
-                }
                 String srvAddr = etSrv.getText().toString().trim();
                 if(srvAddr.endsWith("/")) srvAddr = srvAddr.substring(0, srvAddr.length() - 1);
-                getSharedPreferences(SP, MODE_PRIVATE).edit()
-                    .putString(KEY_PROXY, s)
-                    .putBoolean(KEY_PROXY_ON, cb.isChecked() && s.length() > 0)
-                    .putBoolean(KEY_PROXY_TT_ONLY, cbTT.isChecked())
-                    .apply();
                 // 空 = 恢复内置默认地址
                 if(srvAddr.length() == 0)
                     getSharedPreferences(SP, MODE_PRIVATE).edit().remove(KEY_DYP_SRV).apply();
                 else
                     getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_DYP_SRV, srvAddr).apply();
-                // 下载路径：六项（根 + 五分类），空 = 用默认
-                saveDlPath(KEY_DL_PATH,  etDlRoot.getText().toString().trim());
-                saveDlPath(KEY_DL_VIDEO, etDlVideo.getText().toString().trim());
-                saveDlPath(KEY_DL_IMG,   etDlImg.getText().toString().trim());
-                saveDlPath(KEY_DL_ANIM,  etDlAnim.getText().toString().trim());
-                saveDlPath(KEY_DL_AUDIO, etDlAudio.getText().toString().trim());
-                saveDlPath(KEY_DL_MIX,   etDlMix.getText().toString().trim());
-                boolean enabled = cb.isChecked() && s.length() > 0;
-                String msg;
-                if(!enabled) msg = "设置已保存";
-                else if(cbTT.isChecked()) msg = "设置已保存（代理仅 TikTok）";
-                else msg = "设置已保存（代理全部流量）";
-                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
+                Toast.makeText(MainActivity.this, "服务器地址已保存", Toast.LENGTH_SHORT).show();
                 dlg.dismiss();
             }});
         try{
@@ -3236,8 +4899,53 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
 
     class Bridge {
         @JavascriptInterface
+        public void onYtData(final String data){
+            h.post(new Runnable(){ public void run(){
+                Log.i("DYP", "YT_BRIDGE " + (data == null ? "null" : data.substring(0, Math.min(120, data.length()))));
+                if(data == null || data.length() < 10) return;
+                try{
+                    String[] parts = data.split("@@YT@@", 7);
+                    if(parts.length < 6) return;
+                    final String vurl = parts[0];
+                    final String aurl = parts[1];
+                    final String title = parts[2];
+                    final String author = parts[3];
+                    final String dur = parts[4];
+                    final String cover = parts[5];
+                    if(vurl.length() == 0) return;
+                    webDone = true;
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("{");
+                    if(title.length() > 0 && !"null".equals(title))
+                        sb.append("\"i_desc\":\"").append(YtParser.YtVideo.esc(title)).append("\",");
+                    if(author.length() > 0 && !"null".equals(author))
+                        sb.append("\"i_author\":\"").append(YtParser.YtVideo.esc(author)).append("\",");
+                    if(dur.length() > 0 && !"0".equals(dur) && !"null".equals(dur))
+                        sb.append("\"i_dur\":\"").append(dur).append("\",");
+                    if(cover.length() > 0 && !"null".equals(cover))
+                        sb.append("\"i_cover\":\"").append(YtParser.YtVideo.esc(cover)).append("\",");
+                    sb.append("\"i_platform\":\"YouTube\",");
+                    sb.append("\"i_play\":\"").append(YtParser.YtVideo.esc(vurl)).append("\"");
+                    if(aurl.length() > 0)
+                        sb.append(",\"i_audio\":\"").append(YtParser.YtVideo.esc(aurl)).append("\"");
+                    sb.append("}");
+                    String rr = sb.toString();
+                    Log.i("DYP", "RESULT_BEGIN\n" + rr + "\nRESULT_END");
+                    curAudio = aurl;
+                    o(rr);
+                    s("完成(YouTube)");
+                    web.setVisibility(View.GONE);
+                }catch(Throwable t){ Log.i("DYP", "YT_BRIDGE_ERR " + t); }
+            }});
+        }
+        @JavascriptInterface
         public void onResult(final String json){
             h.post(new Runnable(){ public void run(){
+                // 主页收集模式：普通 inject 回包不渲染
+                if(profileMode){
+                    Log.i("DYP", "IGNORE_RESULT profile mode");
+                    return;
+                }
                 // 限时日常（story）已弹专属提示，忽略 WebView 后到的回包
                 if(storyBlocked){
                     Log.i("DYP", "IGNORE_RESULT story blocked");
@@ -3308,10 +5016,486 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
                 o(r);
                 s(fail ? "解析失败" : "完成");
                 appLog("解析", fail ? "✗ 失败 url=" + curUrl : "✓ 完成 id=" + curId);
+                // 主页列表「下载」入口：解析成功后自动把高清直链入下载队列
+                if(!fail && pendingAutoDlTag.length() > 0 && curPlay != null && curPlay.length() > 0){
+                    final String dl = curPlay;
+                    final String tag = pendingAutoDlTag;
+                    pendingAutoDlTag = "";
+                    pendingAutoDlIdx = -1;
+                    enqueueDownload(dl, tag, "mp4", "视频");
+                    showHintToast("已加入下载队列：" + tag);
+                    s("已加入下载队列：" + tag);
+                }
                 web.setVisibility(View.GONE);
             }});
         }
+
+        @JavascriptInterface
+        public void onProfileData(final String body){
+            onProfileDataFromWeb(body);
+        }
+
+        @JavascriptInterface
+        public void onDiag(final String msg){
+            onDiagFromWeb(msg);
+        }
+
+        /** JS 在页面里发 detail 请求拿到的响应（主页列表条目下载用） */
+        @JavascriptInterface
+        public void onDetailData(final String body){
+            final String b = body;
+            new Thread(new Runnable(){ public void run(){
+                parseDetailBody(b);
+            }}).start();
+        }
     }
+
+    /** 是否主页页面 URL（WebView 运行时检测，短链跳转后也适用） */
+    static boolean isProfilePage(String u){
+        if(u == null) return false;
+        String low = u.toLowerCase();
+        if(low.contains("/share/user/") || low.contains("douyin.com/user/")
+            || low.contains("kuaishou.com/profile/") || low.contains("live.kuaishou.com/u/")
+            || low.contains("c.kuaishou.com/fw/user/") || low.contains("kuaishou.com/fw/user/")
+            || low.contains("bilibili.com/space/")){
+            return true;
+        }
+        // Instagram 用户主页（不带 /p/ /reel/ /stories/）
+        if(low.contains("instagram.com/")){
+            if(low.contains("/p/") || low.contains("/reel/") || low.contains("/reels/")
+                    || low.contains("/tv/") || low.contains("/stories/") || low.contains("/explore/")
+                    || low.contains("/accounts/") || low.contains("/direct/")){
+                return false;
+            }
+            return java.util.regex.Pattern.compile("instagram\\.com/[A-Za-z0-9_.]{2,30}(?:[/?#]|$)")
+                    .matcher(low).find();
+        }
+        return false;
+    }
+
+    /** 主页 WebView 收集模式：页面发列表请求时，把响应体送回来（Bridge 已闭，这里拆成独立入口） */
+    void onProfileDataFromWeb(final String body){
+        if(!profileMode) return;
+        new Thread(new Runnable(){ public void run(){
+            parseProfileBody(body);
+        }}).start();
+    }
+
+    /** 主页收集诊断回包 */
+    void onDiagFromWeb(final String msg){
+        Log.i("DYP", "PROFILE_DIAG " + msg);
+    }
+
+    // ================= 主页 WebView 收集模式 =================
+
+    /** 把本地保存的 IG Cookie 灌进 WebView 的 CookieManager（登录态复用到 WebView） */
+    void injectInsCookiesToWebView(){
+        try{
+            java.util.Map<String, String> m = CookieStore.load(this, CookieStore.PLATFORM_INS);
+            if(m.isEmpty()){
+                Log.i("DYP", "INS_CK_INJECT skip (empty)");
+                return;
+            }
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            int n = 0;
+            for(java.util.Map.Entry<String, String> e : m.entrySet()){
+                String kv = e.getKey() + "=" + e.getValue();
+                cm.setCookie("https://www.instagram.com/", kv);
+                cm.setCookie("https://i.instagram.com/", kv);
+                cm.setCookie("https://instagram.com/", kv);
+                n++;
+            }
+            try{ cm.flush(); }catch(Throwable t){}
+            Log.i("DYP", "INS_CK_INJECT n=" + n);
+        }catch(Throwable t){ Log.i("DYP", "INS_CK_INJECT_ERR " + t); }
+    }
+
+    /** 启动主页收集：WebView 加载主页 + 注入 PROFILE_HOOK_JS + 自动滚动翻页 */
+    void startProfileWebView(final String url){
+        profileMode = true;
+        webDone = true;
+        synchronized(profileCollected){ profileCollected.clear(); } profilePage = 0;
+        synchronized(profileSeen){ profileSeen.clear(); }
+        s("主页网页加载中，自动收集作品…");
+        setupWebView();
+        web.setVisibility(View.VISIBLE);
+        web.loadUrl(url);
+    }
+
+    /** 停止收集（模式退出时调用；不 stopLoading——后面可能紧跟新的 loadUrl） */
+    void stopProfileMode(){
+        profileMode = false;
+        if(web != null){
+            try{
+                web.evaluateJavascript("try{window.__dyStopScroll=1;}catch(e){}", null);
+            }catch(Throwable t){}
+        }
+        web.setVisibility(View.GONE);
+    }
+
+    /** 主页条目下载：在 WebView 页面里发 detail 请求拿高清直链（利用页面已签名的环境） */
+    String pendingDetailId = "";
+    String pendingDetailTag = "";
+    String pendingDetailSignedUrl = "";   // 页面自动加过 msToken+a_bogus 的完整 URL
+    /** 解析完成后自动入下载队列（主页列表抖音条目） */
+    String pendingAutoDlTag = "";
+    int pendingAutoDlIdx = -1;
+    void downloadProfileItemViaDetail(final String awemeId, final String tag){
+        if(web == null || !webReady) return;
+        pendingDetailId = awemeId;
+        pendingDetailTag = tag;
+        pendingDetailSignedUrl = "";
+        // 页面 fetch 会自动被抖音签名包装器补 msToken+a_bogus；
+        // 在 JS 里就地抽取直链字段，只传小 JSON 过桥（避免大字符串跨桥失败）。
+        String js = "(function(){try{"
+            + "var url='/aweme/v1/web/aweme/detail/?device_platform=webapp&aid=6383"
+            + "&channel=channel_pc_web&aweme_id=" + awemeId + "&pc_client_type=1&version_code=190500&version_name=19.5.0&cookie_enabled=true&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome&browser_version=120.0.0.0&browser_online=true';"
+            + "function pick(t){try{var j=JSON.parse(t);var out={};"
+            + "var ad=j.aweme_detail||j;"
+            + "out.aweme_id=ad.aweme_id||'';"
+            + "var v=ad.video;if(v&&v.play_addr){var ul=v.play_addr.url_list||[];out.vurl=ul[0]||'';}"
+            + "if(!out.vurl&&v&&v.download_addr){var dl=v.download_addr.url_list||[];out.vurl=dl[0]||'';}"
+            + "var imgs=ad.images;if(imgs&&imgs.length){var il=imgs[0].url_list||[];out.iurl=il[0]||'';}"
+            + "if(!out.vurl&&!out.iurl&&v&&v.bit_rate){for(var i=0;i<v.bit_rate.length;i++){var b=v.bit_rate[i];if(b.play_addr){var bl=b.play_addr.url_list||[];if(bl[0]){out.vurl=bl[0];break;}}}}"
+            + "return out;}catch(e){return {perr:''+e};}}"
+            + "fetch(url,{credentials:'include'}).then(function(r){return r.text();}).then(function(t){"
+            + "var o=pick(t);window.DyBridge.onDetailData(JSON.stringify(o));"
+            + "}).catch(function(e){window.DyBridge.onDetailData(JSON.stringify({ferr:''+e}));});"
+            + "}catch(e){window.DyBridge.onDetailData(JSON.stringify({err:''+e}));}})()";
+        web.evaluateJavascript(js, null);
+    }
+
+    /** 解析 JS 回传的直链小 JSON（{vurl|iurl|err}），入下载队列 */
+    void parseDetailBody(final String body){
+        try{
+            Object root = new JP(body).parse();
+            if(!(root instanceof Map)){
+                h.post(new Runnable(){ public void run(){
+                    s("解析失败");
+                    showHintToast("解析失败");
+                }});
+                return;
+            }
+            Map m = (Map) root;
+            String err = gs(get(m, "err")) + gs(get(m, "ferr")) + gs(get(m, "perr"));
+            String vurl = gs(get(m, "vurl"));
+            String iurl = gs(get(m, "iurl"));
+            if(err.length() > 0 && vurl.length() == 0 && iurl.length() == 0){
+                Log.i("DYP", "PROFILE_DETAIL_ERR " + err);
+                h.post(new Runnable(){ public void run(){
+                    s("解析失败，试试「解析看详情」：" + err.substring(0, Math.min(60, err.length())));
+                    showHintToast("解析失败");
+                }});
+                return;
+            }
+            final String fin = vurl.length() > 0 ? vurl : iurl;
+            final boolean finImg = vurl.length() == 0;
+            if(fin.length() == 0 || fin.equals("?")){
+                h.post(new Runnable(){ public void run(){
+                    s("解析失败：没有直链");
+                    showHintToast("解析失败");
+                }});
+                return;
+            }
+            h.post(new Runnable(){ public void run(){
+                enqueueDownload(fin, pendingDetailTag, finImg ? "jpg" : "mp4",
+                        finImg ? "图片" : "视频");
+                s("已加入下载队列：" + pendingDetailTag);
+                showHintToast("已加入下载队列");
+            }});
+            pendingDetailId = "";
+        }catch(Throwable t){
+            Log.i("DYP", "PROFILE_DETAIL_PARSE_ERR " + t);
+        }
+    }
+
+    /** 解析列表响应 body，按平台提取 ProfileItem */
+    void parseProfileBody(final String body){
+        try{
+            Object root = new JP(body).parse();
+            // 平台判定：按内容特征
+            if(body.indexOf("aweme_list") >= 0){
+                parseDyProfile(root);
+            } else if(body.indexOf("visionProfileWorkPhotoList") >= 0
+                    || body.indexOf("visionProfileLikePhotoList") >= 0){
+                parseKsProfile(root);
+            } else if(body.indexOf("bvid") >= 0 && body.indexOf("vlist") >= 0){
+                parseBiliProfile(root);
+            } else if(body.indexOf("videoId") >= 0 && body.indexOf("thumbnail") >= 0){
+                parseYtProfile(root);
+            } else if(body.indexOf("edge_owner_to_timeline_media") >= 0
+                    || body.indexOf("xdt_api__v1__feed__user_timeline_graphql_connection") >= 0
+                    || body.indexOf("xdt_shortcode_media") >= 0){
+                parseInsProfileJson(root);
+            } else {
+                Log.i("DYP", "PROFILE_UNKNOWN len=" + body.length());
+            }
+        }catch(Throwable t){
+            Log.i("DYP", "PROFILE_PARSE_ERR " + t);
+        }
+    }
+
+    /** IG：从 graphql/JSON 响应里抠 shortcode 列表 */
+    void parseInsProfileJson(Object root){
+        try{
+            int added = 0;
+            java.util.List<String> codes = new java.util.ArrayList<String>();
+            collectInsCodes(root, codes, 0);
+            for(String code : codes){
+                if(code == null || code.length() < 3) continue;
+                synchronized(profileSeen){
+                    if(!profileSeen.add("ig_" + code)) continue;
+                }
+                ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+                it.id = code;
+                it.url = "https://www.instagram.com/p/" + code + "/";
+                it.title = "Instagram " + code;
+                synchronized(profileCollected){ profileCollected.add(it); }
+                added++;
+            }
+            Log.i("DYP", "INS_PROFILE_JSON added=" + added + " total=" + profileCollected.size());
+            if(added > 0) h.post(profileRenderRunnable);
+        }catch(Throwable t){
+            Log.i("DYP", "INS_PROFILE_JSON_ERR " + t);
+        }
+    }
+
+    /** 递归找 "shortcode" 字段 */
+    void collectInsCodes(Object o, java.util.List<String> out, int depth){
+        if(o == null || depth > 12) return;
+        if(o instanceof Map){
+            Map m = (Map) o;
+            Object sc = m.get("shortcode");
+            if(sc instanceof String) out.add((String) sc);
+            Object codeO = m.get("code");
+            if(codeO instanceof String && !m.containsKey("shortcode")) out.add((String) codeO);
+            for(Object v : m.values()) collectInsCodes(v, out, depth + 1);
+        } else if(o instanceof List){
+            for(Object v : (List) o) collectInsCodes(v, out, depth + 1);
+        }
+    }
+
+    /** 抖音：aweme_list 响应 → items（视频/图集 + 直链） */
+    void parseDyProfile(Object root){
+        Object awemeList = findKey(root, "aweme_list");
+        if(!(awemeList instanceof List)) return;
+        int added = 0;
+        for(Object o : (List) awemeList){
+            if(!(o instanceof Map)) continue;
+            Map aw = (Map) o;
+            String awemeId = gs(get(aw, "aweme_id"));
+            String desc = gs(get(aw, "desc"));
+            if(awemeId.length() == 0) continue;
+            synchronized(profileSeen){
+                if(!profileSeen.add(awemeId)) continue;
+            }
+            ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+            it.id = awemeId;
+            it.title = desc;
+            // 图片集判定
+            Object imgs = get(aw, "images");
+            boolean isImage = imgs instanceof List && !((List) imgs).isEmpty();
+            it.isImage = isImage;
+            // 视频直链：video.play_addr.url_list 第一个
+            if(!isImage){
+                Object video = get(aw, "video");
+                if(video instanceof Map){
+                    Object pa = get((Map) video, "play_addr");
+                    if(pa instanceof Map){
+                        String u = firstUrl(get((Map) pa, "url_list"));
+                        if(u.length() > 0 && !u.equals("?")) it.directUrl = u;
+                    }
+                }
+            }
+            // 图集：第一张图直链
+            if(isImage && it.directUrl.length() == 0){
+                Object firstImg = ((List) imgs).get(0);
+                if(firstImg instanceof Map){
+                    Object ul = get((Map) firstImg, "url_list");
+                    String u = firstUrl(ul);
+                    if(u.length() > 0 && !u.equals("?")) it.directUrl = u;
+                }
+            }
+            it.url = "https://www.iesdouyin.com/share/video/" + awemeId + "/";
+            synchronized(profileCollected){ profileCollected.add(it); }
+            added++;
+        }
+        if(added > 0){
+            Log.i("DYP", "DY_PROFILE +" + added + " total=" + profileCollected.size());
+            scheduleProfileRender();
+        }
+    }
+
+    /** 快手：visionProfileWorkPhotoList / visionProfileLikePhotoList → items */
+    void parseKsProfile(Object root){
+        Object listObj = findKey(root, "visionProfileWorkPhotoList");
+        if(!(listObj instanceof List)) listObj = findKey(root, "visionProfileLikePhotoList");
+        if(!(listObj instanceof List)) return;
+        int added = 0;
+        for(Object o : (List) listObj){
+            if(!(o instanceof Map)) continue;
+            Map ph = (Map) o;
+            // photoId / photo
+            String photoId = gs(get(ph, "photoId"));
+            if(photoId.length() == 0) photoId = gs(get(ph, "id"));
+            String caption = gs(get(ph, "caption"));
+            if(photoId.length() == 0) continue;
+            synchronized(profileSeen){
+                if(!profileSeen.add(photoId)) continue;
+            }
+            ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+            it.id = photoId;
+            it.title = caption;
+            // 视频直链 mainMvUrl / photoUrl
+            Object photo = get(ph, "photo");
+            if(photo instanceof Map){
+                String mv = gs(get((Map) photo, "mainMvUrl"));
+                if(mv.length() == 0) mv = gs(get((Map) photo, "mainMvUrls"));
+                if(mv.length() == 0) mv = gs(get((Map) photo, "photoUrl"));
+                if(mv.length() > 0) it.directUrl = mv;
+            }
+            it.url = "https://www.kuaishou.com/short-video/" + photoId;
+            synchronized(profileCollected){ profileCollected.add(it); }
+            added++;
+        }
+        if(added > 0){
+            Log.i("DYP", "KS_PROFILE +" + added + " total=" + profileCollected.size());
+            scheduleProfileRender();
+        }
+    }
+
+    /** B 站：wbi/arc/search 响应（vlist）→ items */
+    void parseBiliProfile(Object root){
+        Object vlist = findKey(root, "vlist");
+        if(!(vlist instanceof List)) return;
+        int added = 0;
+        for(Object o : (List) vlist){
+            if(!(o instanceof Map)) continue;
+            Map v = (Map) o;
+            String bvid = gs(get(v, "bvid"));
+            if(bvid.length() == 0) continue;
+            synchronized(profileSeen){
+                if(!profileSeen.add(bvid)) continue;
+            }
+            ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+            it.id = bvid;
+            it.title = gs(get(v, "title"));
+            it.url = "https://www.bilibili.com/video/" + bvid;
+            synchronized(profileCollected){ profileCollected.add(it); }
+            added++;
+        }
+        if(added > 0){
+            Log.i("DYP", "BILI_PROFILE +" + added + " total=" + profileCollected.size());
+            scheduleProfileRender();
+        }
+    }
+
+    /** YouTube：browse API 响应（videoId + thumbnail/thumbnails）→ items */
+    void parseYtProfile(Object root){
+        // YouTube browse 响应里有嵌套的 videoRenderer / gridVideoRenderer
+        // 递归搜所有 videoId 对应的 title
+        java.util.List<Map> items = new ArrayList<Map>();
+        collectYtVideos(root, items, new java.util.HashSet<String>());
+        if(items.isEmpty()) return;
+        int added = 0;
+        for(Map v : items){
+            String vid = gs(v.get("videoId"));
+            String title = gs(v.get("title"));
+            if(vid.length() == 0) continue;
+            synchronized(profileSeen){
+                if(!profileSeen.add(vid)) continue;
+            }
+            ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+            it.id = vid;
+            it.title = title;
+            it.url = "https://www.youtube.com/watch?v=" + vid;
+            synchronized(profileCollected){ profileCollected.add(it); }
+            added++;
+        }
+        if(added > 0){
+            Log.i("DYP", "YT_PROFILE +" + added + " total=" + profileCollected.size());
+            scheduleProfileRender();
+        }
+    }
+
+    /** 递归搜 YouTube browse 响应里的 videoId + title（videoRenderer / gridVideoRenderer） */
+    void collectYtVideos(Object o, java.util.List<Map> out, java.util.Set<String> seen){
+        if(o instanceof Map){
+            Map m = (Map) o;
+            Object vid = m.get("videoId");
+            if(vid != null){
+                String v = gs(vid);
+                if(v.length() > 0 && !seen.contains(v)){
+                    seen.add(v);
+                    Map<String, String> it = new java.util.HashMap<String, String>();
+                    it.put("videoId", v);
+                    // 标题：title.runs[0].text / title.simpleText / headline.runs[0].text
+                    String title = "";
+                    Object titleObj = m.get("title");
+                    if(titleObj instanceof Map){
+                        Map tm = (Map) titleObj;
+                        Object runs = tm.get("runs");
+                        if(runs instanceof List && !((List) runs).isEmpty()){
+                            Object r0 = ((List) runs).get(0);
+                            if(r0 instanceof Map) title = gs(((Map) r0).get("text"));
+                        }
+                        if(title.length() == 0) title = gs(tm.get("simpleText"));
+                    } else if(titleObj instanceof String){
+                        title = (String) titleObj;
+                    }
+                    // 兜底 headline
+                    if(title.length() == 0){
+                        Object hl = m.get("headline");
+                        if(hl instanceof Map){
+                            Object hr = ((Map) hl).get("runs");
+                            if(hr instanceof List && !((List) hr).isEmpty()){
+                                Object r0 = ((List) hr).get(0);
+                                if(r0 instanceof Map) title = gs(((Map) r0).get("text"));
+                            }
+                        }
+                    }
+                    // 再兜底 accessibilityData
+                    if(title.length() == 0){
+                        Object ad = m.get("accessibility");
+                        if(ad instanceof Map){
+                            Object adt = ((Map) ad).get("accessibilityData");
+                            if(adt instanceof Map) title = gs(((Map) adt).get("label"));
+                        }
+                    }
+                    it.put("title", title);
+                    out.add(it);
+                }
+            }
+            for(Object val : m.values()){
+                collectYtVideos(val, out, seen);
+            }
+        } else if(o instanceof List){
+            for(Object val : (List) o){
+                collectYtVideos(val, out, seen);
+            }
+        }
+    }
+
+    /** 防抖：收集到数据后 1.2 秒统一刷新列表页（新数据会重置计时） */
+    void scheduleProfileRender(){
+        profileLastRender = System.currentTimeMillis();
+        h.removeCallbacks(profileRenderRunnable);
+        h.postDelayed(profileRenderRunnable, 1200);
+    }
+
+    final Runnable profileRenderRunnable = new Runnable(){ public void run(){
+        if(!profileMode) return;
+        synchronized(profileCollected){
+            if(profileCollected.isEmpty()) return;
+            final java.util.List<ProfileParser.ProfileItem> copy =
+                    new java.util.ArrayList<ProfileParser.ProfileItem>(profileCollected);
+            h.post(new Runnable(){ public void run(){
+                if(!profileMode) return;
+                showProfileList(copy);
+            }});
+        }
+    }};
 
     /** 后台跑 TikTok 解析，结果回到主线程渲染 */
     void triggerTikTokBgParse(final String pageUrl){
@@ -3325,10 +5509,10 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
                     eb.append("【解析失败】\n");
                     eb.append("TikTok 页面没有返回视频数据。\n\n");
                     eb.append("常见原因：\n");
-                    eb.append("1. 未开代理，TikTok 判定为受限地区\n");
-                    eb.append("2. 代理节点被 TikTok 标记\n");
+                    eb.append("1. 网络访问不了 TikTok（可开「内置代理」走服务器中转）\n");
+                    eb.append("2. 出口 IP 被 TikTok 标记\n");
                     eb.append("3. 作品已删除或设为私密\n\n");
-                    eb.append("建议：「关于 → 代理设置」填入可访问的境外代理后重试。");
+                    eb.append("建议：「设置 → 代理 → 内置代理」开启后重试。");
                     final String em = eb.toString();
                     h.post(new Runnable(){ public void run(){
                         o(em);
@@ -3424,7 +5608,7 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
         }
         final String srv = effSrv();
         if(srv.length() == 0){
-            tv.setText("机场流量：未配置服务器（TikTok 需自行开代理）");
+            tv.setText("机场流量：未配置服务器（TikTok 可开内置代理或走自己的网络）");
             return;
         }
         tv.setText("机场流量：查询中…");
@@ -3441,9 +5625,9 @@ wrap.addView(settingRow("检查更新", "手动检查新版本",
                 c.disconnect();
                 Log.i("DYP", "AIR_HTTP " + code + " len=" + (body == null ? 0 : body.length()));
                 if(code != 200 || body == null || body.length() == 0){
-                    out = "机场流量：服务器无响应（TikTok 需自行开代理）";
+                    out = "机场流量：服务器无响应（TikTok 可开内置代理或走自己的网络）";
                 } else if(body.indexOf("\"ok\":true") < 0 && body.indexOf("\"ok\": true") < 0){
-                    out = "机场流量：" + str(jget(body, "err")) + "（TikTok 需自行开代理）";
+                    out = "机场流量：" + str(jget(body, "err")) + "（TikTok 可开内置代理或走自己的网络）";
                 } else {
 long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     String remainS = jnum(body, "remain_gb");
@@ -3455,12 +5639,12 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     b.append("机场流量：剩 ").append(remainS).append(" / ").append(totalS).append(" GB");
                     b.append("　").append(daysS).append(" 天到期");
                     if(dateS.length() > 0) b.append("（").append(dateS).append("）");
-                    // 剩余不足 1GB 或已到期 → 提醒走本地代理
+                    // 剩余不足 1GB 或已到期 → 提示开内置代理不可用
                     if(!usable || remain < 1){
                         String reason = str(jget(body, "reason"));
                         b.append("\n⚠ 机场不可用");
                         if(reason.length() > 0) b.append("：").append(reason);
-                        b.append("\n请在「代理设置」自行填入境外代理后使用 TikTok");
+                        b.append("\n可关闭「内置代理」走自己的网络使用 TikTok");
                     } else {
                         b.append("\nTikTok 解析/下载走服务器，无需挂代理");
                     }
@@ -3468,7 +5652,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 }
             }catch(Throwable t){
                 Log.i("DYP", "AIR_EX " + t);
-                out = "机场流量：连接失败（TikTok 需自行开代理）";
+                out = "机场流量：连接失败（TikTok 可开内置代理或走自己的网络）";
             }
             airCacheText = out;
             airCacheTs = System.currentTimeMillis();
@@ -3535,7 +5719,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             String uMusic = str(jget(dlObj, "music"));
             if(uVideo.length() > 0 && !uVideo.startsWith("http")) uVideo = srvBase + uVideo;
             if(uMusic.length() > 0 && !uMusic.startsWith("http")) uMusic = srvBase + uMusic;
-            curPlay = uVideo.length() > 0 ? uVideo : playAddr;
+            // 视频：原始CDN直链优先（走本机代理），服务器中转兜底
+            curPlay = playAddr.length() > 0 ? playAddr : (uVideo.length() > 0 ? uVideo : "");
             curMusic = uMusic.length() > 0 ? uMusic : musicUrl;
             curBgm = curMusic;
             curBgmTitle = musicTitle;
@@ -3800,10 +5985,10 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         StringBuilder b = new StringBuilder();
         b.append("【解析失败】\n").append(reason).append("\n\n");
         b.append("常见原因：\n");
-        b.append("1. 未开代理，TikTok 直连不通\n");
-        b.append("2. 代理节点被 TikTok 标记\n");
+        b.append("1. 网络访问不了 TikTok（可开「内置代理」走服务器中转）\n");
+        b.append("2. 出口 IP 被 TikTok 标记\n");
         b.append("3. 作品已删除或设为私密\n\n");
-        b.append("建议：「关于 → 代理设置」填入境外代理后重试。");
+        b.append("建议：「设置 → 代理 → 内置代理」开启后重试。");
         return b.toString();
     }
 
@@ -3941,8 +6126,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 if(hasVideo) doPlay();
             }});
 
-            // 是否真的会走代理下载这条 TikTok 链接
-            boolean pxOn = curProxyFor(play.length() > 0 ? play : "https://www.tiktok.com/") != null;
+            // 是否真的会走代理下载这条 TikTok 链接（现在一律直连，仅提示用途）
             StringBuilder b = new StringBuilder();
             b.append("【作品ID】").append(id).append("\n");
             b.append("【平台】TikTok\n");
@@ -3956,10 +6140,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             if(mTitle.length() > 0) b.append("【背景音乐】").append(mTitle).append("\n");
             if(mAuthor.length() > 0) b.append("【音乐作者】").append(mAuthor).append("\n");
             if(hasVideo) b.append("【音频下载】点下方「提取音频」，从视频中提取音轨为 MP3\n");
-            if(!pxOn){
-                b.append("\n【注意】TikTok 视频 CDN 有地区限制，直连下载会 403。\n");
-                b.append("　　　　「关于 → 代理设置」填入境外代理后即可下载。");
-            }
+            b.append("\n【注意】TikTok 视频 CDN 有地区限制，直连下载可能 403。\n");
+            b.append("　　　　打不开就开「设置 → 代理 → 内置代理」走服务器中转。");
             return b.toString();
         }catch(Throwable t){ Log.i("DYP", "TT_BUILD_ERR " + t); return null; }
     }
@@ -4061,11 +6243,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             // TikTok 老路径（i_tt）才需要提示；新 TtParser 路径已由 i_platform 输出平台名
             if(gs(get(m,"i_tt")).length() > 0 && plat.length() == 0){
                 b.append("【平台】TikTok\n");
-                boolean pxOn = curProxyFor(curPlay != null ? curPlay : "https://www.tiktok.com/") != null;
-                if(!pxOn){
-                    b.append("【提示】TikTok 视频 CDN 有地区限制，直连可能 403。\n");
-                    b.append("　　　　「关于 → 代理设置」填入境外代理后再下载。\n");
-                }
+                b.append("【提示】TikTok 视频 CDN 有地区限制，直连可能 403。\n");
+                b.append("　　　　打不开就开「设置 → 代理 → 内置代理」走服务器中转。\n");
             }
             String mt = gs(get(m,"i_musicTitle"));
             if(mt.length()>0) b.append("【背景音乐】").append(mt).append("\n");
@@ -4255,21 +6434,116 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         // 兼容无协议的 youtu.be/xxx
         m = Pattern.compile("(?:youtube\\.com|youtu\\.be)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
         if(m.find()) return "https://" + m.group();
+        // B站：b23.tv 短链 / bilibili.com / m.bilibili.com / space
+        m = Pattern.compile("https?://(?:b23\\.tv|(?:www\\.|m\\.)?bilibili\\.com)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
+        if(m.find()) return m.group();
+        // 兼容无协议的 b23.tv/xxxx、bilibili.com/video/xxx
+        m = Pattern.compile("(?:b23\\.tv|(?:www\\.|m\\.)?bilibili\\.com)/[A-Za-z0-9_./?=&%#@:+-]*").matcher(t);
+        if(m.find()) return "https://" + m.group();
         // 兜底：任意 http 链接
         m = Pattern.compile("https?://[\\w./?=&%#@:+-]+").matcher(t);
         if(m.find()) return m.group();
         return null;
     }
+
+    /** 展开后的 B站 链接清理：只留域名+路径，p 参数单独保留（分P用），其余追踪参数丢掉 */
+    static String cleanBiliUrl(String url){
+        if(url == null) return url;
+        try{
+            int q = url.indexOf('?');
+            if(q < 0) return url;
+            String base = url.substring(0, q);
+            String query = url.substring(q + 1);
+            // 只保留 p=（分P）和 bvid= / aid=（少数分享用参数形式）
+            StringBuilder keep = new StringBuilder();
+            for(String kv : query.split("&")){
+                if(kv.length() == 0) continue;
+                String k = kv;
+                int e = kv.indexOf('=');
+                if(e > 0) k = kv.substring(0, e);
+                if(k.equals("p") || k.equals("bvid") || k.equals("aid")){
+                    if(keep.length() > 0) keep.append('&');
+                    keep.append(kv);
+                }
+            }
+            String out = keep.length() > 0 ? (base + "?" + keep) : base;
+            return out;
+        }catch(Throwable t){ return url; }
+    }
+
+    /** b23.tv 短链展开：跟随 302 拿到真实链接（bilibili.com/video/... 或 /space/...） */
+    static String expandB23(String url){
+        if(url == null) return url;
+        String low = url.toLowerCase();
+        if(!low.contains("b23.tv")) return url;
+        try{
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                    new java.net.URL(url).openConnection(java.net.Proxy.NO_PROXY);
+            c.setInstanceFollowRedirects(false);
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(10000);
+            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+            int code = c.getResponseCode();
+            String loc = c.getHeaderField("Location");
+            try{ c.disconnect(); }catch(Throwable t){}
+            if(code >= 300 && code < 400 && loc != null && loc.length() > 0){
+                if(loc.startsWith("/")) loc = "https://b23.tv" + loc;
+                Log.i("DYP", "B23_EXPAND " + url + " -> " + loc.substring(0, Math.min(120, loc.length())));
+                // 可能多跳，最多跟 3 次
+                if(loc.toLowerCase().contains("b23.tv")) return expandB23(loc);
+                return loc;
+            }
+        }catch(Throwable t){ Log.i("DYP", "B23_EXPAND_ERR " + t); }
+        return url;
+    }
 void parse(){
-        final String raw=input.getText().toString().trim();
-        if(raw.length()==0){ s("空链接"); return; }
-        String url=extractUrl(raw);
-        // 把粘贴的整段口令清理成干净链接
-        if(url != null && !url.equals(raw)){
-            input.setText(url);
-            input.setSelection(url.length());
-        }
-        if(url==null){ s("未找到链接"); return; }
+         final String raw=input.getText().toString().trim();
+         if(raw.length()==0){ s("空链接"); return; }
+         String url=extractUrl(raw);
+         // B站纯号输入：av1234567 / BV1xx411c7mD 直接转成标准链接
+         if(url==null || url.equals(raw)){
+             if(BiliParser.isBareId(raw)){
+                 String conv = BiliParser.bareIdToUrl(raw);
+                 if(conv != null){
+                     url = conv;
+                     input.setText(url);
+                     input.setSelection(url.length());
+                     Log.i("DYP", "BILI_BARE_ID " + raw + " -> " + url);
+                 }
+             }
+         }
+         // 把粘贴的整段口令清理成干净链接
+         if(url != null && !url.equals(raw)){
+             input.setText(url);
+             input.setSelection(url.length());
+         }
+         if(url==null){ s("未找到链接"); return; }
+         // b23.tv 短链：先跟 302 展开成真实链接（视频 / 合集 / 主页都能识别）
+         // 注意：展开是网络请求，必须放后台线程，主线程会抛 NetworkOnMainThreadException
+         if(url.toLowerCase().contains("b23.tv")){
+             s("展开 B站短链…");
+             final String shortUrl = url;
+             new Thread(new Runnable(){ public void run(){
+                 final String exp = cleanBiliUrl(expandB23(shortUrl));
+                 h.post(new Runnable(){ public void run(){
+                     if(exp != null && !exp.equals(shortUrl)){
+                         input.setText(exp);
+                         input.setSelection(exp.length());
+                         Log.i("DYP", "B23_RESOLVED " + exp.substring(0, Math.min(140, exp.length())));
+                     }
+                     // 用展开后的链接继续走原来的解析流程
+                     doParseResolved(exp != null ? exp : shortUrl);
+                 }});
+             }}).start();
+             return;
+         }
+         doParseResolved(url);
+    }
+
+    /** 真正的解析流程（短链展开后调用，url 已是真实链接） */
+    void doParseResolved(String url){
+         if(url == null || url.length() == 0){ s("未找到链接"); return; }
         webDone=false;
         storyBlocked=false;
         curRetry = 0;
@@ -4318,20 +6592,280 @@ void parse(){
     int curRetry = 0;
     String curUrl = "";
 
+    /** 当前 B 站解析结果（分P下载用） */
+    BiliParser.BiliVideo curBili = null;
+
+    /** B 站分P列表：进「列表」页签，点条目直接播/下载该 P */
+/** 从 bili://play/{aid}/{cid} 取该集 aid，取不到就退回主 aid */
+    static String biliEpAid(ProfileParser.ProfileItem it, BiliParser.BiliVideo v){
+        try{
+            if(it != null && it.url != null && it.url.startsWith("bili://play/")){
+                String rest = it.url.substring("bili://play/".length());
+                int k = rest.indexOf('/');
+                if(k > 0){
+                    String a = rest.substring(0, k);
+                    if(a.length() > 0) return a;
+                }
+            }
+        }catch(Throwable t){}
+        return v != null ? v.aid : "";
+    }
+
+    void showBiliPages(final java.util.List<ProfileParser.ProfileItem> items){
+        if(listWrap == null) return;
+        listWrap.removeAllViews();
+        final int n = items.size();
+        final boolean isSeason = curBili != null && curBili.seasonId > 0;
+        listHead.setText((isSeason ? "B站合集" : "B站分P") + " · 共 " + n
+                + (isSeason ? " 集" : " 个分P") + " · 点「下载」下该集，或点右下「选择下载」批量选");
+        btnDlAll.setVisibility(View.VISIBLE);
+        btnDlAll.setText("选择下载");
+        btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            final java.util.List<ProfileParser.ProfileItem> snap =
+                    new java.util.ArrayList<ProfileParser.ProfileItem>(items);
+            final String pre = (curBili != null && curBili.title.length() > 0)
+                    ? curBili.title.replaceAll("[\\\\/:*?\"<>|\\s]+", "_")
+                    : "B站";
+            showListPicker(snap, pre, "视频", null, true);
+        }});
+        for(int i = 0; i < n; i++){
+            final ProfileParser.ProfileItem it = items.get(i);
+            final int idx = i;
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setBackground(makeRoundRect(curDark ? 0xFF24272F : 0xFFFFFFFF,
+                    curDark ? 0xFF333842 : 0xFFE1E4E9, 12));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = dp(8);
+            row.setLayoutParams(lp);
+
+            TextView title = new TextView(this);
+            title.setText((i + 1) + ". " + it.title);
+            title.setTextSize(13);
+            title.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+            title.setPadding(0, 0, 0, dp(6));
+            row.addView(title);
+
+            LinearLayout btns = new LinearLayout(this);
+            btns.setOrientation(LinearLayout.HORIZONTAL);
+            TextView btnDl = new TextView(this);
+            btnDl.setText("下载");
+            btnDl.setTextSize(12);
+            btnDl.setTextColor(0xFFFE2C55);
+            btnDl.setPadding(dp(10), dp(5), dp(10), dp(5));
+            btnDl.setBackground(makeRoundRect(0x1AFE2C55, 0, 8));
+            btnDl.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                s("解析第 " + (idx + 1) + " 集直链…");
+                new Thread(new Runnable(){ public void run(){
+                    // 合集里每集 aid 不同，必须用该集自己的 aid
+                    final String epAid = biliEpAid(it, curBili);
+                    final String dl = BiliParser.getPlayUrl(MainActivity.this, epAid, it.id);
+                    final String dA = BiliParser.lastAudioUrl;
+                    final String dQ = BiliParser.lastQualityDesc;
+                    h.post(new Runnable(){ public void run(){
+                        if(dl != null && dl.length() > 0){
+                            enqueueDownloadWithAudio(dl, "第" + (idx + 1) + "集", "mp4", "视频", "", dA);
+                            s("已加入下载队列：第 " + (idx + 1) + " 集"
+                                    + (dQ.length() > 0 ? "（" + dQ + "）" : ""));
+                            showHintToast("已加入下载队列");
+                        } else {
+                            s("第 " + (idx + 1) + " 集解析失败");
+                            showHintToast("直链获取失败");
+                        }
+                    }});
+                }}).start();
+            }});
+            btns.addView(btnDl);
+
+            TextView btnPlay = new TextView(this);
+            btnPlay.setText("播放");
+            btnPlay.setTextSize(12);
+            btnPlay.setTextColor(curDark ? 0xFF8AB4F8 : 0xFF1A73E8);
+            btnPlay.setPadding(dp(10), dp(5), dp(10), dp(5));
+            LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            plp.leftMargin = dp(8);
+            btnPlay.setLayoutParams(plp);
+            btnPlay.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                s("解析第 " + (idx + 1) + " 集…");
+                new Thread(new Runnable(){ public void run(){
+                    final String epAid = biliEpAid(it, curBili);
+                    final String dl = BiliParser.getPlayUrl(MainActivity.this, epAid, it.id);
+                    final String pA = BiliParser.lastAudioUrl;
+                    final String pQ = BiliParser.lastQualityDesc;
+                    h.post(new Runnable(){ public void run(){
+                        if(dl != null && dl.length() > 0){
+                            curPlay = dl;
+                            curAudio = pA != null ? pA : "";
+                            curImgs = "";
+                            switchTab(0);
+                            actions.setVisibility(View.VISIBLE);
+                            videoBox.setVisibility(View.VISIBLE);
+                            img.setVisibility(View.GONE);
+                            doPlay();
+                            s("播放 第 " + (idx + 1) + " 集" + (pQ.length() > 0 ? "（" + pQ + "）" : ""));
+                        } else {
+                            showHintToast("直链获取失败");
+                        }
+                    }});
+                }}).start();
+            }});
+            btns.addView(btnPlay);
+            row.addView(btns);
+            listWrap.addView(row);
+        }
+        s((isSeason ? "B站合集 " : "B站分P ") + n + (isSeason ? " 集" : " 个") + "已列到「列表」页");
+    }
     void loadForParse(final String url){
         curUrl = url;
+        // 新解析开始：复位各平台「已回退」标志，否则第二次解析不会触发回退
+        ytSrvFallbackDone = false;
+        xSrvFallbackDone = false;
+        biliSrvFallbackDone = false;
+        // 新解析开始时退出主页收集模式（防残留）
+        if(profileMode && !isProfileUrl(url)) stopProfileMode();
         o("");
-        // 主页列表：YouTube @频道 / TikTok @用户 / X 用户名主页
+        // B 站：本地直连 API（免服务器）；space 主页走 profile 路径
+        if(BiliParser.isBiliUrl(url) && extractBiliMid(url).length() == 0
+                && !url.toLowerCase().contains("space.bilibili.com")){
+            s("解析 B 站...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final BiliParser.BiliVideo v = BiliParser.resolve(MainActivity.this, url, 1);
+                Log.i("DYP", "BILI_RESULT err=" + v.err + " ok=" + v.ok()
+                        + " pages=" + v.pages.size());
+                curBili = v;
+                h.post(new Runnable(){ public void run(){
+                    if(v.ok()){
+                        webDone = true;
+                        String r = render(BiliParser.toResultJson(v));
+                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        o(r);
+                        if(v.hasPages()){
+                            boolean isSeason = v.seasonId > 0;
+                            String unit = isSeason ? "集" : "个分P";
+                            s("完成(B站) " + v.pages.size() + " " + unit + " · 点下载可选集");
+                            // 分P / 合集列表进「列表」页签
+                            java.util.List<ProfileParser.ProfileItem> items =
+                                    new java.util.ArrayList<ProfileParser.ProfileItem>();
+                            for(int i = 0; i < v.pages.size(); i++){
+                                BiliParser.BiliVideo.Page p = v.pages.get(i);
+                                ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+                                it.id = String.valueOf(p.cid);
+                                // 合集用「标题 + 第几集」，分P用「P几 分P名」
+                                it.title = isSeason
+                                        ? (p.part.length() > 0 ? p.part : ("第" + p.page + "集"))
+                                        : ("P" + p.page + " " + p.part);
+                                it.durSec = p.durSec;
+                                // 合集里每集是独立视频，必须用该集自己的 aid
+                                String epAid = (p.aid != null && p.aid.length() > 0) ? p.aid : v.aid;
+                                it.url = "bili://play/" + epAid + "/" + p.cid;
+                                items.add(it);
+                            }
+                            showBiliPages(items);
+                            // 自动切到「列表」页并提示，与抖音合集一致
+                            switchTab(1);
+                            s("B站" + (isSeason ? "合集" : "分P") + " " + v.pages.size()
+                                    + " " + unit + "已列到「列表」页");
+                            showHintToast((isSeason ? "B站合集 " : "B站分P ") + v.pages.size()
+                                    + (isSeason ? " 集" : " 个") + "，已放进「列表」页");
+                        } else {
+                            s("完成(B站)");
+                        }
+                    } else {
+                        s("B 站解析失败");
+                        showHintToast(v.err.length() > 0 ? v.err : "B 站解析失败");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 主页列表：B 站空间（本地 wbi）/ YouTube @频道 / TikTok @用户 / X 用户名主页
         if(isProfileUrl(url)){
+            final String biliMid = extractBiliMid(url);
+            // Instagram 主页：优先本地 API（带 Cookie），失败回退 WebView 收集
+            if(InsParser.isInsUrl(url)){
+                s("解析 Instagram 主页...");
+                web.setVisibility(View.GONE);
+                new Thread(new Runnable(){ public void run(){
+                    final java.util.List<ProfileParser.ProfileItem> list =
+                            ProfileParser.resolveInsProfile(MainActivity.this, url);
+                    final String err = ProfileParser.lastErr;
+                    h.post(new Runnable(){ public void run(){
+                        if(list != null && !list.isEmpty()){
+                            showProfileList(list);
+                            s("完成(IG 主页) " + list.size() + " 条");
+                        } else {
+                            // 回退 WebView 收集
+                            Log.i("DYP", "INS_PROFILE_WEBVIEW_FALLBACK " + err);
+                            s("IG 接口受限，改用网页收集…");
+                            profileMode = true;
+                            webDone = false;
+                            synchronized(profileCollected){ profileCollected.clear(); } profilePage = 0;
+                            synchronized(profileSeen){ profileSeen.clear(); }
+                            injectInsCookiesToWebView();
+                            setupWebView();
+                            web.setVisibility(View.VISIBLE);
+                            web.loadUrl(url);
+                            switchTab(1);
+                        }
+                    }});
+                }}).start();
+                return;
+            }
+            if(biliMid.length() > 0 && BiliParser.isBiliUrl(url)){
+                // B 站空间主页：本地 wbi 签名直连
+                s("解析 B 站主页...");
+                web.setVisibility(View.GONE);
+                new Thread(new Runnable(){ public void run(){
+                    final java.util.List<java.util.Map<String, Object>> list =
+                            BiliParser.resolveSpace(biliMid, 1, 30);
+                    h.post(new Runnable(){ public void run(){
+                        if(list != null && !list.isEmpty()){
+                            webDone = true;
+                            java.util.List<ProfileParser.ProfileItem> items =
+                                    new java.util.ArrayList<ProfileParser.ProfileItem>();
+                            for(java.util.Map<String, Object> it : list){
+                                ProfileParser.ProfileItem pi = new ProfileParser.ProfileItem();
+                                pi.id = String.valueOf(it.get("bvid"));
+                                pi.title = String.valueOf(it.get("title"));
+                                pi.url = "https://www.bilibili.com/video/" + pi.id;
+                                items.add(pi);
+                            }
+                            showProfileList(items);
+                        } else {
+                            // wbi 直连被风控：回退 WebView 主页方案
+                            Log.i("DYP", "BILI_SPACE_412 fallback webview");
+                            startProfileWebView(url);
+                        }
+                    }});
+                }}).start();
+                return;
+            }
+            // 抖音/快手 主页：WebView 方案（页面自算签名/过风控）；其余走服务器
+            String lower = url == null ? "" : url.toLowerCase();
+            if(lower.contains("douyin.com") || lower.contains("kuaishou.com")){
+                startProfileWebView(url);
+                return;
+            }
             s("解析主页列表...");
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final java.util.List<ProfileParser.ProfileItem> list = ProfileParser.resolveProfile(MainActivity.this, url);
                 final String err = ProfileParser.lastErr;
                 h.post(new Runnable(){ public void run(){
+                    Log.i("DYP", "PROFILE_LIST size=" + (list != null ? list.size() : -1) + " err=" + err);
                     if(list != null && !list.isEmpty()){
                         webDone = true;
-                        showProfileList(list);
+                        try{
+                            showProfileList(list);
+                            switchTab(1); // 切到列表页签
+                        }catch(Throwable t){
+                            Log.i("DYP", "SHOW_PROFILE_ERR " + t);
+                            s("列表渲染失败");
+                        }
                     } else {
                         s("主页解析失败：" + (err.length() > 0 ? err : "未知错误"));
                         showHintToast(err.length() > 0 ? err : "主页解析失败");
@@ -4340,7 +6874,7 @@ void parse(){
             }}).start();
             return;
         }
-        // YouTube：走服务器（yt-dlp + 机场代理），本地直连被 DNS 污染
+        // YouTube：走服务器解析（yt-dlp dump-json 拿 googlevideo 直链，不走下载缓存）
         if(YtParser.isYtUrl(url)){
             s("解析 YouTube...");
             web.setVisibility(View.GONE);
@@ -4356,10 +6890,33 @@ void parse(){
                     }
                     if(v.ok()){
                         webDone = true;
+                        // 保存 direct 直链（下载优先走本机代理直连，比服务器中转快）
+                        if(v.videoUrl != null && (v.videoUrl.contains("googlevideo") || v.videoUrl.contains("videoplayback"))){
+                            ytDirectPlay = v.videoUrl;
+                            ytDirectAudio = v.audioUrl != null ? v.audioUrl : "";
+                        } else {
+                            ytDirectPlay = "";
+                            ytDirectAudio = "";
+                        }
                         String r = render(v.toResultJson());
                         Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
                         o(r);
                         s("完成(YouTube)");
+                        // 主页列表「下载」入口：解析成功后自动入下载队列
+                        if(pendingAutoDlTag.length() > 0){
+                            final String tag = pendingAutoDlTag;
+                            pendingAutoDlTag = "";
+                            pendingAutoDlIdx = -1;
+                            // 下载走服务器流式中转（直链绑解析 IP，手机直连 403）
+                            String srv = effSrvS(MainActivity.this);
+                            final String dl = (srv.length() > 0 && v.id.length() > 0)
+                                    ? srv + "/api/yt/stream?id=" + v.id + "&uid=" + ytUid(MainActivity.this)
+                                    : "";
+                            if(dl.length() > 0){
+                                enqueueDownload(dl, tag, "mp4", "视频");
+                                showHintToast("已加入下载队列：" + tag);
+                            }
+                        }
                         if(!v.subUsable){
                             showHintToast("服务器代理流量：" + (v.subReason.length() > 0
                                     ? v.subReason : "不可用"));
@@ -4367,6 +6924,47 @@ void parse(){
                     } else {
                         s("YouTube 解析失败");
                         showHintToast(v.err.length() > 0 ? v.err : "YouTube 解析失败");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // Instagram 主页：交给 isProfileUrl 分支处理（本地带 Cookie 直连）
+        if(InsParser.isInsUrl(url) && InsParser.extractCode(url).length() == 0){
+            if(!ProfileParser.isProfileUrl(url)){
+                s("Instagram 链接无法识别");
+                showHintToast("支持单条图文/视频，或用户主页");
+                return;
+            }
+        }
+        // Instagram：本地带 Cookie 直连优先（走用户网络），失败再服务器兜底
+        if(InsParser.isInsUrl(url) && InsParser.extractCode(url).length() > 0){
+            final boolean srvOk = ProxyPolicy.builtinOn(this);
+            s("解析 Instagram...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final InsParser.InsMedia v = InsParser.resolve(MainActivity.this, url, true);
+                Log.i("DYP", "INS_RESULT err=" + v.err + " ok=" + v.ok()
+                        + " code=" + v.code + " kind=" + v.kind + " local=" + v.local
+                        + " video=" + v.isVideo + " srvOn=" + srvOk);
+                h.post(new Runnable(){ public void run(){
+                    if(v.ok()){
+                        webDone = true;
+                        String r = render(InsParser.toResultJson(v));
+                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        o(r);
+                        if(v.isVideo){
+                            s("完成(IG 视频)" + (v.local ? " · 本地直连" : " · 服务器中转"));
+                        } else {
+                            s("完成(IG 图文)" + (v.local ? " · 本地直连" : ""));
+                        }
+                    } else {
+                        s("Instagram 解析失败");
+                        String msg = v.err.length() > 0 ? v.err : "IG 解析失败";
+                        if(!CookieStore.insReady(MainActivity.this)){
+                            msg = "IG 需要登录：设置 → Cookie → Instagram，填入 sessionid";
+                        }
+                        showHintToast(msg);
                     }
                 }});
             }}).start();
@@ -4398,10 +6996,10 @@ void parse(){
                         } else {
                             s("完成(X) 纯文字推");
                         }
-                        // 机场流量提醒：服务器中转不可用时告知用户自己挂代理
+                        // 机场流量提醒：服务器中转不可用时告知用户
                         if(!v.serverUsable){
                             showHintToast("服务器代理流量：" + (v.serverReason.length() > 0
-                                    ? v.serverReason : "不可用") + "，下载请自行挂代理");
+                                    ? v.serverReason : "不可用") + "，下载请关闭内置代理走自己的网络");
                         }
                     } else if(!v.ok() && v.cardUrl.length() > 0){
                         // 纯卡片推（无媒体但有外链）：走服务器外链深挖
@@ -4456,10 +7054,52 @@ void parse(){
                     } else {
                         // 直连失败再退回 WebView 兜底
                         Log.i("DYP", "KS_FALLBACK_WEBVIEW " + v.err);
+                        // 主页短链：先试壳页列表解析（fw/user 页里带分享预览作品）
+                        if(ProfileParser.isProfileUrl(url)
+                                || (url != null && url.contains("kuaishou.com"))){
+                            final List<Map<String, String>> plist =
+                                    KsParser.resolveProfileList(MainActivity.this, url);
+                            if(plist != null && !plist.isEmpty()){
+                                final List<ProfileParser.ProfileItem> items =
+                                        new ArrayList<ProfileParser.ProfileItem>();
+                                for(Map<String, String> it : plist){
+                                    ProfileParser.ProfileItem pi = new ProfileParser.ProfileItem();
+                                    pi.id = it.get("id");
+                                    pi.title = it.get("title");
+                                    pi.url = it.get("url");
+                                    pi.directUrl = it.get("mv");
+                                    items.add(pi);
+                                }
+                                h.post(new Runnable(){ public void run(){
+                                    webDone = true;
+                                    showProfileList(items);
+                                    s("主页解析完成（快手分享预览 " + items.size() + " 条）");
+                                }});
+                                return;
+                            }
+                            // 壳页也没列表：快手主页匿名拿不到完整作品列表（滑块验证码），
+                            // 直接告知，不再进 WebView 死循环
+                            Log.i("DYP", "KS_PROFILE_EMPTY");
+                            h.post(new Runnable(){ public void run(){
+                                webDone = true;
+                                s("快手主页解析失败：快手对匿名访问主页要求滑块验证，"
+                                        + "网页端只能拿到分享预览。\n"
+                                        + "建议：在快手 App 里复制单条作品链接解析下载。");
+                                showHintToast("快手主页需要登录或逐个分享作品");
+                            }});
+                            return;
+                        }
                         s("快手直连失败，改用网页模式...");
                         setupWebView();
                         web.setVisibility(View.VISIBLE);
                         webDone = false;
+                        // 主页短链：进主页收集模式
+                        if(ProfileParser.isProfileUrl(url)){
+                            profileMode = true;
+                            synchronized(profileCollected){ profileCollected.clear(); } profilePage = 0;
+                            synchronized(profileSeen){ profileSeen.clear(); }
+                            s("主页网页加载中，自动收集作品…");
+                        }
                         web.loadUrl(KsParser.isShort(url) ? url : v.pageUrl);
                     }
                 }});
@@ -4522,6 +7162,7 @@ void parse(){
         s(curRetry == 0 ? "加载中..." : ("重试中(" + curRetry + "/2)..."));
         // 抖音路径需要真实浏览器算签名，这里才初始化 WebView
         setupWebView();
+        webDone = false;
         web.setVisibility(View.VISIBLE);
         web.loadUrl(url);
         // 短链可能因网络抖动停在中转页，兜底：解析真实地址后直连
@@ -4720,12 +7361,38 @@ void parse(){
     /** 尝试用签名 detail 接口解析抖音作品（图文/实况主路径）。
      *  自建服务器优先（用户零门槛 + UIFID 池），失败回退本地签名。 */
     void tryDyDetail(final String awemeId){
+        // 没有凭据时，后台静默获取一次（不打扰用户），拿到后本次解析就能用
+        if(!dyHasUifid() && !dyAutoRunning){
+            s("首次解析：正在后台准备实况图凭据（约 5-10 秒）…");
+            autoFetchDyUifid(new Runnable(){ public void run(){
+                if(dyHasUifid()){
+                    Log.i("DYP", "DY_AUTO_READY 本次解析可直接用本地签名");
+                    s("凭据就绪，实况图可本地解析");
+                } else {
+                    Log.i("DYP", "DY_AUTO_MISS 本次仍走服务器/静态图");
+                }
+            }});
+        }
         new Thread(new Runnable(){ public void run(){
             if(webDone || mixMode) return;
             DyDetail.Result r = null;
+            // 调试开关：--ez localonly true 时强制走本地签名（验证免服务器路径）
+            boolean localOnly = false;
+            try{ localOnly = getIntent() != null && getIntent().getBooleanExtra("localonly", false); }catch(Throwable t){}
+            // 优先本地签名（已有凭据时不走服务器，更快也更省流量）
+            String localUifid = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_UIFID, "");
+            boolean hasLocal = localUifid != null && localUifid.length() >= 32;
+            if(hasLocal && !localOnly){
+                String ck0 = "UIFID_TEMP=" + localUifid;
+                String tw0 = DyDetail.registerTtwid();
+                if(tw0.length() > 0) ck0 = ck0 + "; " + tw0;
+                r = DyDetail.fetch(awemeId, ck0, 2);
+                Log.i("DYP", "DYDETAIL local-first " + r);
+                if(!r.ok) r = null;   // 本地失败再走服务器兜底
+            }
             // ---- 路径 1：自建服务器中转 ----
-            String srv = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DYP_SRV, DYP_SRV_DEFAULT);
-            if(srv != null && srv.length() > 0){
+            String srv = localOnly ? "" : getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DYP_SRV, DYP_SRV_DEFAULT);
+            if(r == null && srv != null && srv.length() > 0){
                 // 服务器 detail 偶发 403（UIFID 池瞬时失效），重试 2 次再放弃
                 String js = null;
                 for(int attempt = 0; attempt < 3; attempt++){
@@ -4913,14 +7580,14 @@ void parse(){
         void onProgress(long doneBytes, long totalBytes);
         void onError(Exception e);
     }
-    /** 图集提示语：有实况就说清楚能转 MP4；快手纯静态图集说明原因 */
+    /** 图集提示语：有实况就说清楚能存成实况照片；快手纯静态图集说明原因 */
     String imgTipText(){
         int n = imgUrls.size();
         int live = 0;
         for(int i = 0; i < dynUrls.size(); i++){ if(dynUrls.get(i).length() > 0) live++; }
         if(live > 0){
-            if(live == n) return "共" + n + "张实况，左右滑动切图，可存为 MP4";
-            return "共" + n + "张（" + live + "张实况），左右滑动切图，点图放大";
+            if(live == n) return "共" + n + "张实况，左右滑动切图\n下载为 .jpg 实况照片，相册里长按可播放";
+            return "共" + n + "张（" + live + "张实况），左右滑动切图，点图放大\n实况存为 .jpg 实况照片，相册里长按可播放";
         }
         // 快手：网页端不下发动图轨道，作者标「实况」也只给静态图
         if(n > 0 && KsParser.isKsUrl(curUrl) && !isTikTokUrl(curUrl))
@@ -4944,12 +7611,33 @@ void parse(){
 
     /** 自测：3 张图，第 1、3 张为实况，第 2 张静态 */
 
+    /** 图片内存缓存：同一 URL 只下一次，避免并发重复请求把服务端连接写坏 */
+    final java.util.HashMap<String, byte[]> imgMem = new java.util.HashMap<String, byte[]>();
+    final java.util.HashSet<String> imgLoading = new java.util.HashSet<String>();
+
     void loadImage(final String url, final ImageView iv){
         if(url==null||url.length()==0) return;
+        byte[] cached;
+        synchronized(imgMem){ cached = imgMem.get(url); }
+        if(cached != null){
+            Bitmap bm0 = BitmapFactory.decodeByteArray(cached,0,cached.length);
+            if(bm0 != null){ iv.setImageBitmap(bm0); return; }
+        }
+        synchronized(imgLoading){
+            if(imgLoading.contains(url)) return;   // 同一张图正在下，别重复发
+            imgLoading.add(url);
+        }
         new Thread(new Runnable(){ public void run(){
             final byte[] d=httpGetBytes(url);
+            synchronized(imgLoading){ imgLoading.remove(url); }
             if(d==null){ h.post(new Runnable(){ public void run(){ s("图片加载失败"); }}); return; }
             final Bitmap bm=BitmapFactory.decodeByteArray(d,0,d.length);
+            if(bm != null){
+                synchronized(imgMem){
+                    if(imgMem.size() > 24) imgMem.clear();   // 简单容量上限
+                    imgMem.put(url, d);
+                }
+            }
             // 成功时不改状态栏：图片本身已经显示了，再写一句会盖掉图集提示
             h.post(new Runnable(){ public void run(){
                 if(bm!=null) iv.setImageBitmap(bm);
@@ -4989,12 +7677,14 @@ void parse(){
         if(curPlay==null||curPlay.length()==0) return;
         try{
             // 代理/Referer 可能随设置变化，URL 也换站，重建播放器
-            boolean ttUrl = isTikTokUrl(curPlay);
+boolean ttUrl = isTikTokUrl(curPlay);
             boolean ksUrl = KsParser.isKsUrl(curPlay);
             boolean xUrl = isXDomain(curPlay) || isXDomain(curUrl);
             boolean ytPlayUrl = YtParser.isYtUrl(curPlay) || YtParser.isYtUrl(curUrl)
                     || (curPlay != null && curPlay.contains("googlevideo.com"))
                     || (curAudio != null && curAudio.contains("googlevideo.com"));
+            boolean biliUrl = BiliParser.isBiliUrl(curPlay) || BiliParser.isBiliUrl(curUrl)
+                    || (curPlay != null && curPlay.contains("bilivideo.com"));
             // 当前播放器用的 DataSource.Factory（双轨合并时复用）
             final androidx.media3.datasource.DataSource.Factory[] dsf = new androidx.media3.datasource.DataSource.Factory[1];
             if(miniPlayer == null || miniProxyKey == null || miniProxyKey != proxyCacheKey(curPlay) || miniWasTT != ttUrl){
@@ -5002,17 +7692,29 @@ void parse(){
                 String ref = ttUrl ? "https://www.tiktok.com/"
                     : (ksUrl ? "https://www.kuaishou.com/"
                     : (xUrl ? "https://x.com/"
-                    : (ytPlayUrl ? "https://www.youtube.com/" : "https://www.douyin.com/")));
+                    : (biliUrl ? "https://www.bilibili.com/"
+                    : (ytPlayUrl ? "https://www.youtube.com/" : "https://www.douyin.com/"))));
                 androidx.media3.datasource.DefaultHttpDataSource.Factory http =
                     new androidx.media3.datasource.DefaultHttpDataSource.Factory()
                         .setUserAgent(MUA)
                         .setDefaultRequestProperties(new HashMap<String,String>(){{ put("Referer", ref); }})
                         .setAllowCrossProtocolRedirects(true);
-                // 代理：按「仅 TikTok」开关决定；服务器中转地址强制直连（用户代理可能不通）
-                final Proxy pxPlay = (curPlay != null && (curPlay.indexOf("/api/x/dl") >= 0 || curPlay.indexOf("/api/yt/file") >= 0))
-                        ? null : curProxyFor(curPlay);
-                Log.i("DYP", "MINI_DS tt=" + ttUrl + " proxy=" + (pxPlay != null));
-                androidx.media3.datasource.DataSource.Factory f = http;
+                // 代理：本地文件不套；服务器中转强制直连；其余按设置
+                final boolean isLocalFile = curPlay != null && curPlay.startsWith("file://");
+                final Proxy pxPlay = isLocalFile ? null
+                    : ((curPlay != null && (curPlay.indexOf("/api/x/dl") >= 0
+                        || curPlay.indexOf("/api/yt/file") >= 0
+                        || curPlay.indexOf("/api/yt/stream") >= 0
+                        || curPlay.indexOf("/api/tt/dl") >= 0))
+                    ? null : curProxyFor(curPlay));
+                Log.i("DYP", "MINI_DS tt=" + ttUrl + " proxy=" + (pxPlay != null) + " local=" + isLocalFile);
+                androidx.media3.datasource.DataSource.Factory f;
+                if(isLocalFile){
+                    // 本地文件：DefaultDataSource 自动选 FileDataSource
+                    f = new androidx.media3.datasource.DefaultDataSource.Factory(this, http);
+                } else {
+                    f = http;
+                }
                 if(pxPlay != null){
                     final java.net.Proxy pxFinal = pxPlay;
                     final String refFinal = ref;
@@ -5033,6 +7735,18 @@ void parse(){
                         }
                     };
                 }
+                // B 站 CDN：必须桌面 UA（手机 UA 一律 403）+ Referer + buvid3
+                if(biliUrl && pxPlay == null){
+                    final java.net.Proxy pxB = java.net.Proxy.NO_PROXY;
+                    final String refB = "https://www.bilibili.com/";
+                    final String ckB = BiliParser.biliCookie();
+                    Log.i("DYP", "MINI_BILI_CK len=" + ckB.length());
+                    f = new androidx.media3.datasource.DataSource.Factory(){
+                        public androidx.media3.datasource.DataSource createDataSource(){
+                            return new ProxyHttpDataSource(pxB, BiliParser.UA_DESKTOP, refB, ckB);
+                        }
+                    };
+                }
                 dsf[0] = f;
                 miniPlayer = new androidx.media3.exoplayer.ExoPlayer.Builder(this)
                     .setMediaSourceFactory(new androidx.media3.exoplayer.source.DefaultMediaSourceFactory(f))
@@ -5048,15 +7762,13 @@ void parse(){
                             miniPlay.setText("\u23f8");
                             Log.i("DYP", "MINI_READY dur=" + d);
                          } else if(state == androidx.media3.common.Player.STATE_BUFFERING){
-                             // 缓冲中：X/YouTube 走服务器中转，回源大视频可能要 1-2 分钟
-                             String tip = "缓冲中";
-                             if(isXDomain(curUrl)) tip = "缓冲中（服务器回源，稍等）";
-                             else if(YtParser.isYtUrl(curUrl)){
-                                 tip = ProxyPolicy.hasUserProxy(MainActivity.this)
-                                         ? "缓冲中（走你的代理直连 googlevideo，稍等）"
-                                         : "缓冲中（服务器解析回源，稍等）";
-                             }
-                             if(status != null) status.setText(tip);
+                              // 缓冲中：X/YouTube 走服务器中转，回源大视频可能要 1-2 分钟
+                              String tip = "缓冲中";
+                              if(isXDomain(curUrl)) tip = "缓冲中（服务器回源，稍等）";
+                              else if(YtParser.isYtUrl(curUrl)){
+                                  tip = "缓冲中（服务器解析回源，稍等）";
+                              }
+                              if(status != null) status.setText(tip);
                          } else if(state == androidx.media3.common.Player.STATE_ENDED){
                             miniPlay.setText("\u25b6");
                         }
@@ -5068,6 +7780,59 @@ void parse(){
                     }
                     @Override public void onPlayerError(androidx.media3.common.PlaybackException e){
                         Log.i("DYP", "MINI_ERR " + e.getErrorCodeName());
+                        // YouTube direct 直连失败（403 绑 IP）：自动回退服务器流式中转
+                        if(YtParser.isYtUrl(curUrl) && !ytSrvFallbackDone
+                                && (curPlay == null || curPlay.contains("googlevideo.com") || curPlay.contains("videoplayback"))){
+                            ytSrvFallbackDone = true;
+                            final String fbUrl = curUrl;
+                            final String fbId = curId.length() > 0 ? curId
+                                    : (curUrl != null ? curUrl : "");
+                            h.post(new Runnable(){ public void run(){
+                                s("直连被 CDN 拒绝，正在回退服务器中转…");
+                            }});
+                            new Thread(new Runnable(){ public void run(){
+                                // 重新请求服务器（不带 direct=1）拿 STREAM:// 中转地址
+                                final YtParser.YtVideo v = YtParser.resolveServer(MainActivity.this, fbUrl, false);
+                                h.post(new Runnable(){ public void run(){
+                                    if(v.ok() && v.videoUrl.length() > 0){
+                                        Log.i("DYP", "YT_SRV_FALLBACK url=" + v.videoUrl.substring(0, Math.min(60, v.videoUrl.length())));
+                                        curPlay = v.videoUrl;
+                                        curAudio = "";
+                                        miniProxyKey = null;
+                                        try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                                        doPlay();
+                                    } else {
+                                        s("YouTube 播放失败：" + (v.err.length() > 0 ? v.err : "服务器中转不可用"));
+                                    }
+                                }});
+                            }}).start();
+                            return;
+                        }
+                        // B 站直连 CDN 失败：自动回退服务器中转（buvid3/UA 变化或网络异常时）
+                        if(BiliParser.isBiliUrl(curUrl) && !biliSrvFallbackDone
+                                && (curPlay != null && curPlay.contains("bilivideo.com"))){
+                            biliSrvFallbackDone = true;
+                            final String fbCdn = curPlay;
+                            final String fbKey = curId;
+                            h.post(new Runnable(){ public void run(){
+                                s("B站直连失败，正在回退服务器中转…");
+                            }});
+                            new Thread(new Runnable(){ public void run(){
+                                final String srvUrl = BiliParser.biliProxyUrl(MainActivity.this, fbCdn, fbKey, "");
+                                h.post(new Runnable(){ public void run(){
+                                    if(srvUrl != null && srvUrl.length() > 0 && !srvUrl.equals(fbCdn)){
+                                        Log.i("DYP", "BILI_SRV_FALLBACK " + srvUrl.substring(0, Math.min(70, srvUrl.length())));
+                                        curPlay = srvUrl;
+                                        miniProxyKey = null;
+                                        try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                                        doPlay();
+                                    } else {
+                                        s("B站播放失败：服务器中转不可用");
+                                    }
+                                }});
+                            }}).start();
+                            return;
+                        }
                         // 403 时直接给出可操作提示
                         if(e.getErrorCodeName() != null && e.getErrorCodeName().contains("BAD_HTTP_STATUS")){
                             final String msg = "视频被 CDN 拒绝（403）\n"
@@ -5076,9 +7841,9 @@ void parse(){
                                 + "换住宅节点，或点「关于 → 网络自检」看具体原因。";
                             h.post(new Runnable(){ public void run(){ s(msg); }});
                         }
-                        // X 直连播放失败：用户的代理节点连不上 video.twimg.com → 自动回退服务器中转
+                        // X 直连播放失败：直连连不上 video.twimg.com → 自动回退服务器中转
                         if((isXDomain(curUrl) || (curPlay != null && curPlay.contains("twimg.com")))
-                                && !xSrvFallbackDone && ProxyPolicy.hasUserProxy(MainActivity.this)){
+                                && !xSrvFallbackDone){
                             xSrvFallbackDone = true;
                             final String fbUrl = curUrl;
                             h.post(new Runnable(){ public void run(){
@@ -5720,25 +8485,60 @@ void parse(){
 
     /** 是否主页链接（转发给 ProfileParser 判断） */
     boolean isProfileUrl(String url){
-        return ProfileParser.isProfileUrl(url);
+        if(ProfileParser.isProfileUrl(url)) return true;
+        // B 站空间主页：space.bilibili.com/{mid} 或 m.bilibili.com/space/{mid}
+        if(url != null){
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("bilibili\\.com/(?:space/)?(\\d{5,12})").matcher(url);
+            if(m.find()) return true;
+        }
+        return false;
     }
 
-    /** 主页作品列表：渲染到「列表」页签，每条可解析/下载 */
+    /** B 站空间主页 mid 提取（排除 av 号/BV 号） */
+    static String extractBiliMid(String url){
+        if(url == null) return "";
+        // 兼容 www / m / space 三种：bilibili.com/85420121、bilibili.com/space/85420121、m.bilibili.com/space/85420121
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("bilibili\\.com/(?:space/)?(\\d{5,12})(?![0-9])").matcher(url);
+        if(m.find()){
+            String mid = m.group(1);
+            // av 号排除
+            int i = url.lastIndexOf("av" + mid);
+            if(i >= 0) return "";
+            return mid;
+        }
+        return "";
+    }
+
+    /** 主页作品列表：渲染到「列表」页签，每条可解析/下载（分页，每页 100 条） */
+    static final int PROFILE_PAGE_SIZE = 100;
+    int profilePage = 0;
+
     void showProfileList(final java.util.List<ProfileParser.ProfileItem> list){
+        Log.i("DYP", "SHOW_PROFILE_LIST n=" + (list != null ? list.size() : 0) + " wrap=" + (listWrap != null));
         if(listWrap == null) return;
         listWrap.removeAllViews();
         final int n = list.size();
-        listHead.setText("主页共 " + n + " 条 · 点「下载」直接下，点标题先解析");
+        final int pages = Math.max(1, (n + PROFILE_PAGE_SIZE - 1) / PROFILE_PAGE_SIZE);
+        if(profilePage >= pages) profilePage = pages - 1;
+        if(profilePage < 0) profilePage = 0;
+        final int from = profilePage * PROFILE_PAGE_SIZE;
+        final int to = Math.min(n, from + PROFILE_PAGE_SIZE);
+
+        listHead.setText(pages > 1
+                ? ("主页共 " + n + " 条 · 第 " + (profilePage + 1) + "/" + pages + " 页 · 点「下载」直接下")
+                : ("主页共 " + n + " 条 · 点「下载」直接下，点标题先解析"));
         btnDlAll.setVisibility(n > 0 ? View.VISIBLE : View.GONE);
         btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
             new android.app.AlertDialog.Builder(MainActivity.this)
                 .setTitle("全部下载")
-                .setMessage("将把主页里 " + n + " 条全部加入下载队列。\n"
+                .setMessage("将把本页 " + (to - from) + " 条加入下载队列。\n"
                     + "境外平台会走服务器中转，大视频较多时速度受限。\n\n继续？")
                 .setPositiveButton("全部加入", new android.content.DialogInterface.OnClickListener(){
                     public void onClick(android.content.DialogInterface d, int w){
                         int added = 0;
-                        for(int i = 0; i < n; i++){
+                        for(int i = from; i < to; i++){
                             ProfileParser.ProfileItem it = list.get(i);
                             String u = it.url.length() > 0 ? it.url
                                     : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
@@ -5755,7 +8555,53 @@ void parse(){
                 .setNegativeButton("取消", null)
                 .show();
         }});
-        for(int i = 0; i < n; i++){
+
+        // 翻页栏（页数 > 1 才显示）
+        if(pages > 1){
+            LinearLayout pager = new LinearLayout(this);
+            pager.setOrientation(LinearLayout.HORIZONTAL);
+            pager.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            pager.setPadding(0, dp(4), 0, dp(8));
+
+            TextView prev = new TextView(this);
+            prev.setText("上一页");
+            prev.setTextSize(12);
+            prev.setTextColor(profilePage > 0
+                    ? (curDark ? 0xFF8AB4F8 : 0xFF1A73E8)
+                    : (curDark ? 0xFF4A4F5A : 0xFFC0C4CC));
+            prev.setPadding(dp(6), dp(5), dp(10), dp(5));
+            if(profilePage > 0){
+                prev.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                    profilePage--;
+                    showProfileList(list);
+                }});
+            }
+            pager.addView(prev);
+
+            TextView mid = new TextView(this);
+            mid.setText("  " + (profilePage + 1) + " / " + pages + "（" + from + "-" + (to - 1) + "）  ");
+            mid.setTextSize(12);
+            mid.setTextColor(curDark ? 0xFFB8BEC9 : 0xFF4B5563);
+            pager.addView(mid);
+
+            TextView next = new TextView(this);
+            next.setText("下一页");
+            next.setTextSize(12);
+            next.setTextColor(profilePage < pages - 1
+                    ? (curDark ? 0xFF8AB4F8 : 0xFF1A73E8)
+                    : (curDark ? 0xFF4A4F5A : 0xFFC0C4CC));
+            next.setPadding(dp(10), dp(5), dp(6), dp(5));
+            if(profilePage < pages - 1){
+                next.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                    profilePage++;
+                    showProfileList(list);
+                }});
+            }
+            pager.addView(next);
+            listWrap.addView(pager);
+        }
+
+        for(int i = from; i < to; i++){
             final ProfileParser.ProfileItem it = list.get(i);
             final int idx = i;
             LinearLayout row = new LinearLayout(this);
@@ -5790,10 +8636,42 @@ void parse(){
             btnDl.setPadding(dp(10), dp(5), dp(10), dp(5));
             btnDl.setBackground(makeRoundRect(0x1AFE2C55, 0, 8));
             btnDl.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-                // 先解析拿直链，再入下载队列（YouTube/TikTok 原始 URL 不能直接下）
-                String u = it.url.length() > 0 ? it.url
+                // 快手条目：列表响应里的 mainMvUrl 就是正常视频直链，直接入队
+                boolean isKs = (it.url != null && it.url.contains("kuaishou.com"))
+                        || (it.directUrl != null && it.directUrl.contains("kwimgs"))
+                        || (it.directUrl != null && it.directUrl.contains("kwaicdn"))
+                        || (it.directUrl != null && it.directUrl.contains("yximgs"))
+                        || (it.directUrl != null && it.directUrl.contains("ksyungslb"));
+                if(isKs && it.directUrl != null && it.directUrl.length() > 0){
+                    enqueueDownload(it.directUrl, "视频" + (idx + 1), "mp4", "视频");
+                    s("已加入下载队列：第 " + (idx + 1) + " 条（快手直链）");
+                    showHintToast("已加入下载队列");
+                    return;
+                }
+                final String u = it.url.length() > 0 ? it.url
                         : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
                 if(u.length() == 0){ s("该条无链接"); return; }
+                boolean isDy = u.contains("iesdouyin.com") || u.contains("douyin.com");
+                boolean isYt = YtParser.isYtUrl(u);
+                // YouTube 主页下载：走服务器中转（服务器有代理，不风控）
+                if(isYt && it.id != null && it.id.length() > 0){
+                    // YouTube 主页下载：走服务器解析拿直链，同单视频链路
+                    pendingAutoDlTag = "视频" + (idx + 1);
+                    pendingAutoDlIdx = idx;
+                    stopProfileMode();
+                    switchTab(0);
+                    loadForParse("https://www.youtube.com/watch?v=" + it.id);
+                    return;
+                }
+                // 抖音主页条目：走单视频解析全链路，解析完成后自动入下载队列
+                if(isDy && it.id.length() > 0){
+                    pendingAutoDlTag = "视频" + (idx + 1);
+                    pendingAutoDlIdx = idx;
+                    stopProfileMode();
+                    switchTab(0);
+                    loadForParse(u);
+                    return;
+                }
                 s("解析第 " + (idx + 1) + " 条直链…");
                 final String finalU = u;
                 new Thread(new Runnable(){ public void run(){
@@ -5846,6 +8724,8 @@ void parse(){
     /** 解析主页列表第 idx 条（0 基） */
     void parseProfileItem(final java.util.List<ProfileParser.ProfileItem> list, final int idx){
         if(list == null || idx < 0 || idx >= list.size()) return;
+        // 退出主页收集模式（解析单条走正常链路）
+        if(profileMode) stopProfileMode();
         final ProfileParser.ProfileItem it = list.get(idx);
         final String target = it.url.length() > 0 ? it.url
                 : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
@@ -5865,6 +8745,11 @@ void parse(){
             if(YtParser.isYtUrl(url)){
                 YtParser.YtVideo v = YtParser.resolve(this, url);
                 if(v.ok() && v.videoUrl.length() > 0) return v.videoUrl;
+                return null;
+            }
+            if(BiliParser.isBiliUrl(url)){
+                BiliParser.BiliVideo bv = BiliParser.resolve(this, url, 1);
+                if(bv.ok() && bv.playUrl.length() > 0) return bv.playUrl;
                 return null;
             }
             if(TtParser.isTtUrl(url)){
@@ -5972,9 +8857,8 @@ void parse(){
     }
 
     /** 下载视频前的大文件提醒：
-     *  X：挂了代理 → 直连 CDN（不烧机场流量）；没挂 → 走服务器机场，弹确认。
-     *  YouTube：googlevideo 直链绑定解析 IP（实测 strip ip= 后 403），
-     *          用户代理无效，一律走服务器中转，弹确认提示自建服务器方案。 */
+     *  内置代理开着 → X/YouTube 走服务器中转（弹确认）；
+     *  关着 → 直连（用户自己代理 / TUN 生效），直接下。 */
     void warnBigOverseas(final Runnable then){
         final boolean isX = isXDomain(curUrl);
         final boolean isYt = YtParser.isYtUrl(curUrl);
@@ -5982,41 +8866,36 @@ void parse(){
             then.run();
             return;
         }
-        if(isX && ProxyPolicy.hasUserProxy(this)){
-            showHintToast("已检测到你挂了代理：X 媒体将走你的代理直连，不消耗服务器流量");
+        // 内置代理关着：走用户自己的网络（含用户自己挂的代理/TUN），直接下
+        if(!ProxyPolicy.builtinOn(this)){
             then.run();
             return;
         }
         if(isX && !xSrvUsable){
-            showHintToast("服务器代理流量不可用，请自行挂代理后重试下载");
+            showHintToast("服务器代理流量不可用，请关闭内置代理走自己的网络后重试");
             return;
         }
         String msg;
         if(isYt){
-            msg = "YouTube 必须走服务器中转：\n"
-                + "1. 解析接口在国内被墙，本地无法直连\n"
-                + "2. 视频直链绑定解析 IP，挂代理也拿不到（已实测）\n\n"
-                + "当前将走服务器机场流量下载，速度受服务器带宽限制。\n"
-                + "服务器到期后（2027-04），可在设置里自建服务器地址（源码开源）。\n\n"
+            msg = "YouTube 将走服务器中转下载：\n"
+                + "解析接口在国内被墙，必须服务器中转。\n\n"
+                + "速度受服务器带宽限制（约 250KB/s）。\n\n"
                 + "仍要继续下载吗？";
         } else {
-            msg = "你没有挂代理，这个大文件将走我们服务器的机场流量下载，"
+            msg = "内置代理已开启，这个大文件将走我们服务器的机场流量下载，"
                 + "速度受服务器带宽限制（约 250KB/s），且会消耗机场流量。\n\n"
-                + "建议：在设置里挂上自己的代理，速度更快、不消耗服务器流量。\n\n"
+                + "想更快？关闭内置代理，用你自己的网络 / 代理直连。\n\n"
                 + "仍要继续走服务器下载吗？";
         }
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle(isYt ? "YouTube 走服务器下载" : "境外视频走服务器下载")
             .setMessage(msg)
             .setPositiveButton("继续下载", new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int w){ then.run(); }
             })
-            .setNegativeButton(isYt ? "取消" : "先去设置代理", new android.content.DialogInterface.OnClickListener(){
-                public void onClick(android.content.DialogInterface d, int w){
-                    if(isYt) d.dismiss(); else showProxyDialog();
-                }
+            .setNegativeButton("取消", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ d.dismiss(); }
             })
-            .setNeutralButton("取消", null)
             .show();
     }
 
@@ -6038,7 +8917,21 @@ void parse(){
         // 视频（无图集）：大文件提醒后直接下 mp4（分类：视频）
         if(!hasImgs){
             warnBigOverseas(new Runnable(){ public void run(){
-                // YouTube direct：带独立音轨，下载后本地合成
+                // YouTube：直链绑服务器解析 IP（手机直连 403），下载走服务器流式中转；
+                // 服务器已异步缓存合并好的 mp4，二次下载直接吃缓存
+                if(YtParser.isYtUrl(curUrl) || (curPlay != null && curPlay.indexOf("/api/yt/stream") >= 0)){
+                    String dlPlay = curPlay;
+                    if(dlPlay == null || (dlPlay.indexOf("googlevideo") >= 0 || dlPlay.indexOf("videoplayback") >= 0)){
+                        // 直链 403 下不了，换服务器中转
+                        String srv = effSrvS(MainActivity.this);
+                        if(srv.length() > 0 && curId.length() > 0){
+                            dlPlay = srv + "/api/yt/stream?id=" + curId + "&uid=" + ytUid(MainActivity.this);
+                        }
+                    }
+                    enqueueDownloadWithAudio(dlPlay, "视频", "mp4", "视频", "", "");
+                    return;
+                }
+                // 其他平台 direct：带独立音轨，下载后本地合成
                 String au = (curAudio != null && curAudio.startsWith("http")) ? curAudio : "";
                 enqueueDownloadWithAudio(curPlay, "视频", "mp4", "视频", "", au);
             }});
@@ -6537,6 +9430,8 @@ final String pfx;
                         else if(KsParser.isKsUrl(task.url)) pfx = "ks_";
                         else if(isXDomain(task.url) || isXDomain(curUrl)) pfx = "x_";
                         else if(YtParser.isYtUrl(task.url) || YtParser.isYtUrl(curUrl)) pfx = "yt_";
+                        else if(BiliParser.isBiliUrl(task.url) || BiliParser.isBiliUrl(curUrl)
+                                || task.url.indexOf("bilivideo.com") >= 0) pfx = "bl_";
                         else pfx = "dy_";
                         name = pfx + curId + "_" + task.tag + "_" + System.currentTimeMillis() + "." + task.ext;
                     }
@@ -6576,7 +9471,12 @@ final String pfx;
                             }
                             @Override public void onDone(boolean ok2, File out, String msg){
                                 Log.i("DYP", "DL_END " + fIdx + "/" + fTotal + " ok=" + ok2 + " " + msg);
-                                appLog("下载", (ok2 ? "✓ " : "✗ ") + out.getName() + "  " + msg);
+                                String name = out != null ? out.getName() : (target != null ? target.getName() : "?");
+                                appLog("下载", (ok2 ? "✓ " : "✗ ") + name + "  " + msg);
+                                // 失败时清掉半成品，避免空文件留在下载目录
+                                if(!ok2 && target != null && target.exists() && target.length() < 1024){
+                                    try{ target.delete(); }catch(Throwable t){}
+                                }
                             }
                         }, ttSes, MainActivity.this);
                     }
