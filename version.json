@@ -1,8 +1,14 @@
 {
-  "tag": "v1.3.7.2",
-  "name": "v1.3.7.2 抖音主页全量翻页 + 登录体验统一",
-  "body": "DY解析器 v1.3.7.2\n\n新增\n- 抖音主页全量翻页：主页作品列表一次拿全，实测 280 条作品 16 页全部翻完（日志 DYPROF_DONE n=280 pages=16）\n- 设置 → 抖音主页登录：登录成功后自动回到解析页，和 YouTube 一致，不用再手动点「完成」\n- 设置 → 抖音 Cookie 状态：可查看已保存的字段（只显示有无，不显示值）、手动清空\n\n优化\n- 三平台登录行为统一：YouTube / 抖音 / B站 全部改为「抓到 Cookie → 自动隐藏顶栏 + 清空网页 + 恢复手机 UA + 回解析页」\n- 登录菜单改为两步弹窗：先说明再选操作，修复之前列表被挤掉只剩「关闭」按钮的问题\n- 抖音 Cookie 存储路径迁移到 Android/data/<包名>/files/cookies/，文件管理器可见可备份，卸载自动清理\n\n修复\n- 崩溃：ClassCastException LinearLayout cannot be cast to FrameLayout（MainActivity.showDyLoginBar，B站同类问题一并修好）\n- 连续解析第二次主页只拿到 20/38 条：extractSecUid 正则漏了 sec_user_id= 写法，且翻页完成后误置 profileMode=false 导致渲染被跳过\n- 抖音主页跳转被打回手机版：跳转前设置桌面 UA + 拦截一次 m.douyin.com/share/user/\n\n变更\n- 抖音 Cookie 读写策略定版：CookieManager 实时优先，本地文件仅作重启兜底（本地是登录瞬间的死快照，msToken 几分钟即过期）\n- 抖音移动版登录入口已移除：m.douyin.com 已下线 404，手机 UA 被 302 到 PC 版，passport 登录报「非法应用」\n\n依赖变化\n- 抖音主页全量解析不需要服务器，也不需要访客凭据，只要登录 Cookie（登录一次即可）\n- 服务器到期不影响抖音主页解析与下载\n\n反馈群：995434160\nGitHub / Gitee 同步更新",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.2/DYParse-v1.3.7.2.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.2/DYParse-v1.3.7.2.apk",
-  "released": "2026-10-28"
+  "tag": "v1.3.7.3",
+  "name": "v1.3.7.3 修复检查更新失效 + 弹窗暗色 + 抖音主页全量翻页",
+  "body": "DY解析器 v1.3.7.2\n\n新增\n- 抖音主页全量翻页：主页作品列表一次拿全，实测 280 条作品 16 页全部翻完（日志 DYPROF_DONE n=280 pages=16）\n- 设置 → 抖音主页登录：登录成功后自动回到解析页，和 YouTube 一致，不用再手动点「完成」\n- 设置 → 抖音 Cookie 状态：可查看已保存的字段（只显示有无，不显示值）、手动清空\n\n优化\n- 三平台登录行为统一：YouTube / 抖音 / B站 全部改为「抓到 Cookie → 自动隐藏顶栏 + 清空网页 + 恢复手机 UA + 回解析页」\n- 登录菜单改为两步弹窗：先说明再选操作，修复之前列表被挤掉只剩「关闭」按钮的问题\n- 抖音 Cookie 存储路径迁移到 Android/data/<包名>/files/cookies/，文件管理器可见可备份，卸载自动清理\n\n修复\n- 检查更新失效：parseVer 只解析三段版本号，v1.3.7.2 被算成 10307 小于当前 103701，永远提示已是最新；现支持四位版本号\n- 更新源优先级形同虚设：自建服务器拿到的新版本会被 Gitee API 的旧版本无条件覆盖，现改为只有更高版本才覆盖\n- 崩溃：ClassCastException LinearLayout cannot be cast to FrameLayout（MainActivity.showDyLoginBar，B站同类问题一并修好）\n- 连续解析第二次主页只拿到 20/38 条：extractSecUid 正则漏了 sec_user_id= 写法，且翻页完成后误置 profileMode=false 导致渲染被跳过\n- 抖音主页跳转被打回手机版：跳转前设置桌面 UA + 拦截一次 m.douyin.com/share/user/\n\n变更\n- 抖音 Cookie 读写策略定版：CookieManager 实时优先，本地文件仅作重启兜底（本地是登录瞬间的死快照，msToken 几分钟即过期）\n- 抖音移动版登录入口已移除：m.douyin.com 已下线 404，手机 UA 被 302 到 PC 版，passport 登录报「非法应用」\n\n依赖变化\n- 抖音主页全量解析不需要服务器，也不需要访客凭据，只要登录 Cookie（登录一次即可）\n- 服务器到期不影响抖音主页解析与下载\n\n反馈群：995434160\nGitHub / Gitee 同步更新",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.3/DYParse-v1.3.7.3.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.3/DYParse-v1.3.7.3.apk",
+  "released": "2026-10-28",
+  "upgrade_notice": {
+    "title": "请手动更新到 v1.3.7.3",
+    "message": "检测到你在使用较旧的版本。\n\n之前的版本号算法有缺陷（1.3.7.1 的版本号 103701 比后续 1.3.8 的 10308 还大），导致 App 内「检查更新」一直提示「已是最新版」，实际已有新版本发布。\n\n这个缺陷已在 v1.3.7.3 修正，但旧版本自身无法自行修复，需要你手动更新一次。\n\n更新后：\n• 抖音主页可拿全量作品（实测 280 条 16 页翻完）\n• 检查更新恢复正常\n• 弹窗颜色跟随主题\n• 三平台登录后自动回解析页\n\n点「去更新」打开 Gitee 发布页下载安装即可，覆盖安装不会丢数据。",
+    "url": "https://gitee.com/adaaixianzun/dyparse/releases",
+    "until": 1030703
+  }
 }
