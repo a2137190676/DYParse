@@ -132,23 +132,12 @@ public class InnerDownloader {
                     c.setReadTimeout(60000);
                     c.connect();
                 } else {
-                    // 普通下载：支持代理（X / TikTok / YouTube 的 CDN 在国内常被 DNS 污染）
+                    // 普通下载：一律直连。
+                    // 海外 CDN 被墙时由「内置代理」开关决定是否走服务器中转（URL 已经是中转地址），
+                    // 用户自己挂的代理 / TUN 由系统接管，App 不套任何 Proxy。
                     java.net.Proxy px = null;
-                    try{
-                        if(url.indexOf("googlevideo.com") >= 0){
-                            // YouTube 直链：用户代理优先（direct 模式）；这里不看「仅 TikTok」开关
-                            px = ProxyPolicy.userProxy(ctx);
-                        } else if(url.indexOf("/api/x/dl") >= 0 || url.indexOf("/api/yt/file") >= 0
-                            || url.indexOf("/api/bili/dl") >= 0 || url.indexOf("/api/link/dl") >= 0
-                            || url.indexOf("/api/ins/dl") >= 0){
-                            // 服务器中转：强制直连，不套用户代理
-                            px = null;
-                        } else {
-                            px = MainActivity.staticProxyFor(ctx, url);
-                        }
-                    }catch(Throwable t){}
                     c = (HttpURLConnection) new URL(url).openConnection(
-                            px != null ? px : java.net.Proxy.NO_PROXY);
+                            java.net.Proxy.NO_PROXY);
                     // 服务器中转：必须带 HMAC 鉴权（AUTH_PREFIXES 保护 /api/），
                     // 用 SrvClient.sign 加头但不走它的 open（避免转 HTTPS 8443）。
                     if(url.indexOf("/api/ins/dl") >= 0 || url.indexOf("/api/bili/dl") >= 0
@@ -157,15 +146,21 @@ public class InnerDownloader {
                         try{ SrvClient.sign(c, url); }catch(Throwable t){}
                     }
                     c.setInstanceFollowRedirects(true);
-                    c.setRequestProperty("User-Agent", MUA);
+                    boolean isBili = url.indexOf("bilivideo.com") >= 0 || url.indexOf("bilibili.com") >= 0;
+                    c.setRequestProperty("User-Agent", isBili ? BiliParser.UA_DESKTOP : MUA);
                     String ref = "https://www.douyin.com/";
                     if(url.indexOf("tiktok") >= 0 || url.indexOf("tiktokcdn") >= 0) ref = "https://www.tiktok.com/";
                     else if(KsParser.isKsUrl(url)) ref = "https://www.kuaishou.com/";
                     else if(MainActivity.isXDomain(url)) ref = "https://x.com/";
                     else if(url.indexOf("googlevideo.com") >= 0) ref = "https://www.youtube.com/";
-                    else if(url.indexOf("bilivideo.com") >= 0 || url.indexOf("bilibili.com") >= 0) ref = "https://www.bilibili.com/";
+                    else if(isBili) ref = "https://www.bilibili.com/";
                     else if(url.indexOf("/api/ins/dl") >= 0) ref = "https://www.instagram.com/";
                     c.setRequestProperty("Referer", ref);
+                    // B 站 CDN 必须带 buvid3，否则 403
+                    if(isBili){
+                        String ck = BiliParser.biliCookie();
+                        if(ck.length() > 0) c.setRequestProperty("Cookie", ck);
+                    }
                     // 断点续传：带 Range 从 .part 大小继续
                     if(resumeFrom > 0) c.setRequestProperty("Range", "bytes=" + resumeFrom + "-");
                     // X/YT 中转地址（服务器在回源大视频，可能 1-2 分钟才出首字节）
@@ -185,6 +180,17 @@ public class InnerDownloader {
             if(code != 200 && code != 206){
                 Log.i(TAG, "IDL_HTTP " + code + " " + url);
                 msg = "HTTP " + code;
+                String why;
+                if(code == 403) why = "直链被 CDN 拒绝（通常是直链过期或需要代理）";
+                else if(code == 404) why = "文件不存在（直链已过期，需要重新解析）";
+                else if(code >= 500) why = "对方服务器出错或中转服务器回源失败";
+                else why = "服务器返回了非预期的状态码";
+                DiagLog.e(DiagLog.M_DOWNLOAD, "下载失败 | HTTP " + code + " | " + why
+                    + "\n  目标地址: " + url
+                    + "\n  保存路径: " + target.getAbsolutePath()
+                    + "\n  续传起点: " + resumeFrom
+                    + "\n  建议: 重新解析一次再试；若反复出现请把这段日志发给我们",
+                    new java.io.IOException("HTTP " + code));
                 if(cb != null) cb.onDone(false, null, msg);
                 return false;
             }
@@ -205,7 +211,29 @@ public class InnerDownloader {
 
             in = c.getInputStream();
             // 写 .part：有断点就追加，否则覆盖
-            out = new BufferedOutputStream(new FileOutputStream(part, resumeFrom > 0), 64 * 1024);
+            try{
+                out = new BufferedOutputStream(new FileOutputStream(part, resumeFrom > 0), 64 * 1024);
+            }catch(Throwable fe){
+                String reason = String.valueOf(fe);
+                String hint;
+                if(reason.indexOf("EACCES") >= 0 || reason.indexOf("Permission denied") >= 0){
+                    hint = "没有存储权限。请到 系统设置 → 应用 → DY解析器 → 权限 → 存储 里打开";
+                }else if(reason.indexOf("ENOSPC") >= 0 || reason.indexOf("No space") >= 0){
+                    hint = "手机存储空间不足，清理后再试";
+                }else if(reason.indexOf("EROFS") >= 0 || reason.indexOf("Read-only") >= 0){
+                    hint = "目标目录是只读的，换一个下载目录试试";
+                }else{
+                    hint = "目录创建失败或系统拒绝写入";
+                }
+                DiagLog.e(DiagLog.M_DOWNLOAD, "下载失败 | 无法创建文件 | " + hint
+                    + "\n  保存路径: " + part.getAbsolutePath()
+                    + "\n  上级目录: " + (part.getParentFile() != null ? part.getParentFile().getAbsolutePath() : "?")
+                    + "\n  目录是否存在: " + (part.getParentFile() != null && part.getParentFile().exists())
+                    + "\n  目录可写: " + (part.getParentFile() != null && part.getParentFile().canWrite()), fe);
+                msg = "无法写入文件：" + hint;
+                if(cb != null) cb.onDone(false, null, msg);
+                return false;
+            }
 
             if(cb != null) cb.onStart(total > 0 ? total : -1);
 
@@ -237,6 +265,29 @@ public class InnerDownloader {
         }catch(Throwable t){
             Log.i(TAG, "IDL_ERR " + t);
             msg = "" + t;
+            String reason = String.valueOf(t);
+            String hint;
+            if(reason.indexOf("EACCES") >= 0 || reason.indexOf("Permission denied") >= 0){
+                hint = "没有存储权限 → 系统设置 → 应用 → DY解析器 → 权限 → 存储 打开";
+            }else if(reason.indexOf("ENOSPC") >= 0){
+                hint = "存储空间不足";
+            }else if(reason.indexOf("UnknownHost") >= 0 || reason.indexOf("Unable to resolve") >= 0){
+                hint = "域名解析失败（网络不通或需要代理）";
+            }else if(reason.indexOf("SocketTimeout") >= 0 || reason.indexOf("timeout") >= 0){
+                hint = "连接超时（网络慢或服务器无响应）";
+            }else if(reason.indexOf("SSL") >= 0 || reason.indexOf("Cert") >= 0){
+                hint = "TLS/证书校验失败";
+            }else if(reason.indexOf("closed") >= 0 || reason.indexOf("reset") >= 0){
+                hint = "连接被中途断开";
+            }else{
+                hint = "未归类的异常，请看下方堆栈";
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("下载失败 | ").append(hint)
+              .append("\n  保存路径: ").append(target.getAbsolutePath())
+              .append("\n  目标地址: ").append(url)
+              .append("\n  已下载字节: ").append(resumeFrom);
+            DiagLog.e(DiagLog.M_DOWNLOAD, sb.toString(), t);
             // 保留 .part：下次重试带 Range 续传，不再从头下
             ok = false;
         }finally{
@@ -247,6 +298,27 @@ public class InnerDownloader {
 
         if(cb != null) cb.onDone(ok, ok ? target : null, msg);
         return ok;
+    }
+
+    /** 探测 URL 是否可下载（HEAD 或 Range 请求，只看状态码，不拉全量）。
+     *  用于更新镜像优选：镜像站很多，逐个 HEAD 一下挑可用的。 */
+    public static boolean headOk(String url){
+        java.net.HttpURLConnection uc = null;
+        try{
+            uc = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            uc.setRequestMethod("HEAD");
+            uc.setInstanceFollowRedirects(true);
+            uc.setConnectTimeout(6000);
+            uc.setReadTimeout(8000);
+            uc.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) DYParse");
+            int code = uc.getResponseCode();
+            long len = uc.getContentLengthLong();
+            return code >= 200 && code < 400 && (len <= 0 || len > 100000);
+        }catch(Throwable t){
+            return false;
+        }finally{
+            try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
+        }
     }
 
     /** 断点文件用：只取长度，用于显示 */
