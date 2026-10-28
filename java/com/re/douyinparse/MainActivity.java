@@ -2617,8 +2617,11 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
             .create().show();
     }
 
-    /** 统一弹窗 Builder：主题强制跟随 App 内主题（不受 ROM DeviceDefault 影响） */
+    /** 统一弹窗构建器：颜色必须跟随 App 主题。
+     *  不直接读 curDark —— 它有可能是默认 false 还没被赋值，
+     *  那样在深色模式下会弹出亮色框。这里实时查系统深色状态。 */
     android.app.AlertDialog.Builder dypDlg(){
+        curDark = isDarkMode();
         return new android.app.AlertDialog.Builder(this, curDark
             ? android.app.AlertDialog.THEME_DEVICE_DEFAULT_DARK
             : android.app.AlertDialog.THEME_DEVICE_DEFAULT_LIGHT);
@@ -4325,7 +4328,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             labels[i] = "第 " + (i + 1) + " 集" + (desc.length() > 0 ? "　" + desc : "");
         }
 
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("选择要下载的集数")
             .setMessage("合集共 " + n + " 集\n保存为：" + safeTitle + "_第N集.mp4")
             .setMultiChoiceItems(labels, sel,
@@ -4626,6 +4629,14 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(srv != null && srv.length() > 0){
                 String srvBody = httpGetText(srv + "/version.json", 7000, 9000);
                 if(srvBody != null){
+                    // ---- 升级公告：解决老版本版本号算法 bug 导致的「检测不到更新」----
+                    // 服务器在 version.json 里下发 upgrade_notice（JSON 对象）：
+                    //   {"title":"提示","message":"正文","url":"下载页","until":1030703,"once_per_day":0}
+                    // 条件：当前 versionCode < until 才显示；只对老版本生效，新版本不会再弹。
+                    // 老版本（1.3.7.1 及以前）的 parseVer 有 bug，无法识别四位版本更新，
+                    // 只能靠这个通道把它们引导到 Gitee 手动更新一次。
+                    checkUpgradeNotice(srvBody);
+
                     String st = jget(srvBody, "tag");
                     if(st != null && st.length() > 0){
                         tag = st;
@@ -4667,21 +4678,32 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 : ("https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest");
             String body = httpGetText(api, 9000, 11000);
             if(body != null){
-                tag = jget(body, "tag_name");
-                html = jget(body, "html_url");
-                name = jget(body, "name");
-                bodyTxt = jget(body, "body");
-                int q = body.indexOf("browser_download_url");
-                while(q > 0){
-                    String u = jgetFrom(body, q);
-                    if(u != null && u.toLowerCase().endsWith(".apk")){
-                        apkUrl = u;
-                        apkName = u.substring(u.lastIndexOf('/') + 1);
-                        break;
+                // 注意：源 0（自建服务器）已拿到 tag 时不能被低版本覆盖。
+                // 之前这里无条件赋值，导致服务器发 v1.3.7.3 会被 Gitee 上的 v1.3.7.2 盖掉，
+                // 表现就是「服务器明明发了新版，App 却说已是最新」。
+                String apiTag = jget(body, "tag_name");
+                if(apiTag == null) apiTag = "";
+                boolean takeApi = (tag == null || tag.length() == 0)
+                                  || (parseVer(apiTag) > parseVer(tag));
+                if(takeApi){
+                    tag = apiTag;
+                    html = jget(body, "html_url");
+                    name = jget(body, "name");
+                    bodyTxt = jget(body, "body");
+                    int q = body.indexOf("browser_download_url");
+                    while(q > 0){
+                        String u = jgetFrom(body, q);
+                        if(u != null && u.toLowerCase().endsWith(".apk")){
+                            apkUrl = u;
+                            apkName = u.substring(u.lastIndexOf('/') + 1);
+                            break;
+                        }
+                        q = body.indexOf("browser_download_url", q + 1);
                     }
-                    q = body.indexOf("browser_download_url", q + 1);
+                } else {
+                    Log.i("DYP", "UPDATE_SRC api_skip 已有更高版本 " + tag + " >= " + apiTag);
                 }
-                Log.i("DYP", "UPDATE_SRC api(" + (useGitee ? "gitee" : "github") + ") tag=" + tag);
+                Log.i("DYP", "UPDATE_SRC api(" + (useGitee ? "gitee" : "github") + ") tag=" + apiTag);
             } else {
                 why.append("api_fail ");
             }
@@ -4756,6 +4778,82 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         }}).start();
     }
 
+    /** 服务器下发的升级公告（JSON 对象）。
+     *
+     *  用途：v1.3.7.1 及以前的 parseVer 有 bug（只解析三段，把 v1.3.7.3 算成 10307，
+     *  小于自身的 103701），导致它们永远检测不到后续更新。新版已修正算法，
+     *  但已经装出去的旧版无法回头改，只能靠这条公告引导用户去 Gitee 手动更新一次。
+     *
+     *  version.json 里这样写：
+     *    "upgrade_notice": {
+     *      "title": "请更新到 v1.3.7.3",
+     *      "message": "……说明……",
+     *      "url": "https://gitee.com/adaaixianzun/dyparse/releases",
+     *      "until": 1030703,        // 当前 versionCode 小于这个值才弹（0 或缺省=不限）
+     *      "once": 1                // 1 = 同一个 versionCode 只弹一次
+     *    }
+     *
+     *  注意：这个方法只有装了「已修正版本」的 App 才会调用；对旧版无效。
+     */
+    void checkUpgradeNotice(String srvJson){
+        try{
+            int p = srvJson.indexOf("\"upgrade_notice\"");
+            if(p < 0) return;
+            // 取 upgrade_notice 这个对象的文本
+            int ob = srvJson.indexOf('{', p);
+            if(ob < 0) return;
+            int depth = 0, oe = -1;
+            for(int i = ob; i < srvJson.length(); i++){
+                char c = srvJson.charAt(i);
+                if(c == '{') depth++;
+                else if(c == '}'){ depth--; if(depth == 0){ oe = i; break; } }
+            }
+            if(oe < 0) return;
+            final String obj = srvJson.substring(ob, oe + 1);
+            final String nTitle = jget(obj, "title");
+            final String nMsg   = jget(obj, "message");
+            final String nUrl   = jget(obj, "url");
+            if(nMsg == null || nMsg.length() == 0) return;
+            String untilS = jnum(obj, "until");
+            int until = 0;
+            try{ if(untilS != null && untilS.length() > 0) until = (int) Double.parseDouble(untilS); }catch(Throwable t){}
+            final int cur = curVersionCode();
+            if(until > 0 && cur >= until){
+                Log.i("DYP", "UPGRADE_NOTICE skip cur=" + cur + " until=" + until);
+                return;
+            }
+            // 同一个 versionCode 只弹一次
+            final String spKey = "upg_notice_" + cur;
+            if(getSharedPreferences(SP, MODE_PRIVATE).getBoolean(spKey, false)){
+                Log.i("DYP", "UPGRADE_NOTICE already_shown cur=" + cur);
+                return;
+            }
+            Log.i("DYP", "UPGRADE_NOTICE show cur=" + cur + " until=" + until);
+            h.post(new Runnable(){ public void run(){
+                try{
+                    dypDlg()
+                        .setTitle(nTitle != null && nTitle.length() > 0 ? nTitle : "重要提示")
+                        .setMessage(nMsg)
+                        .setCancelable(true)
+                        .setPositiveButton("去更新", new android.content.DialogInterface.OnClickListener(){
+                            public void onClick(android.content.DialogInterface d, int w){
+                                openUrl(nUrl != null && nUrl.length() > 0
+                                    ? nUrl
+                                    : "https://gitee.com/adaaixianzun/dyparse/releases");
+                            }
+                        })
+                        .setNegativeButton("以后再说", null)
+                        .show();
+                    getSharedPreferences(SP, MODE_PRIVATE).edit().putBoolean(spKey, true).apply();
+                }catch(Throwable t){
+                    Log.i("DYP", "UPGRADE_NOTICE_ERR " + t);
+                }
+            }});
+        }catch(Throwable t){
+            Log.i("DYP", "UPGRADE_NOTICE_PARSE_ERR " + t);
+        }
+    }
+
     /** 三级都失败时的兜底弹窗：给手动入口，不粗暴报 HTTP 码 */
     void showUpdateFailDialog(){
         final String url = curReleasesUrl(this);
@@ -4767,7 +4865,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             + "\n当前更新源：" + platformName() + "\n"
             + "当前版本：" + versionName() + "\n\n"
             + "可打开发布页手动查看最新版本。";
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("检查更新失败")
             .setMessage(msg)
             .setPositiveButton("打开发布页", new android.content.DialogInterface.OnClickListener(){
@@ -4788,7 +4886,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     void showUpdSrcDialog(){
         final String[] labels = {"Gitee（国内快，推荐）", "GitHub（国际，可能需代理）"};
         int cur = isGitee(this) ? 0 : 1;
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("选择更新源")
             .setSingleChoiceItems(labels, cur, new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int which){
@@ -4908,17 +5006,34 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         }catch(Throwable t){ return "?"; }
     }
 
-    /** tag \u8f6c\u6570\u5b57\uff1av1.2.3 -> 10203\uff08\u4e24\u4f4d\u4e00\u6bb5\uff09 */
+    /** 解析版本号 → 与 Manifest 的 versionCode 使用同一套规则（每位占两位，预留空间）。
+     *
+     *  规则：major*1000000 + minor*10000 + patch*100 + sub
+     *    1.3.7   → 1030700
+     *    1.3.7.1 → 1030701
+     *    1.3.7.3 → 1030703
+     *    1.3.8   → 1030800   ← 三位版本也能正常递增
+     *    1.4.0   → 1040000
+     *    2.0.0   → 2000000
+     *
+     *  为什么不用老的 major*10000+minor*100+patch：
+     *    1.3.7.1 的 versionCode 已是 103701，而 1.3.8 按老规则只有 10308，
+     *    数值倒退会导致「装了 1.3.7.1 的用户永远收不到后续更新」。
+     */
     static int parseVer(String tag){
         if(tag == null) return 0;
         String t = tag.trim().toLowerCase();
         if(t.startsWith("v")) t = t.substring(1);
+        // 去掉可能带的 build 后缀等非版本内容
+        int dash = t.indexOf('-');
+        if(dash > 0) t = t.substring(0, dash);
         String[] parts = t.split("[.]");
-        int major = 0, minor = 0, patch = 0;
+        int major = 0, minor = 0, patch = 0, sub = 0;
         try{ if(parts.length > 0) major = Integer.parseInt(parts[0].replaceAll("[^0-9]", "")); }catch(Throwable e){}
         try{ if(parts.length > 1) minor = Integer.parseInt(parts[1].replaceAll("[^0-9]", "")); }catch(Throwable e){}
         try{ if(parts.length > 2) patch = Integer.parseInt(parts[2].replaceAll("[^0-9]", "")); }catch(Throwable e){}
-        return major * 10000 + minor * 100 + patch;
+        try{ if(parts.length > 3) sub   = Integer.parseInt(parts[3].replaceAll("[^0-9]", "")); }catch(Throwable e){}
+        return major * 1000000 + minor * 10000 + patch * 100 + sub;
     }
 
     /** \u4ece JSON \u5b57\u7b26\u4e32\u91cc\u53d6 \"key\":\"value\" */
@@ -4985,7 +5100,9 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             m.append("\n\n⚠ 此版本为强制更新（修复关键问题），必须更新后才能继续使用。");
         }
 
-        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+        // 必须用 dypDlg() 走 App 主题，否则 ColorOS 的 Theme.DeviceDefault
+        // 默认解析成深色，会出现「App 亮色但更新弹窗全黑」
+        android.app.AlertDialog.Builder b = dypDlg()
             .setTitle(force ? "需要更新（强制）" : "发现新版本")
             .setMessage(m.toString())
             .setCancelable(!force)
@@ -5170,7 +5287,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     /** 「安装未知应用」未授权时的引导弹窗 */
     void showInstallPermissionDialog(){
         pendingInstallApk = true;
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("需要安装权限")
             .setMessage("系统尚未允许本应用安装 APK。\n\n"
                 + "请在接下来的页面里找到「DY解析器」，打开「允许安装未知应用」，然后返回本应用，会自动继续安装。\n\n"
@@ -5196,7 +5313,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 
     /** 免责声明弹窗：必须同意才能用；5 秒倒计时后可点同意，不同意退出 */
     void showAgreementDialog(){
-        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        final android.app.AlertDialog dlg = dypDlg()
             .setTitle("用户协议与免责声明")
             .setMessage(
                 "1. 本软件全程免费，无任何收费项目；\n"
@@ -5289,7 +5406,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         tv.setTextIsSelectable(true);
         wrap.addView(tv);
 
-        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog dlg = dypDlg()
             .setTitle("关于")
             .setView(wrap)
             .setPositiveButton("关闭", null)
@@ -5550,7 +5667,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         sv.setLayoutParams(new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, maxH));
 
-        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog dlg = dypDlg()
             .setTitle("平台支持说明")
             .setView(sv)
             .setPositiveButton("代理设置", new android.content.DialogInterface.OnClickListener(){
@@ -5664,7 +5781,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 
     /** 节点体检：判断当前出口 IP 是否能拿到 TikTok 视频 */
     void showNetCheck(){
-        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        final android.app.AlertDialog dlg = dypDlg()
             .setTitle("节点体检")
             .setMessage("正在检测…")
             .setPositiveButton("关闭", null)
@@ -5891,7 +6008,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         btnWhy.setPadding(0, dp(10), 0, 0);
         wrap.addView(btnWhy);
 
-        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        final android.app.AlertDialog dlg = dypDlg()
             .setTitle("抖音访客凭据")
             .setView(new android.widget.ScrollView(this){{ addView(wrap); }})
             .setPositiveButton("保存", null)
@@ -5972,7 +6089,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         tip.setPadding(0, dp(10), 0, dp(4));
         wrap.addView(tip);
 
-        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog dlg = dypDlg()
             .setTitle("代理设置")
             .setView(wrap)
             .setPositiveButton("保存", null)
@@ -6083,7 +6200,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         lpSrv.topMargin = dp(10);
         wrap.addView(etSrv, lpSrv);
 
-        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog dlg = dypDlg()
             .setTitle("服务器地址")
             .setView(wrap)
             .setPositiveButton("保存", null)
@@ -6176,7 +6293,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(logBuf.isEmpty()) sb.append("（暂无日志）");
             else for(String l : logBuf) sb.append(l).append("\n");
         }
-        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog dlg = dypDlg()
             .setTitle("运行日志（最近 " + LOG_MAX + " 条）")
             .setMessage(sb.toString())
             .setPositiveButton("复制全部", new android.content.DialogInterface.OnClickListener(){
@@ -9535,7 +9652,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
 
     void showMiniSpeedDialog(){
         final String[] items = {"0.5X", "1.0X", "1.25X", "1.5X", "2.0X"};
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("\u64ad\u653e\u901f\u5ea6")
             .setSingleChoiceItems(items, miniSpeedIdx, new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int which){
@@ -9745,7 +9862,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             labels[i] = lb.toString();
         }
 
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("选择要下载的视频（共 " + n + " 个）")
             .setMultiChoiceItems(labels, sel,
                 new android.content.DialogInterface.OnMultiChoiceClickListener(){
@@ -10326,7 +10443,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
         if(liveN > 0) tip += "，" + liveN + " 张实况存到「动图」目录";
         tip += "\n实况存成 .jpg 实况照片，相册长按可播放";
 
-        new android.app.AlertDialog.Builder(this)
+        dypDlg()
             .setTitle("选择要下载的图片（" + tip + "）")
             .setMultiChoiceItems(labels, sel,
                 new android.content.DialogInterface.OnMultiChoiceClickListener(){
