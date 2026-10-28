@@ -2790,6 +2790,14 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 public void onClick(View v){ setBatchKeep(!batchKeepOn()); buildSettingsPage(); }});
 
         addSettingSection("下载路径");
+LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showStorageState(); }});
+        // 调试用：长按「存储写入检测」那一行可切换强制 MediaStore 兜底
+        try{
+            stRow.setOnLongClickListener(new View.OnLongClickListener(){
+                public boolean onLongClick(View v){ toggleForceScoped(); return true; }
+            });
+        }catch(Throwable t){}
         addSettingRow("视频目录", curDlDirLabel("视频"), new View.OnClickListener(){
             public void onClick(View v){ showDlDirDialog("视频", KEY_DL_VIDEO, "Download/DYParse/视频"); }});
         addSettingRow("图片目录", curDlDirLabel("图片"), new View.OnClickListener(){
@@ -2866,12 +2874,28 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
 
     // ================= 存储权限 =================
     static final int REQ_STORAGE = 1001;
+    /** 本次启动是否已经自动申请过存储权限（避免每次回前台都弹） */
+    volatile boolean permAskedThisLaunch = false;
 
     /** 下载/保存前调用：没权限就申请，返回 false 表示已发起申请需等待 */
     boolean ensureStoragePerm(){
         if(AppInfo.hasStoragePerm(this)) return true;
+
+        // 已被永久拒绝（Android 7 上系统不会再弹窗）→ 直接引导去设置页开
+        if(AppInfo.storagePermBlocked(this)){
+            DiagLog.w(DiagLog.M_PERM, "存储权限被永久拒绝 | API=" + android.os.Build.VERSION.SDK_INT
+                + " | 引导用户去系统设置");
+            showPermSettingsDialog();
+            return false;
+        }
+
         DiagLog.w(DiagLog.M_PERM, "缺少存储权限 | API=" + android.os.Build.VERSION.SDK_INT
             + " | 正在向用户申请 WRITE_EXTERNAL_STORAGE");
+        // 标记「已申请过」，供 storagePermBlocked 判断永久拒绝
+        try{
+            getSharedPreferences(SP, MODE_PRIVATE).edit()
+                .putBoolean("perm_storage_asked", true).apply();
+        }catch(Throwable t){}
         try{
             requestPermissions(new String[]{
                 android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
@@ -2881,6 +2905,42 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
             DiagLog.e(DiagLog.M_PERM, "申请存储权限失败 | " + t);
         }
         return false;
+    }
+
+    /** 权限被永久拒绝时的引导弹窗：教用户去系统设置里手动开启 */
+    void showPermSettingsDialog(){
+        StringBuilder m = new StringBuilder();
+        m.append("本应用需要「存储权限」才能把文件保存到手机。\n\n");
+        m.append("系统已经不再弹权限框了（之前被拒绝过），请手动开启：\n\n");
+        m.append("1. 点下面「去设置」\n");
+        m.append("2. 找到「存储」或「存储和相机」\n");
+        m.append("3. 选择「允许」\n");
+        m.append("4. 返回本应用重新点下载\n\n");
+        m.append("如果找不到开关，也可以到：\n");
+        m.append("系统设置 → 应用管理 → DY解析器 → 权限");
+        dypDlg()
+            .setTitle("需要存储权限")
+            .setMessage(m.toString())
+            .setPositiveButton("去设置", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    openAppSettings();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /** 跳到本应用的系统设置页（权限/存储都在这里） */
+    void openAppSettings(){
+        try{
+            android.content.Intent it = new android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            it.setData(android.net.Uri.parse("package:" + getPackageName()));
+            startActivity(it);
+        }catch(Throwable t){
+            Log.i("DYP", "OPEN_SETTINGS_ERR " + t);
+            showHintToast("无法打开设置，请手动到系统设置里开启存储权限");
+        }
     }
 
     @Override
@@ -3528,7 +3588,7 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
     }
 
     /** 设置页行 */
-    void addSettingRow(String title, String sub, View.OnClickListener l){
+    LinearLayout addSettingRow(String title, String sub, View.OnClickListener l){
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.VERTICAL);
         row.setPadding(dp(12), dp(10), dp(12), dp(10));
@@ -3551,6 +3611,7 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
         row.addView(s2);
         row.setOnClickListener(l);
         settingsWrap.addView(row);
+        return row;
     }
     void refreshHistory(){
         if(historyWrap == null || historyEmpty == null) return;
@@ -6216,7 +6277,16 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "· 自动播放开关无效（默认关闭时解析视频仍会自动播放）：render 视频分支写死 doPlay()\n"
              + "· 批量模式下主页判定误清空自己的结果：4 处主页入口无条件清空列表\n"
              + "· 页面在确认框弹出瞬间就抓完整页数据绕过确认：现改为确认期间拦截请求 + 丢弃页面数据，\n"
-             + "  确认后再主动发起签名翻页\n\n"
+             + "  确认后再主动发起签名翻页\n"
+             + "· 华为 P40 / Android 10 等系统下载失败（能播能听就是下不了）：\n"
+             + "  Manifest 缺 requestLegacyExternalStorage，Android 10 强制分区存储导致写不进公共目录。\n"
+             + "  已补该开关，并新增 MediaStore 兜底：目录不可写时先下到私有目录，\n"
+             + "  下完自动搬进「内部存储/Download/DYParse/<分类>/」，Android 8~17 全兼容。\n"
+             + "  设置页新增「存储写入检测」，可自查权限与目录可写状态\n"
+             + "· Android 7/8 下载崩溃：通知用了 API 26+ 才有的双参构造，低版本会 NoSuchMethodError\n"
+             + "  导致前台服务起不来。已按版本分开构造，Android 7 起可正常下载\n"
+             + "· Android 7 权限被拒后无法下载：系统不再弹窗。现改为启动时主动申请一次，\n"
+             + "  被永久拒绝时弹「需要存储权限」引导，可直接跳系统设置开启\n\n"
              + "──────────────\n"
              + "【v1.3.7.3】版本号算法重构 + 弹窗主题修复（重要）\n"
              + "修复\n"
@@ -10721,6 +10791,21 @@ boolean ttUrl = isTikTokUrl(curPlay);
         try{ h.postDelayed(new Runnable(){ public void run(){ autoFillFromClipboard(); }}, 350); }catch(Throwable t){}
         // 列表内如果有内容，回到前台时如果 listWrap 是空的（被系统回收）就补渲染
         try{ h.postDelayed(new Runnable(){ public void run(){ restoreListIfEmpty(); }}, 500); }catch(Throwable t){}
+        // 启动时主动申请存储权限：Android 7 及以下系统只弹一次，
+        // 等到用户点下载才申请容易错过（拒了就不再弹），所以进来自动要一次
+        try{
+            h.postDelayed(new Runnable(){ public void run(){
+                try{
+                    if(!AppInfo.hasStoragePerm(MainActivity.this)
+                            && !AppInfo.storagePermBlocked(MainActivity.this)
+                            && !permAskedThisLaunch){
+                        permAskedThisLaunch = true;
+                        Log.i("DYP", "PERM_AUTO_REQUEST API=" + android.os.Build.VERSION.SDK_INT);
+                        ensureStoragePerm();
+                    }
+                }catch(Throwable t){}
+            }}, 1200);
+        }catch(Throwable t){}
         // 从「安装未知应用」设置页返回且 APK 已就绪 → 自动继续安装
         if(pendingInstallApk){
             pendingInstallApk = false;
@@ -12064,6 +12149,68 @@ final String pfx;
         }}).start();
     }
 
+    /** 设置页「存储写入检测」的副标题 */
+    String storageStateLabel(){
+        try{
+            int sdk = android.os.Build.VERSION.SDK_INT;
+            boolean perm = AppInfo.hasStoragePerm(this);
+            boolean canWrite = ScopedStore.canWriteDir(new File(dlDirFor("视频")));
+            if(canWrite) return "正常 · 可直接写入公共下载目录";
+            if(perm) return "受限 · 将自动改存公共 Download（MediaStore）";
+            return "缺权限 · 点击授权";
+        }catch(Throwable t){ return "点击查看详情"; }
+    }
+
+    /** 存储写入详情弹窗（用户自查用，也方便反馈群里排查） */
+    void showStorageState(){
+        int sdk = android.os.Build.VERSION.SDK_INT;
+        String dir = dlDirFor("视频");
+        boolean perm = AppInfo.hasStoragePerm(this);
+        boolean canWrite = ScopedStore.canWriteDir(new File(dir));
+        boolean allFiles = AppInfo.hasAllFilesAccess(this);
+
+        StringBuilder m = new StringBuilder();
+        m.append("系统版本：Android ").append(sdk)
+         .append("（API ").append(sdk).append("）\n\n");
+        m.append("存储权限：").append(perm ? "已授权" : "未授权").append("\n");
+        if(sdk >= 30){
+            m.append("所有文件访问：").append(allFiles ? "已授权" : "未授权").append("\n");
+        }
+        m.append("目标目录：\n").append(dir).append("\n\n");
+        m.append("目录可写：").append(canWrite ? "是" : "否").append("\n\n");
+        if(canWrite){
+            m.append("下载会直接写入上面这个目录。");
+        }else{
+            m.append("检测到目录不可写。下载会自动改存到：\n");
+            m.append("内部存储/Download/DYParse/<分类>/\n");
+            m.append("（走系统媒体库 MediaStore，无需额外权限）\n\n");
+            m.append("如果连媒体库也失败，文件会留在应用私有目录，");
+            m.append("此时请到系统设置里给本应用开启存储权限。");
+        }
+
+        dypDlg()
+            .setTitle("存储写入检测")
+            .setMessage(m.toString())
+            .setPositiveButton("重新检测", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ showStorageState(); }
+            })
+            .setNeutralButton("申请权限", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    ensureStoragePerm();
+                }
+            })
+            .setNegativeButton("关闭", null)
+            .show();
+    }
+
+    /** 调试：长按「存储写入检测」切换强制走 MediaStore 兜底（验证 Android 10 等受限环境用） */
+    void toggleForceScoped(){
+        boolean cur = getSharedPreferences(SP, MODE_PRIVATE).getBoolean("force_scoped", false);
+        getSharedPreferences(SP, MODE_PRIVATE).edit().putBoolean("force_scoped", !cur).apply();
+        showHintToast(!cur ? "已强制走 MediaStore 兜底（测试模式）" : "已恢复正常写入");
+        buildSettingsPage();
+    }
+
     /** 下载根目录（兼容旧版：读旧 key 作为根，分类未填时用它/<分类>） */
     String dlRootDir(){
         String legacy = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DL_PATH, "");
@@ -12204,8 +12351,28 @@ final String pfx;
                     if(task.mixDir != null && task.mixDir.length() > 0){
                         catDir = new File(catDir, task.mixDir);
                     }
-                    if(!catDir.exists()) catDir.mkdirs();
-                    final File target = new File(catDir, name);
+                    // 分区存储兼容：目录不可写（Android 10+ 常见）时，
+                    // 先落到应用私有目录，下完再经 MediaStore 搬进公共 Download
+                    boolean dirWritable = ScopedStore.canWriteDir(catDir);
+                    // 测试开关：设置里有 force_scoped 时强制走 MediaStore 兜底（仅调试用）
+                    if(getSharedPreferences(SP, MODE_PRIVATE).getBoolean("force_scoped", false)){
+                        dirWritable = false;
+                        Log.i("DYP", "DL_FORCE_SCOPED 测试开关已开启");
+                    }
+                    File workDir = catDir;
+                    String relSub = task.cat;
+                    if(!dirWritable){
+                        workDir = new File(getCacheDir(), "dl_tmp");
+                        if(!workDir.exists()) workDir.mkdirs();
+                        Log.i("DYP", "DL_SCOPED_FALLBACK 目录不可写，改用私有临时目录: "
+                                + catDir.getAbsolutePath() + " -> " + workDir.getAbsolutePath());
+                        DiagLog.w(DiagLog.M_PERM, "下载目录不可写，走 MediaStore 兜底 | "
+                                + catDir.getAbsolutePath() + " | API=" + android.os.Build.VERSION.SDK_INT);
+                    }
+                    if(task.mixDir != null && task.mixDir.length() > 0){
+                        relSub = task.cat + "/" + task.mixDir;
+                    }
+                    final File target = new File(workDir, name);
                     lastCatDir[0] = catDir.getAbsolutePath();
 
                     s("下载中 " + idx + "/" + total + "：" + name);
@@ -12248,11 +12415,36 @@ final String pfx;
                     if(ok) okCount++; else failCount++;
                     // 关键：必须通知系统媒体库，否则文件在磁盘上但相册看不到
                     if(ok){
+                        File real = target;
+                        // 走了私有目录兜底：下完搬进公共 Download（MediaStore，Android 10+ 唯一可靠方式）
+                        if(!dirWritable){
+                            android.net.Uri mv = ScopedStore.saveToDownloads(
+                                    MainActivity.this, target, relSub, target.getName());
+                            if(mv != null){
+                                Log.i("DYP", "DL_SCOPED_MOVED " + target.getName() + " -> " + mv);
+                                try{ target.delete(); }catch(Throwable t){}
+                                try{ savedDirs.add(catDir.getAbsolutePath()); }catch(Throwable t){}
+                                // MediaStore 插入后系统已建档，不需要再 scanFile
+                                h.post(new Runnable(){ public void run(){
+                                    progSet(1f, "(" + fIdx + "/" + fTotal + ") 完成"); }});
+                                continue;
+                            }
+                            // MediaStore 也失败：文件留在私有目录，至少用户能在这里找到
+                            Log.i("DYP", "DL_SCOPED_FAIL 保留在私有目录 " + target.getAbsolutePath());
+                            DiagLog.e(DiagLog.M_PERM, "MediaStore 兜底失败，文件留在 "
+                                    + target.getAbsolutePath());
+                            try{ savedDirs.add(workDir.getAbsolutePath()); }catch(Throwable t){}
+                            h.post(new Runnable(){ public void run(){
+                                progSet(1f, "(" + fIdx + "/" + fTotal + ") 完成");
+                                showHintToast("公共目录写入受限，文件已存到应用私有目录");
+                            }});
+                            continue;
+                        }
                         // 图片下载后按真实文件头修正后缀：抖音/快手给的是 WEBP，
                         // 存成 .jpg 会让部分相册打不开。
-                        File real = fixImageExt(target);
+                        real = fixImageExt(target);
                         scanMedia(real);
-                        // 记录实际落盘目录（完整路径）
+// 记录实际落盘目录（完整路径）
                         try{ savedDirs.add(real.getParentFile().getAbsolutePath()); }catch(Throwable t){}
                     }
                     h.post(new Runnable(){ public void run(){ progSet(1f, "(" + fIdx + "/" + fTotal + ") 完成"); }});
