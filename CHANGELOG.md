@@ -74,6 +74,36 @@
 
 ### 修复
 
+- **Android 7/8 下载崩溃（NoSuchMethodError）**
+  - 根因：`DownloadService` 用了 `new Notification.Builder(this, CHANNEL_ID)`，
+    双参构造是 **API 26+** 才有。Android 7.x（API 24/25）会抛 `NoSuchMethodError`，
+    前台服务起不来 → 下载队列直接崩。
+  - 修法：按 `SDK_INT >= 26` 分别构造（低版本用单参 `new Notification.Builder(this)`）。
+  - 顺带修 `InnerDownloader.headOk()` 里的 `getContentLengthLong()`（API 24+），
+    低版本改用 `getContentLength()`。
+- **Android 7 权限被拒后彻底无法下载**
+  - 根因：Android 7 上权限被拒绝一次后系统不再弹窗，用户点下载完全没反应，也不知道去哪开。
+  - 修法一：App 启动 1.2 秒后主动申请一次存储权限（每次启动只申请一次），不用等点下载。
+  - 修法二：新增 `AppInfo.storagePermBlocked()` 判断永久拒绝
+    （`shouldShowRequestPermissionRationale == false` 且申请过）。
+  - 修法三：被永久拒绝时弹「需要存储权限」引导弹窗，带「去设置」直接跳系统应用详情页，
+    并写明操作步骤（存储 → 允许 → 返回重试）。
+- **华为 P40 / Android 10 等系统下载失败（能播能听、就是下不了）**
+  - 根因：Manifest 缺 `android:requestLegacyExternalStorage="true"`。
+    Android 10（API 29）只要有 `targetSdk>=29` 就强制分区存储，
+    此时 `WRITE_EXTERNAL_STORAGE` 不再允许直接写 `/sdcard/Download/...`，
+    `mkdirs()` / 文件落盘全部失败，表现为「播放正常（走网络流）但下载失败」。
+  - 修法一：Manifest 加 `requestLegacyExternalStorage="true"`，
+    `WRITE_EXTERNAL_STORAGE` 加 `maxSdkVersion="29"`，Android 10 恢复传统写入。
+  - 修法二（兜底，覆盖 Android 11~17）：新增 `ScopedStore`，
+    下载前用 `canWriteDir()` 探测目标目录；不可写就先落到应用私有目录
+    `cache/dl_tmp`，下完经 **MediaStore** 搬进公共 `Download/DYParse/<分类>/`。
+    实测日志：`DL_SCOPED_FALLBACK` → `SCOPED_SAVE_OK` → `DL_SCOPED_MOVED`。
+  - 修法三：MediaStore 也失败时，文件保留在私有目录并提示用户；
+    `AppInfo.hasStoragePerm()` 修正 Android 10 判定（原先 >=30 一律返回 true）。
+  - 新增设置页「存储写入检测」：显示系统版本、权限状态、目标目录、目录是否可写，
+    并提供「申请权限 / 重新检测」。用户反馈问题时可据此自查。
+  - 长按「存储写入检测」可切换强制兜底（调试用，验证 MediaStore 通道）。
 - **批量解析最后一条永不渲染**（列表空但「清空列表」说有 4 条记录）
   - 根因：`batchItemFinished()` 里 `if(curNo >= total) return;` 让最后一条直接返回，
     永远进不了 `runNextBatch()` 的结束分支，导致 `BATCH_DONE` + `renderBatchList()` 永不执行
