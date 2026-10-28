@@ -420,15 +420,53 @@ static final String GH_REPO  = "仓库名";
 
 ### 版本号规则
 
-`v1.2.3` 会被解析成 `10203`，与 `versionCode` 比对：
+> **v1.3.7.3 起规则变更（重要）**
+>
+> 老规则 `major*10000 + minor*100 + patch` 有致命缺陷：`1.3.7.1` 的 `versionCode` 是 `103701`，
+> 而 `1.3.8` 按老规则只有 `10308`，**数值倒退**，导致装过 `1.3.7.1` 的用户永远收不到后续更新。
+>
+> 新规则每段占两位，给每段留出 100 的空间：
 
-```
-versionCode = major*10000 + minor*100 + patch
+```text
+versionCode = major*1000000 + minor*10000 + patch*100 + sub
 ```
 
-所以 `versionName="1.2.3"` 必须配 `versionCode="10203"`。
+| versionName | versionCode |
+|---|---|
+| 1.3.7 | 1030700 |
+| 1.3.7.1 | 1030701 |
+| 1.3.7.3 | 1030703 |
+| 1.3.8 | 1030800 |
+| 1.3.10 | 1031000 |
+| 1.4.0 | 1040000 |
+| 2.0.0 | 2000000 |
+
+三位、四位版本都能正常递增，不会再出现数值倒退。
 
 > 注意：只有 `versionCode` 大于用户当前版本时才会提示更新。
+>
+> **老版本兼容说明**：`v1.3.6` 及以前、`v1.3.7` 的用户，其 App 内 `parseVer` 是旧算法，
+> 但它们仍能检测到 `v1.3.7.3`（旧算法把 `v1.3.7.3` 算成 `10307`，大于它们自己的 `10306`/`10307`）。
+> 只有 `v1.3.7.1` 和 `v1.3.7.2` 这两个版本因自身 `versionCode` 过大（`103701`/`103702`）无法自动检测，
+> 需要手动到发布页下载一次，覆盖安装不丢数据。
+
+### 服务器下发升级公告
+
+`version.json` 支持 `upgrade_notice` 字段，用于给老版本推送公告：
+
+```json
+"upgrade_notice": {
+  "title": "请手动更新到 v1.3.7.3",
+  "message": "……说明正文……",
+  "url": "https://gitee.com/adaaixianzun/dyparse/releases",
+  "until": 1030703
+}
+```
+
+- `until`：当前 `versionCode` 小于它才弹；设 `0` 或缺省表示不限版本。
+- 同一个 `versionCode` 只弹一次（存在 SharedPreferences，键名 `upg_notice_<versionCode>`）。
+- 只在自建服务器（源 0）返回的 `version.json` 里生效，不走 Gitee / GitHub。
+
 
 ## 已知限制
 
