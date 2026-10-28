@@ -312,7 +312,13 @@ public class InnerDownloader {
             uc.setReadTimeout(8000);
             uc.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) DYParse");
             int code = uc.getResponseCode();
-            long len = uc.getContentLengthLong();
+            // getContentLengthLong 是 API 24+，低版本用 getContentLength
+            long len;
+            if(android.os.Build.VERSION.SDK_INT >= 24){
+                len = uc.getContentLengthLong();
+            }else{
+                len = uc.getContentLength();
+            }
             return code >= 200 && code < 400 && (len <= 0 || len > 100000);
         }catch(Throwable t){
             return false;
