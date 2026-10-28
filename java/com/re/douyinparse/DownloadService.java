@@ -55,12 +55,23 @@ public class DownloadService extends Service {
     @Override public IBinder onBind(Intent intent){ return null; }
 
     Notification buildNotification(String text){
-        Notification.Builder b = new Notification.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("DYParse 下载")
-                .setContentText(text)
-                .setOngoing(true)
-                .setProgress(0, 0, true);   // 不确定进度
-        return b.build();
+        // 注意：new Notification.Builder(ctx, channelId) 双参构造是 API 26+ 才有的，
+        // Android 7/8（API 24/25/26 以下）会抛 NoSuchMethodError 导致前台服务起不来、下载失败。
+        // 所以按版本分别构造。
+        Notification.Builder b;
+        if(android.os.Build.VERSION.SDK_INT >= 26){
+            b = new Notification.Builder(this, CHANNEL_ID);
+        }else{
+            b = new Notification.Builder(this);
+        }
+        b.setSmallIcon(android.R.drawable.stat_sys_download)
+         .setContentTitle("DYParse 下载")
+         .setContentText(text)
+         .setOngoing(true)
+         .setProgress(0, 0, true);   // 不确定进度
+        if(android.os.Build.VERSION.SDK_INT >= 16){
+            return b.build();
+        }
+        return b.getNotification();
     }
 }
