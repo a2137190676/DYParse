@@ -2789,6 +2789,19 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             new View.OnClickListener(){
                 public void onClick(View v){ setBatchKeep(!batchKeepOn()); buildSettingsPage(); }});
 
+        addSettingSection("后台保活（下载不中断）");
+        addSettingRow("电池优化白名单", PowerHelper.stateLabel(this),
+            new View.OnClickListener(){
+                public void onClick(View v){ showBackgroundTips(); }});
+        addSettingRow("厂商后台限制", PowerHelper.deviceLabel() + " · 自启动/后台运行管理",
+            new View.OnClickListener(){
+                public void onClick(View v){
+                    String r = PowerHelper.openOemBackgroundSettings(MainActivity.this);
+                    Log.i("DYP", "OEM_SETTINGS_OPEN " + r);
+                    showHintToast("请在列表里把本应用设为「允许后台运行」");
+                    DiagLog.i(DiagLog.M_APP, "打开厂商后台设置 | " + PowerHelper.deviceLabel() + " | " + r);
+                }});
+
         addSettingSection("下载路径");
 LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), new View.OnClickListener(){
             public void onClick(View v){ showStorageState(); }});
@@ -2876,6 +2889,8 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
     static final int REQ_STORAGE = 1001;
     /** 本次启动是否已经自动申请过存储权限（避免每次回前台都弹） */
     volatile boolean permAskedThisLaunch = false;
+    /** 本次启动是否已经弹过后台保活提示（避免 onResume 反复弹） */
+    volatile boolean bgTipShown = false;
 
     /** 下载/保存前调用：没权限就申请，返回 false 表示已发起申请需等待 */
     boolean ensureStoragePerm(){
@@ -6257,6 +6272,12 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         return
             "【v1.3.7.4】批量解析重构：静默解析 + 结果进列表 + 退出重进可恢复\n"
              + "新增\n"
+             + "· 后台保活设置：设置 → 后台保活（下载不中断）\n"
+             + "  · 电池优化白名单：一键调起系统框，点「允许」后下载不会被省电策略限制\n"
+             + "  · 厂商后台限制：按机型直达「自启动 / 后台运行管理」页面\n"
+             + "    （华为/荣耀/小米/红米/OPPO/一加/真我/vivo/iQOO/魅族/华硕/三星）\n"
+             + "  · 首次启动会弹一次引导，已放行的设备不弹\n"
+             + "  · 这类设置属系统权限，App 不能替用户改，只能引导跳转\n"
              + "· 更新源可自由切换：设置 → 更新源（Gitee / GitHub）\n"
              + "· GitHub 访问方式（设置 → GitHub 访问方式）：镜像加速 / 直连\n"
              + "  · 镜像加速会自动从 4 个公开镜像里挑可用的，全部失效时自动回退直连\n"
@@ -10816,6 +10837,39 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 }catch(Throwable t){}
             }}, 1200);
         }catch(Throwable t){}
+        // 后台保活提示：只提一次（用户拒绝过就不再烦），下载中断是高频客诉
+        try{
+            h.postDelayed(new Runnable(){ public void run(){
+                try{
+                    if(bgTipShown) return;
+                    bgTipShown = true;
+                    boolean asked = getSharedPreferences(SP, MODE_PRIVATE)
+                            .getBoolean("bg_tip_asked", false);
+                    if(asked) return;
+                    if(android.os.Build.VERSION.SDK_INT < 23) return;
+                    if(PowerHelper.isIgnoringBattery(MainActivity.this)) return;   // 已放行，不用提
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                            .putBoolean("bg_tip_asked", true).apply();
+                    Log.i("DYP", "BG_TIP_SHOW API=" + android.os.Build.VERSION.SDK_INT);
+                    dypDlg()
+                        .setTitle("让下载在后台不中断")
+                        .setMessage("手机的省电策略会在后台限制本应用，"
+                            + "常见表现是「下载到一半突然停了」。\n\n"
+                            + "给本应用加个白名单就不会被这样限制：\n"
+                            + "· 点「去设置」→ 在系统弹框里选「允许」\n\n"
+                            + "之后如果还断，多半是厂商的「自启动 / 后台运行管理」没开，"
+                            + "可以到「设置 → 后台保活」里一键跳转。")
+                        .setPositiveButton("去设置", new android.content.DialogInterface.OnClickListener(){
+                            public void onClick(android.content.DialogInterface d, int w){
+                                PowerHelper.requestIgnoreBattery(MainActivity.this);
+                                DiagLog.i(DiagLog.M_APP, "首次引导：申请忽略电池优化");
+                            }
+                        })
+                        .setNegativeButton("以后再说", null)
+                        .show();
+                }catch(Throwable t){}
+            }}, 2200);
+        }catch(Throwable t){}
         // 从「安装未知应用」设置页返回且 APK 已就绪 → 自动继续安装
         if(pendingInstallApk){
             pendingInstallApk = false;
@@ -12157,6 +12211,59 @@ final String pfx;
                 try{ if(tmp != null) tmp.delete(); }catch(Throwable t){}
             }
         }}).start();
+    }
+
+    /** 后台保活引导：说明为什么会被杀 + 一键申请白名单 */
+    void showBackgroundTips(){
+        final boolean ok = PowerHelper.isIgnoringBattery(this);
+        StringBuilder m = new StringBuilder();
+        m.append("机型：").append(PowerHelper.deviceLabel()).append("\n");
+        m.append("系统：Android ").append(android.os.Build.VERSION.SDK_INT).append("\n\n");
+        m.append("当前状态：").append(ok ? "✅ 已放行" : "⚠ 未放行").append("\n\n");
+        if(ok){
+            m.append("系统不会因为省电策略限制本应用，下载可以正常在后台继续。\n\n");
+            m.append("如果下载仍然会断，多半是厂商的「自启动 / 后台运行管理」还没开，");
+            m.append("请点下面「厂商后台设置」手动放行。");
+        }else{
+            m.append("手机的省电策略会在后台限制甚至杀掉本应用，表现就是");
+            m.append("「下载到一半突然停了」。\n\n");
+            m.append("给本应用加白名单后就不会被这样限制。\n\n");
+            m.append("【推荐做法】点下面「加入白名单」，在弹出的系统框里选「允许」。\n\n");
+            m.append("【找不到选项时】手动操作：\n");
+            m.append("系统设置 → 电池 → 电池优化 → 找到本应用 → 选「不限制 / 不优化」\n\n");
+            m.append("华为/小米/OPPO/vivo 等还有独立的「应用启动管理」，");
+            m.append("需要把本应用设为「允许后台运行」「允许自启动」。");
+        }
+        dypDlg()
+            .setTitle("后台保活设置")
+            .setMessage(m.toString())
+            .setPositiveButton(ok ? "厂商后台设置" : "加入白名单",
+                new android.content.DialogInterface.OnClickListener(){
+                    public void onClick(android.content.DialogInterface d, int w){
+                        if(ok){
+                            String r = PowerHelper.openOemBackgroundSettings(MainActivity.this);
+                            Log.i("DYP", "OEM_SETTINGS_OPEN " + r);
+                            showHintToast("把本应用设为「允许后台运行」");
+                        }else{
+                            PowerHelper.requestIgnoreBattery(MainActivity.this);
+                            DiagLog.i(DiagLog.M_APP, "申请忽略电池优化 | " + PowerHelper.deviceLabel());
+                        }
+                    }
+                })
+            .setNeutralButton(ok ? "重新检测" : "厂商后台设置",
+                new android.content.DialogInterface.OnClickListener(){
+                    public void onClick(android.content.DialogInterface d, int w){
+                        if(ok){
+                            showBackgroundTips();
+                        }else{
+                            String r = PowerHelper.openOemBackgroundSettings(MainActivity.this);
+                            Log.i("DYP", "OEM_SETTINGS_OPEN " + r);
+                            showHintToast("把本应用设为「允许后台运行」");
+                        }
+                    }
+                })
+            .setNegativeButton("关闭", null)
+            .show();
     }
 
     /** 设置页「存储写入检测」的副标题 */
