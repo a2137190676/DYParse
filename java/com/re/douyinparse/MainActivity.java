@@ -3821,6 +3821,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(label != null && progressLabel != null) progressLabel.setText(label);
         }});
         Log.i("DYP", "PROG " + (p / 10) + "% " + label);
+        // 通知栏同步：让后台下载时进度条/文字都能看到实时状态
+        try{
+            DownloadService.updateProgress("DYParse 下载 " + (p / 10) + "%", label, p / 10);
+        }catch(Throwable t){}
     }
     void progHide(){
         h.post(new Runnable(){ public void run(){
@@ -6286,7 +6290,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "· Android 7/8 下载崩溃：通知用了 API 26+ 才有的双参构造，低版本会 NoSuchMethodError\n"
              + "  导致前台服务起不来。已按版本分开构造，Android 7 起可正常下载\n"
              + "· Android 7 权限被拒后无法下载：系统不再弹窗。现改为启动时主动申请一次，\n"
-             + "  被永久拒绝时弹「需要存储权限」引导，可直接跳系统设置开启\n\n"
+             + "  被永久拒绝时弹「需要存储权限」引导，可直接跳系统设置开启\n"
+             + "· 后台下载几分钟就断 + 通知栏进度不同步（本次重点修复）：\n"
+             + "  · 读超时 30 秒太短，后台限流就断 → 改为 90 秒\n"
+             + "  · 重试 3 次无间隔 → 改为 6 次 + 递增退避（1/2/3/5/8 秒）\n"
+             + "  · 文件名带时间戳导致 .part 永远匹配不上，续传形同虚设 → 改为稳定文件名\n"
+             + "  · 失败后 .part 被删 → 改为保留，重新点下载自动接着传\n"
+             + "  · 通知栏从静态文字改为实时进度 + 速度（如 1.8MB/s），结束显示成功/失败数\n\n"
              + "──────────────\n"
              + "【v1.3.7.3】版本号算法重构 + 弹窗主题修复（重要）\n"
              + "修复\n"
@@ -12304,13 +12314,10 @@ final String pfx;
 
     /** 串行消费下载队列，进度条显示 第N个/总数 */
     void runDownloadQueue(){
-        // 前台服务：切后台继续下载（WakeLock + 通知栏占位）
+        // 前台服务：切后台继续下载（WakeLock + 通知栏实时进度）
         try{
-            if(android.os.Build.VERSION.SDK_INT >= 26){
-                startForegroundService(new android.content.Intent(this, DownloadService.class));
-            } else {
-                startService(new android.content.Intent(this, DownloadService.class));
-            }
+            DownloadService.markStart(this);
+            DownloadService.updateProgress("DYParse 下载", "准备中…", -1);
         }catch(Throwable t){
             Log.i("DYP", "DL_SERVICE_ERR " + t);
         }
@@ -12331,8 +12338,8 @@ final String pfx;
 
                     String name;
                     if(task.nameBase.length() > 0){
-                        // 合集：标题_第N集_时间戳.mp4
-                        name = task.nameBase + "_" + System.currentTimeMillis() + "." + task.ext;
+                        // 合集：标题_第N集.mp4（不加时间戳，保证 .part 能匹配上做续传）
+                        name = task.nameBase + "." + task.ext;
                     } else {
                         // 前缀按「当前解析的平台」判定：X/YouTube 的媒体走服务器中转，
                         // 光看下载 URL 会误判成 dy_，所以同时看 curUrl。
@@ -12342,9 +12349,24 @@ final String pfx;
                         else if(isXDomain(task.url) || isXDomain(curUrl)) pfx = "x_";
                         else if(YtParser.isYtUrl(task.url) || YtParser.isYtUrl(curUrl)) pfx = "yt_";
                         else if(BiliParser.isBiliUrl(task.url) || BiliParser.isBiliUrl(curUrl)
-                                || task.url.indexOf("bilivideo.com") >= 0) pfx = "bl_";
+|| task.url.indexOf("bilivideo.com") >= 0) pfx = "bl_";
                         else pfx = "dy_";
-                        name = pfx + curId + "_" + task.tag + "_" + System.currentTimeMillis() + "." + task.ext;
+                        // 关键：文件名必须稳定（不带时间戳），否则每次下载生成新名字，
+                        // 旧的 .part 永远匹配不上，断点续传等于失效。
+                        // 同一作品同一角标重复下载 → 直接覆盖/续传，这也是用户期望的行为。
+                        name = pfx + curId + "_" + task.tag + "." + task.ext;
+                        // 重名且已有完整文件时，加 _2/_3 后缀避免覆盖用户已下好的文件
+                        File catDirTmp = new File(dlDirFor(task.cat));
+                        if(task.mixDir != null && task.mixDir.length() > 0){
+                            catDirTmp = new File(catDirTmp, task.mixDir);
+                        }
+                        File probe = new File(catDirTmp, name);
+                        int dup = 2;
+                        while(probe.exists() && probe.length() > 0 && dup < 100){
+                            name = pfx + curId + "_" + task.tag + "_" + dup + "." + task.ext;
+                            probe = new File(catDirTmp, name);
+                            dup++;
+                        }
                     }
                     // 分类下载目录：分类自定义 > 根目录/分类；合集再加专属子文件夹
                     File catDir = new File(dlDirFor(task.cat));
@@ -12374,6 +12396,8 @@ final String pfx;
                     }
                     final File target = new File(workDir, name);
                     lastCatDir[0] = catDir.getAbsolutePath();
+                    // 速度采样状态：[0]=上次采样时间ms，[1]=上次采样的字节数
+                    final long[] speedState = new long[]{ System.currentTimeMillis(), 0L };
 
                     s("下载中 " + idx + "/" + total + "：" + name);
                     Log.i("DYP", "DL_START " + idx + "/" + total + " " + name);
@@ -12395,10 +12419,23 @@ final String pfx;
                             }
                             @Override public void onProgress(long done, long tot){
                                 float r = tot > 0 ? (float)((double) done / tot) : 0f;
-                                progSet(r, String.format(Locale.US, "(%d/%d) 下载中  %s / %s",
+                                // 速度计算：按 1 秒窗口采样，通知栏能看出是否在动
+                                String spd = "";
+                                long nowMs = System.currentTimeMillis();
+                                if(nowMs - speedState[0] >= 1000){
+                                    long dBytes = done - speedState[1];
+                                    long dMs = nowMs - speedState[0];
+                                    if(dMs > 0 && dBytes >= 0){
+                                        double bps = dBytes * 1000.0 / dMs;
+                                        spd = "  " + InnerDownloader.sizeText((long) bps) + "/s";
+                                    }
+                                    speedState[0] = nowMs;
+                                    speedState[1] = done;
+                                }
+                                progSet(r, String.format(Locale.US, "(%d/%d) 下载中  %s / %s%s",
                                         fIdx, fTotal,
                                         InnerDownloader.sizeText(done),
-                                        tot > 0 ? InnerDownloader.sizeText(tot) : "?"));
+                                        tot > 0 ? InnerDownloader.sizeText(tot) : "?", spd));
                             }
                             @Override public void onDone(boolean ok2, File out, String msg){
                                 Log.i("DYP", "DL_END " + fIdx + "/" + fTotal + " ok=" + ok2 + " " + msg);
@@ -12454,9 +12491,18 @@ final String pfx;
             }finally{
                 final int fo = okCount, ff = failCount;
                 dlRunning = false;
-                // 队列结束：停前台服务，通知栏图标消失
-                try{ stopService(new android.content.Intent(MainActivity.this, DownloadService.class)); }
-                catch(Throwable t){}
+                // 队列结束：更新通知栏为最终状态再收起（有失败时提示可「继续下载」）
+                try{
+                    if(ff > 0){
+                        DownloadService.updateProgress("DYParse 下载",
+                            fo + " 成功 / " + ff + " 失败（可重新点下载续传）", 100);
+                        Thread.sleep(600);   // 让用户看到结果
+                    }else if(fo > 0){
+                        DownloadService.updateProgress("DYParse 下载", "全部完成 " + fo + " 个文件", 100);
+                        Thread.sleep(400);
+                    }
+                    DownloadService.markStop(MainActivity.this, null);
+                }catch(Throwable t){}
                 // 汇总本次下载实际落盘的目录（去重，保持顺序）
                 final java.util.LinkedHashSet<String> dirSet =
                         new java.util.LinkedHashSet<String>(savedDirs);
@@ -12485,6 +12531,24 @@ final String pfx;
                         // X 的 CDN（video/pbs.twimg.com）在国内常被 DNS 污染，
                         // 解析能成功但下载连不上，这里明确告诉用户怎么办。
                         showHintToast("X 媒体直连失败，请开启代理后重试下载");
+                    }
+                    // 有失败时：告诉用户 .part 已保留，重新点下载会接着下（不用从头）
+                    if(ff > 0){
+                        long keptBytes = 0;
+                        try{
+                            java.io.File[] fs = new java.io.File(lastCatDir[0]).listFiles();
+                            if(fs != null){
+                                for(java.io.File f : fs){
+                                    if(f.getName().endsWith(".part") && f.length() > 0) keptBytes += f.length();
+                                }
+                            }
+                        }catch(Throwable t){}
+                        if(keptBytes > 1024){
+                            sb.append("\n\n已保留 ").append(InnerDownloader.sizeText(keptBytes))
+                              .append(" 断点数据，重新点「下载」会接着传（不用从头）");
+                            s(sb.toString());
+                            showHintToast("已保留断点，重新点下载可续传");
+                        }
                     }
                     if(ff == 0 && !dirSet.isEmpty()){
                         showHintToast("已保存到 " + dirSet.iterator().next());
