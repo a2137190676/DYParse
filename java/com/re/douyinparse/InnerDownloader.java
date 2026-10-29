@@ -43,12 +43,25 @@ public class InnerDownloader {
 
     public static boolean fetch(String url, File target, Cb cb, Object ttSessionObj, android.content.Context ctx){
         // 断点续传 + 重试：大文件（YouTube 4K 等）经服务器中转容易中途断。
-        // 保留 .part 文件，重连时带 Range 从断点继续，最多 3 次。
+        // 保留 .part 文件，重连时带 Range 从断点继续。
+        // 2026-10 加强：后台被杀/网络抖动导致断流的场景，原来只 3 次且无退避，
+        // 现改为最多 6 次 + 递增等待（1/2/3/5/8 秒），配合 .part 能接着下。
         File part = new File(target.getAbsolutePath() + ".part");
-        for(int attempt = 1; attempt <= 3; attempt++){
+        int maxAttempt = 6;
+        for(int attempt = 1; attempt <= maxAttempt; attempt++){
             boolean done = fetchOnce(url, target, part, cb, ttSessionObj, ctx);
             if(done) return true;
-            Log.i(TAG, "IDL_RETRY attempt=" + attempt + " keep=" + (part.exists() ? part.length() : 0));
+            long kept = part.exists() ? part.length() : 0;
+            Log.i(TAG, "IDL_RETRY attempt=" + attempt + "/" + maxAttempt + " keep=" + kept);
+            if(cb != null && attempt < maxAttempt){
+                try{ cb.onProgress(kept, -1); }catch(Throwable t){}
+            }
+            // 退避等待：网络刚断时立刻重连大概率还是失败
+            if(attempt < maxAttempt){
+                long wait = attempt <= 2 ? attempt * 1000L
+                          : (attempt == 3 ? 3000L : (attempt == 4 ? 5000L : 8000L));
+                try{ Thread.sleep(wait); }catch(Throwable t){}
+            }
         }
         // 服务器到期降级：B 站 / IG 中转下载失败 → 解 src/code 参数回退源站直连
         String fallback = extractFallbackDirect(url);
@@ -58,7 +71,8 @@ public class InnerDownloader {
             boolean done = fetchOnce(fallback, target, part, cb, ttSessionObj, ctx);
             if(done) return true;
         }
-        try{ if(part.exists()) part.delete(); }catch(Throwable t){}
+        // 注意：这里【不删】.part，留给「继续下载」用（下次同一个 URL 会接着下）
+        Log.i(TAG, "IDL_GIVEUP keep.part=" + (part.exists() ? part.length() : 0));
         return false;
     }
 
@@ -168,8 +182,11 @@ public class InnerDownloader {
                         c.setConnectTimeout(30000);
                         c.setReadTimeout(300000);
                     } else {
-                        c.setConnectTimeout(15000);
-                        c.setReadTimeout(30000);
+                        // 普通 CDN：
+                        // - 连接 20 秒（弱网抖动留余量）
+                        // - 读 90 秒（后台时系统会限流，30 秒太容易在慢速时被掐断）
+                        c.setConnectTimeout(20000);
+                        c.setReadTimeout(90000);
                     }
                     c.connect();
                 }
