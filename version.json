@@ -1,14 +1,14 @@
 {
-  "tag": "v1.3.7.5",
-  "name": "v1.3.7.5",
-  "body": "## v1.3.7.5 画质大升级：支持抖音原画（最高 8K）\n\n### 新增\n- 抖音原画下载：可直接拿到平台原始画质，实测 8K / 4K，单条体积可达数 GB\n- 播放器控制栏自动隐藏：小窗和全屏统一，点一下出现，几秒后自动收起\n- 不支持的链接会给出友好提示，不再弹出技术报错\n\n### 优化\n- 抖音画质档位识别更准，优先选分辨率最高的一档\n- 原画下载自动用正确文件格式保存，避免播放器打不开\n- 播放小窗点击响应更灵敏，点画面任意位置都能唤出进度条\n\n### 修复\n- 部分视频有声音没画面（设备不支持原画编码时自动降级到兼容档）\n- 图文、实况图解析后提示解析失败、图片加载不出来\n- 小窗进度条点了不显示、显示了不会自动隐藏\n- 全屏播放器控制栏不自动隐藏\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.5/DYParse-v1.3.7.5.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.5/DYParse-v1.3.7.5.apk",
+  "tag": "v1.3.7.6",
+  "name": "v1.3.7.6",
+  "body": "## v1.3.7.6 修复直链画质：复制到浏览器下载也能拿到 4K\n\n### 优化\n- 解析结果新增【原画直链】，放在最前面，复制第一条就是最高画质\n- 【视频直链】标注实际画质，不再让人误以为能下 4K\n- 原画直链旁附说明：改成 ratio=1080p 即为通用 1080p 版\n\n### 修复\n- 从 App 复制直链到浏览器下载，拿到的只有 720P，不是 4K\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.6/DYParse-v1.3.7.6.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.6/DYParse-v1.3.7.6.apk",
   "released": "2026-10-30",
   "upgrade_notice": {
     "title": "发现新版本",
-    "message": "v1.3.7.5 已发布：支持抖音原画（最高 8K），播放器控制栏自动隐藏，修复图文/实况图解析失败。",
+    "message": "v1.3.7.6 已发布：修复复制直链只有 720P 的问题，新增原画直链可直接下载 4K。",
     "url": "https://gitee.com/adaaixianzun/dyparse/releases",
-    "until": 1030705
+    "until": 1030706
   }
 }
