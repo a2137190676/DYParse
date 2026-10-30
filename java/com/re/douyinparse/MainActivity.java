@@ -6448,28 +6448,20 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v1.3.7.5】画质大升级：支持抖音原画（最高 8K）\n"
-             + "新增\n"
-             + "· 抖音原画下载：可直接拿到平台原始画质（实测 8K / 4K，体积可达数 GB）\n"
-             + "· 播放器控制栏自动隐藏：小窗和全屏都是点一下出现，几秒后自动收起\n"
-             + "· 不支持的链接会给出友好提示，不再弹出技术报错\n"
+            "【v1.3.7.6】修复直链画质：复制到浏览器下载也能拿到 4K\n"
              + "优化\n"
-             + "· 抖音画质档位识别更准，优先选分辨率最高的一档\n"
-             + "· 原画下载自动用正确文件格式保存，避免播放器打不开\n"
-             + "· 播放小窗点击响应更灵敏，点画面任意位置都能唤出进度条\n"
+             + "· 解析结果新增【原画直链】，放最前面，复制第一条就是最高画质\n"
+             + "· 【视频直链】标注实际画质，不再让人误以为能下 4K\n"
+             + "· 原画直链旁附说明：改成 ratio=1080p 即为通用 1080p 版\n"
              + "修复\n"
-             + "· 部分视频有声音没画面（设备不支持原画编码时自动降级到兼容档）\n"
-             + "· 图文、实况图解析后提示解析失败、图片加载不出来\n"
-             + "· 小窗进度条点了不显示、显示了不会自动隐藏\n"
-             + "· 全屏播放器控制栏不自动隐藏\n"
+             + "· 从 App 复制直链到浏览器下载，拿到的只有 720P，不是 4K\n"
              + "\n"
              + "【历史版本】\n"
+             + "v1.3.7.5：支持抖音原画（最高 8K）、播放器控制栏自动隐藏、修复图文/实况图解析失败\n"
              + "v1.3.7.4：批量解析重构，静默执行、结果进列表、退出重进可恢复\n"
              + "· 后台保活设置、更新源切换、GitHub 镜像加速\n"
-             + "· 自动播放关闭时显示封面预览、批量结果列表持久化\n"
              + "v1.3.7.3：修复下载中断、优化封面预览、适配 Android 7~17\n"
-             + "v1.3.7.2：修复实况图解析、优化访客凭据获取\n"
-             + "v1.3.7.1：新增实况照片支持、访客凭据管理\n";
+             + "v1.3.7.2：修复实况图解析、优化访客凭据获取\n";
     }
     static String changelogOld(){
         return
@@ -8782,7 +8774,20 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             String tags = gs(get(m,"i_tags"));
             if(tags.length() > 0) b.append("【话题】").append(tags).append("\n");
             b.append("【封面】").append(curCover).append("\n");
-            b.append("【视频直链】").append(gs(get(m,"i_play"))).append("\n");
+            // ===== 直链展示 =====
+            // 关键事实：PC detail 接口对未登录用户只下发 720P/540P（实测 11 档最高 1280x720），
+            // 所以 i_play / gearUrl(0) 拿到的都是 720P。真原画只有 ratio=default 一条路。
+            // 原画直链放最前面，用户复制第一条就是能下 4K/8K 的那条。
+            String dyUriForLink = gs(get(m,"i_uri"));
+            if(dyUriForLink.length() > 0){
+                b.append("【原画直链】").append(playUrlOriginal(dyUriForLink)).append("\n");
+                b.append("  ↑ 这条才是最高画质（实测 8K / 4K），可直接复制到浏览器下载\n");
+                b.append("  原画为 WebM/AV1 容器，部分机型无法播放；\n");
+                b.append("  把 ratio=default 改成 ratio=1080p 即为 1080p 版（MP4/H.264，普适）\n");
+            }
+            String dyLink = (curPlay != null && curPlay.length() > 0) ? curPlay : gs(get(m,"i_play"));
+            b.append("【视频直链】").append(dyLink).append("\n");
+            b.append("  ↑ 接口下发的流（通常 720P），想要 4K 请用上面的原画直链\n");
             String ws=gs(get(m,"i_ws"));
             if(ws.length()>0) b.append("【无水印直链】").append(ws).append("\n");
             // TikTok 老路径（i_tt）才需要提示；新 TtParser 路径已由 i_platform 输出平台名
