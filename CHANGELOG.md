@@ -7,6 +7,104 @@
 > 旧版本 App 的更新检查走数值比较，可正常识别为更新。
 
 ---
+## v1.3.7.5 (2026-10-30)
+
+本次为 **画质与播放器体验** 版本。核心是打通抖音原画（实测最高 8K），
+并统一小窗 / 全屏播放器的控制栏自动隐藏行为。
+
+### 新增
+
+- **抖音原画下载（最高 8K）**
+  - 改用 `ratio=default` 取流，这是平台真正的原始画质入口。
+  - 实测同一条 4K60 作品：`ratio=1080p` 为 1024×576 / 160MB，
+    `ratio=default` 为 7680×4320 / 4.36GB。
+  - 注意：`ratio=4k` 是无效档位，平台会静默回落到 1080p，不要用它。
+  - 原画为 WebM 容器（AV1 视频 + Opus 音频），下载扩展名按 URL 动态判定，
+    不再写死 `mp4`，避免播放器按 MP4 解析失败。
+  - 新增 `extOf(url)`：`/aweme/v1/play/` 且 `ratio=default` → `webm`。
+  - 参考实现：JoeanAmier/TikTokDownloader 的 `generate_original_quality_url()`
+    与 `__request_video_size()`。
+
+- **播放器控制栏自动隐藏（小窗 + 全屏统一）**
+  - 小窗 `MINI_BAR_HIDE_MS = 3000`，全屏 `CTRL_HIDE_MS = 4000`。
+  - 统一模式：`getVisibility() == VISIBLE` 作唯一真相；代次号 `miniBarGen` /
+    `ctrlGen` 每次显示自增，定时器回调首行校验代次，旧定时器自动作废。
+  - 隐藏走直接 `setVisibility(GONE)`，不再依赖动画 `withEndAction`
+    （动画被打断时回调不执行，是「有时不隐藏」的元凶）。
+  - 删掉「暂停时不隐藏」这类例外。
+  - 拖进度条时暂停计时（`onStartTrackingTouch` 递增代次），松手续命。
+
+- **不支持的链接前置校验**
+  - 新增 `isSupportedParseUrl()`，覆盖 7 平台域名与短链
+    （抖音 / 快手 / TikTok / X / YouTube / B站 / Instagram）。
+  - 命中失败弹 `showUnsupportedUrlDialog()`，列出支持平台并显示对方 host，
+    不再把 GitHub 等无关页面当 JSON 解析后抛 `SyntaxError`。
+
+### 优化
+
+- **画质档位识别修正**
+  - 分辨率改从 `play_addr.width/height` 读（不在 `bit_rate` 顶层，
+    也不在 `video` 顶层——顶层是最高档，会把所有档位显示成同一分辨率）。
+  - 帧率字段是大写 `FPS`；HDR 读 `HDR_type` / `HDR_bit`；H.265 读 `is_h265`。
+  - 排序键从 `quality_type` 改为「像素数 → 码率」，
+    因为 `quality_type` 在抖音侧不单调（实测 8K 档 q=292 却排在 1080 之后）。
+
+- **小窗点击命中修复**
+  - 根因：`TextureView` 会吃掉触摸事件，叠在上面的容器收不到点击。
+  - 修法参照 ExoPlayer `PlayerView` / DKVideoPlayer `StandardVideoController`
+    的结构，在画面之上加一层 control layer（`miniTouch`），由它统一接点击。
+  - `miniBar` 自身用 `onTouch` + `return false` 续命，不设 `OnClickListener`，
+    避免吞掉子按钮点击。
+
+- **原画探测不再阻塞主线程**
+  - `NetworkOnMainThreadException` 修复：探测放后台线程，
+    探到后清 `startedUrl` 并重新 `doPlay()`（WebM/AV1 必须换解码器重新初始化）。
+  - 新增 `InnerDownloader.probeSizeRange()`：`GET` + `Range: bytes=0-0` 读
+    `Content-Range`。原 `probeSize()` 走 HEAD，对 `/aweme/v1/play/` 的
+    302 跳转链拿不到 `Content-Range`（CDN 只回分段 Content-Length）。
+
+### 修复
+
+- **部分视频「有声音没画面」**
+  - 根因：原画是 WebM + AV1 + Opus。没有 AV1 硬解的设备
+    （骁龙 8 Gen1 及更早、天玑 1200 及更早）音轨能放、视频轨全黑。
+  - 修法：新增 `hasAv1Decoder()`，查 `MediaCodecList` 是否有 `video/av01`。
+    有才上原画，没有则老实走档位，避免黑屏。
+
+- **图文 / 实况图解析后显示解析失败、图片加载不出来**
+  - SSR 抓取识别条件从「只认 `videoInfoRes/slidesInfoRes/imagesInfoRes`」
+    改为「`_ROUTER_DATA` 里含 `aweme_id` 即认」，并补 `noteInfoRes` / `imageInfoRes`。
+    原判定对 note 页面永远不触发。
+  - 图片 URL 铁律：**绝不能删 `~tplv-` 段**，那是资源名的一部分，
+    删了直接 404（`imgErr java.io.FileNotFoundException`）。
+    只在 `shrink`/`resize` 家族里换尺寸规格，认不出的模板原样返回。
+  - 取图用 `url_list[0]`（页面实际渲染用的），不用末尾
+    （`p3-pc-sign.douyinpic.com` 这类签名域名会失效）。
+
+- **小窗进度条点了不显示、显示了不自动隐藏**
+  - 触摸事件铁律：`ACTION_DOWN` 必须 `return true`，否则后续
+    `MOVE`/`UP` 根本不派发。
+  - `miniBar` 初始 `GONE`，不点击不显示。
+
+- **全屏播放器控制栏不自动隐藏**
+  - `hideControls()` 原先靠 `controlsVisible` 布尔变量判断，
+    该变量会与其他地方的 `setVisibility` 脱钩，改为按 `getVisibility()` 判断。
+
+- **移动端 detail 补抓失败不再打扰用户**
+  - `"1".equals(gs(get(m,"mob")))` 恒假：JP 把 JSON 数字 `1` 解析成
+    `Double 1.0`，`toString()` 得 `"1.0"`。改为 `parseLong(get(m,"mob"), 0) == 1`。
+  - 移动端 detail 参数（`version_code=290100` 等）与 PC UA 不匹配会被风控返回 HTML；
+    改成 `190500` 后暴露 `Blocked by ArgusSecurityPlugin Uifid Not Found`
+    ——移动端 detail 强制要求 UIFID 访客凭据，无法伪造。
+    该路径失败只写日志（`DETAIL_MOBILE_ERR`），不弹用户提示。
+
+### 已知限制
+
+- 抖音原画需要设备支持 AV1 解码。无 AV1 硬解的机型会自动降级到兼容档（H.264）。
+- 移动端 detail 补抓（用于争取更高档位）受 UIFID 限制，实际走不通，已静默。
+
+---
+
 ## v1.3.7.4 (2026-10-28)
 
 本次为 **批量解析体验重构** 小版本。核心是让批量解析不再「一条条闪过去」，
