@@ -3,15 +3,18 @@
     android:layout_width="match_parent" android:layout_height="match_parent"
     android:background="#000000">
 
+    <!-- 视频画面 -->
     <TextureView android:id="@+id/pVideo"
         android:layout_width="match_parent" android:layout_height="match_parent"/>
 
+    <!-- 中央大播放键（暂停时显示） -->
     <TextView android:id="@+id/pCenterIcon"
-        android:layout_width="76dp" android:layout_height="76dp"
-        android:layout_gravity="center" android:background="@drawable/bg_pill"
-        android:gravity="center" android:text="⏸" android:textColor="#FFFFFF"
-        android:textSize="30sp" android:visibility="gone"/>
+        android:layout_width="78dp" android:layout_height="78dp"
+        android:layout_gravity="center" android:background="@drawable/pl_circle"
+        android:gravity="center" android:text="&#x23F8;" android:textColor="#FFFFFF"
+        android:textSize="32sp" android:visibility="gone"/>
 
+    <!-- 提示气泡 -->
     <TextView android:id="@+id/pHint"
         android:layout_width="wrap_content" android:layout_height="wrap_content"
         android:layout_gravity="center" android:background="@drawable/bg_pill"
@@ -20,28 +23,32 @@
         android:textColor="#FFFFFF" android:textSize="14sp"
         android:visibility="gone"/>
 
+    <!-- 顶栏：渐变遮罩 + 圆形返回 + 标题 -->
     <LinearLayout android:id="@+id/pTopBar"
         android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:layout_gravity="top" android:background="@drawable/bg_bar"
+        android:layout_gravity="top" android:background="@drawable/pl_grad_top"
         android:orientation="horizontal" android:gravity="center_vertical"
-        android:paddingLeft="6dp" android:paddingRight="14dp"
-        android:paddingTop="8dp" android:paddingBottom="22dp">
+        android:paddingLeft="10dp" android:paddingRight="14dp"
+        android:paddingTop="12dp" android:paddingBottom="34dp">
         <TextView android:id="@+id/pBack"
-            android:layout_width="42dp" android:layout_height="42dp"
-            android:gravity="center" android:text="‹" android:textColor="#FFFFFF"
-            android:textSize="30sp"/>
+            android:layout_width="40dp" android:layout_height="40dp"
+            android:background="@drawable/pl_circle"
+            android:gravity="center" android:text="&#x2039;" android:textColor="#FFFFFF"
+            android:textSize="28sp"/>
         <TextView android:id="@+id/pTitle"
             android:layout_width="0dp" android:layout_height="wrap_content"
-            android:layout_weight="1" android:singleLine="true"
-            android:ellipsize="end" android:textColor="#FFFFFF" android:textSize="14sp"/>
+            android:layout_weight="1" android:layout_marginLeft="12dp"
+            android:singleLine="true" android:ellipsize="end"
+            android:textColor="#FFFFFF" android:textSize="14sp"/>
     </LinearLayout>
 
+    <!-- 底栏：渐变遮罩 + 进度条 + 胶囊按钮组 -->
     <LinearLayout android:id="@+id/pBottomBar"
         android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:layout_gravity="bottom" android:background="@drawable/bg_bar"
-        android:orientation="vertical" android:paddingLeft="14dp"
-        android:paddingRight="14dp" android:paddingTop="30dp"
-        android:paddingBottom="10dp">
+        android:layout_gravity="bottom" android:background="@drawable/pl_grad_bottom"
+        android:orientation="vertical" android:paddingLeft="18dp"
+        android:paddingRight="18dp" android:paddingTop="44dp"
+        android:paddingBottom="16dp">
 
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal" android:gravity="center_vertical">
@@ -50,8 +57,8 @@
                 android:text="00:00" android:textColor="#FFFFFF" android:textSize="12sp"/>
             <SeekBar android:id="@+id/pSeek"
                 android:layout_width="0dp" android:layout_height="wrap_content"
-                android:layout_weight="1" android:layout_marginLeft="10dp"
-                android:layout_marginRight="10dp" android:max="1000"
+                android:layout_weight="1" android:layout_marginLeft="12dp"
+                android:layout_marginRight="12dp" android:max="1000"
                 android:progressDrawable="@drawable/seek_progress"
                 android:thumb="@drawable/seek_thumb"
                 android:splitTrack="false"/>
@@ -62,25 +69,35 @@
 
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal" android:gravity="center_vertical"
-            android:layout_marginTop="4dp">
+            android:layout_marginTop="10dp">
+
             <TextView android:id="@+id/pPlayPause"
-                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:padding="10dp" android:text="⏸" android:textColor="#FFFFFF"
+                android:layout_width="44dp" android:layout_height="44dp"
+                android:background="@drawable/pl_circle"
+                android:gravity="center" android:text="&#x23F8;" android:textColor="#FFFFFF"
                 android:textSize="20sp"/>
+
             <TextView android:id="@+id/pSpeed"
-                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:padding="10dp" android:text="1.0X" android:textColor="#FFFFFF"
+                android:layout_width="wrap_content" android:layout_height="34dp"
+                android:layout_marginLeft="12dp" android:background="@drawable/pl_btn"
+                android:gravity="center" android:minWidth="58dp" android:paddingLeft="12dp"
+                android:paddingRight="12dp" android:text="1.0X" android:textColor="#FFFFFF"
                 android:textSize="13sp" android:textStyle="bold"/>
+
             <View android:layout_width="0dp" android:layout_height="1dp"
                 android:layout_weight="1"/>
+
             <TextView android:id="@+id/pDownload"
-                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:padding="10dp" android:text="⇩ 下载" android:textColor="#FFFFFF"
-                android:textSize="13sp"/>
+                android:layout_width="wrap_content" android:layout_height="34dp"
+                android:background="@drawable/pl_btn" android:gravity="center"
+                android:paddingLeft="14dp" android:paddingRight="14dp"
+                android:text="&#x2913; 下载" android:textColor="#FFFFFF" android:textSize="13sp"/>
+
             <TextView android:id="@+id/pFull"
-                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:padding="10dp" android:text="⛶" android:textColor="#FFFFFF"
-                android:textSize="18sp"/>
+                android:layout_width="40dp" android:layout_height="40dp"
+                android:layout_marginLeft="10dp" android:background="@drawable/pl_circle"
+                android:gravity="center" android:text="&#x26F6;" android:textColor="#FFFFFF"
+                android:textSize="17sp"/>
         </LinearLayout>
     </LinearLayout>
 </FrameLayout>
