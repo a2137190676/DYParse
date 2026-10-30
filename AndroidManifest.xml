@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    package="com.re.douyinparse" android:versionCode="1030704" android:versionName="1.3.7.4">
+    package="com.re.douyinparse" android:versionCode="1030705" android:versionName="1.3.7.5">
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="30"/>
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- 存储权限：Android 9 及以下有效；Android 10 配合 requestLegacyExternalStorage 生效 -->
