@@ -75,7 +75,7 @@
 
             <TextView
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:text="支持 抖音 · 快手 · TikTok · X · YouTube"
+                android:text="支持 抖音 · 快手 · TikTok · X · YouTube · B站 · Instagram"
                 android:textColor="@color/text_hint" android:textSize="11sp"
                 android:paddingLeft="4dp" android:paddingBottom="8dp"/>
 
@@ -88,9 +88,10 @@
             <EditText android:id="@+id/input"
                 android:layout_width="match_parent" android:layout_height="54dp"
                 android:background="@drawable/input_bg" android:paddingLeft="16dp"
-                android:paddingRight="16dp" android:hint="粘贴分享链接或口令"
+                android:paddingRight="16dp" android:hint="粘贴分享链接或口令（支持一行一个，批量解析）"
                 android:textColor="@color/text" android:textColorHint="@color/text_hint"
-                android:textSize="14sp" android:singleLine="true" android:inputType="textUri"/>
+                android:textSize="14sp" android:maxLines="6" android:minLines="1"
+                android:gravity="center_vertical" android:inputType="textUri|textMultiLine"/>
 
             <TextView android:id="@+id/btn"
                 android:layout_width="match_parent" android:layout_height="52dp"
@@ -135,6 +136,28 @@
                 android:layout_marginTop="8dp" android:max="1000"
                 android:progress="0" android:progressDrawable="@drawable/progress_h"
                 android:progressTint="@color/brand"/>
+        </LinearLayout>
+
+        <LinearLayout android:id="@+id/parseNavRow"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:visibility="gone"
+            android:paddingLeft="18dp" android:paddingRight="18dp"
+            android:paddingBottom="8dp">
+
+            <TextView android:id="@+id/btnParsePrev"
+                android:layout_width="0dp" android:layout_height="40dp" android:layout_weight="1"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="上一个" android:textColor="@color/text" android:textSize="13sp"/>
+
+            <TextView android:id="@+id/parseNavLabel"
+                android:layout_width="wrap_content" android:layout_height="40dp"
+                android:gravity="center" android:text="" android:textColor="@color/text_sub"
+                android:textSize="12sp" android:paddingLeft="10dp" android:paddingRight="10dp"/>
+
+            <TextView android:id="@+id/btnParseNext"
+                android:layout_width="0dp" android:layout_height="40dp" android:layout_weight="1"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="下一个" android:textColor="@color/text" android:textSize="13sp"/>
         </LinearLayout>
 
         <LinearLayout android:id="@+id/actions"
@@ -186,47 +209,56 @@
 
                     <TextureView android:id="@+id/video"
                         android:layout_width="match_parent" android:layout_height="210dp"/>
+                    <!-- 触摸接收层：TextureView 在部分机型会绕过 Java 触摸分发，
+                         用一层透明遮罩专门接点击，保证小窗显隐可控。
+                         放在 video 之后、miniBar 之前，保证按钮仍可点击。 -->
+                    <View android:id="@+id/miniTouch"
+                        android:layout_width="match_parent" android:layout_height="match_parent"/>
 
                     <LinearLayout android:id="@+id/miniBar"
                         android:layout_width="match_parent" android:layout_height="wrap_content"
-                        android:layout_gravity="bottom" android:background="@drawable/bg_bar"
-                        android:orientation="vertical" android:paddingLeft="12dp"
-                        android:paddingRight="12dp" android:paddingTop="16dp"
-                        android:paddingBottom="8dp">
-
+                        android:layout_gravity="bottom" android:background="@drawable/pl_bar_bg"
+                        android:orientation="vertical" android:paddingLeft="10dp"
+                        android:paddingRight="10dp" android:paddingTop="6dp"
+                        android:paddingBottom="6dp">
                         <LinearLayout android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:orientation="horizontal" android:gravity="center_vertical">
                             <TextView android:id="@+id/miniTimeNow"
                                 android:layout_width="wrap_content" android:layout_height="wrap_content"
-                                android:text="00:00" android:textColor="@color/white" android:textSize="10sp"/>
+                                android:text="00:00" android:textColor="@color/white" android:textSize="11sp"/>
                             <SeekBar android:id="@+id/miniSeek"
                                 android:layout_width="0dp" android:layout_height="wrap_content"
-                                android:layout_weight="1" android:layout_marginLeft="8dp"
-                                android:layout_marginRight="8dp" android:max="1000"
+                                android:layout_weight="1" android:layout_marginLeft="10dp"
+                                android:layout_marginRight="10dp" android:max="1000"
                                 android:progressDrawable="@drawable/seek_progress"
                                 android:thumb="@drawable/seek_thumb" android:splitTrack="false"/>
                             <TextView android:id="@+id/miniTimeAll"
                                 android:layout_width="wrap_content" android:layout_height="wrap_content"
-                                android:text="00:00" android:textColor="@color/white_sub" android:textSize="10sp"/>
+                                android:text="00:00" android:textColor="@color/white_sub" android:textSize="11sp"/>
                         </LinearLayout>
-
                         <LinearLayout android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:orientation="horizontal" android:gravity="center_vertical">
+                            android:orientation="horizontal" android:gravity="center_vertical"
+                            android:layout_marginTop="8dp">
                             <TextView android:id="@+id/miniPlay"
-                                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                                android:padding="6dp" android:text="||" android:textColor="@color/white"
+                                android:layout_width="40dp" android:layout_height="40dp"
+                                android:background="@drawable/pl_circle"
+                                android:gravity="center" android:text="||" android:textColor="@color/white"
                                 android:textSize="16sp" android:textStyle="bold"/>
                             <TextView android:id="@+id/miniSpeed"
-                                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                                android:padding="6dp" android:text="1.0X" android:textColor="@color/white"
+                                android:layout_width="wrap_content" android:layout_height="30dp"
+                                android:layout_marginLeft="10dp" android:background="@drawable/pl_btn"
+                                android:gravity="center" android:minWidth="52dp" android:paddingLeft="10dp"
+                                android:paddingRight="10dp" android:text="1.0X" android:textColor="@color/white"
                                 android:textSize="11sp" android:textStyle="bold"/>
                             <View android:layout_width="0dp" android:layout_height="1dp"
                                 android:layout_weight="1"/>
                             <TextView android:id="@+id/miniFull"
-                                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                                android:padding="6dp" android:text="全屏" android:textColor="@color/white"
+                                android:layout_width="wrap_content" android:layout_height="30dp"
+                                android:background="@drawable/pl_btn" android:gravity="center"
+                                android:paddingLeft="12dp" android:paddingRight="12dp"
+                                android:text="全屏" android:textColor="@color/white"
                                 android:textSize="12sp"/>
                         </LinearLayout>
                     </LinearLayout>
@@ -276,6 +308,15 @@
             android:background="@drawable/btn_primary" android:gravity="center"
             android:text="全部下载" android:textColor="#FFFFFF"
             android:textSize="13sp" android:textStyle="bold" android:visibility="gone"/>
+
+        <TextView android:id="@+id/btnClearList"
+            android:layout_width="match_parent" android:layout_height="38dp"
+            android:layout_marginLeft="18dp" android:layout_marginRight="18dp"
+            android:layout_marginBottom="8dp"
+            android:background="@drawable/input_bg" android:gravity="center"
+            android:text="清空列表" android:textColor="@color/text_sub"
+            android:textSize="13sp" android:visibility="gone"/>
+
 
         <ScrollView android:id="@+id/listScroll"
             android:layout_width="match_parent" android:layout_height="0dp"
