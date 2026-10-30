@@ -344,6 +344,96 @@ public class InnerDownloader {
         }
     }
 
+    /** 探测远端文件总字节数（HEAD + Range 兜底）。失败返回 -1。
+     *  用途：4K 原片体积可达 1~2GB，下载前先让用户知道有多大再决定画质。 */
+    public static long probeSize(String url){
+        long n = probeSizeOnce(url, "HEAD");
+        if(n > 0) return n;
+        return probeSizeOnce(url, "GET");
+    }
+
+    static long probeSizeOnce(String url, String method){
+        java.net.HttpURLConnection uc = null;
+        try{
+            uc = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            uc.setRequestMethod(method);
+            uc.setInstanceFollowRedirects(true);
+            uc.setConnectTimeout(8000);
+            uc.setReadTimeout(12000);
+            uc.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36");
+            uc.setRequestProperty("Referer", "https://www.douyin.com/");
+            // GET 探测时只要头几个字节，别把整个文件拉下来
+            if(!"HEAD".equals(method)) uc.setRequestProperty("Range", "bytes=0-1");
+            int code = uc.getResponseCode();
+            if(code < 200 || code >= 400) return -1;
+            long len;
+            if(android.os.Build.VERSION.SDK_INT >= 24){
+                len = uc.getContentLengthLong();
+            }else{
+                len = uc.getContentLength();
+            }
+            // 206 时 Content-Length 是分段长度，真实总长在 Content-Range 里
+            String cr = uc.getHeaderField("Content-Range");
+            if(cr != null){
+                int slash = cr.lastIndexOf('/');
+                if(slash > 0){
+                    try{
+                        long total = Long.parseLong(cr.substring(slash + 1).trim());
+                        if(total > 0) return total;
+                    }catch(Throwable t){}
+                }
+            }
+            return len > 0 ? len : -1;
+        }catch(Throwable t){
+            return -1;
+        }finally{
+            try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
+        }
+    }
+
+    /**
+     * 原画地址探测专用：GET + Range: bytes=0-0 读 Content-Range。
+     * 抖音的 /aweme/v1/play/ 先回 302，跟随跳转后 CDN 才给 206 + Content-Range，
+     * 用 HEAD 走这条路很多 CDN 节点不回 Content-Range（只给 Content-Length，且是分段长度）。
+     * 参考 JoeanAmier/TikTokDownloader 的 __request_video_size，它就是 GET + Range。
+     */
+    public static long probeSizeRange(String url){
+        java.net.HttpURLConnection uc = null;
+        try{
+            uc = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            uc.setRequestMethod("GET");
+            uc.setInstanceFollowRedirects(true);
+            uc.setConnectTimeout(8000);
+            uc.setReadTimeout(12000);
+            uc.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+            uc.setRequestProperty("Referer", "https://www.douyin.com/");
+            uc.setRequestProperty("Range", "bytes=0-0");
+            int code = uc.getResponseCode();
+            Log.i("DYP", "PROBE_RANGE code=" + code);
+            if(code < 200 || code >= 400) return -1;
+            String cr = uc.getHeaderField("Content-Range");
+            Log.i("DYP", "PROBE_RANGE cr=" + cr);
+            if(cr != null){
+                int slash = cr.lastIndexOf('/');
+                if(slash > 0){
+                    try{
+                        long total = Long.parseLong(cr.substring(slash + 1).trim());
+                        if(total > 0) return total;
+                    }catch(Throwable t){}
+                }
+            }
+            long len;
+            if(android.os.Build.VERSION.SDK_INT >= 24) len = uc.getContentLengthLong();
+            else len = uc.getContentLength();
+            return len > 0 ? len : -1;
+        }catch(Throwable t){
+            Log.i("DYP", "PROBE_RANGE_ERR " + t);
+            return -1;
+        }finally{
+            try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
+        }
+    }
+
     /** 断点文件用：只取长度，用于显示 */
     public static String sizeText(long b){
         if(b < 1024) return b + "B";
