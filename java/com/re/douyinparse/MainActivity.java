@@ -56,7 +56,7 @@ public class MainActivity extends Activity {
     // 播放器当前的代理/站点标记，配置变了就重建播放器
     String miniProxyKey = null;
     boolean miniWasTT = false;
-    View videoBox, miniBar;
+    View videoBox, miniBar, miniTouch;
     TextView miniTimeNow, miniTimeAll, miniPlay, miniSpeed, miniFull;
     SeekBar miniSeek;
     // 下载/转码进度
@@ -73,6 +73,12 @@ public class MainActivity extends Activity {
     long miniLastTapTime = 0;
     float miniLastTapX = 0;
     String curPlay="", curCover="", curWs="", curImgs="", curId="", curDesc="";
+    /** 抖音 4K 作品的 1080p 兜底地址：起播失败 / 解码不支持时自动降级，用户无感 */
+    String curFallbackPlay="";
+    /** 本次播放是否已经降级过一次（防止反复降级死循环） */
+    boolean playFallbackDone = false;
+    /** 当前这条作品解析出来的 vid/uri，降级时用它拼 4k / 1080p 地址 */
+    String curVidUri="";
     /** YouTube direct：独立音轨直链（itag 140 m4a），与 curPlay 合并播放/下载 */
     String curAudio="";
     /** YouTube 下载专用：解析拿到的 googlevideo 直链（播放可能 403 回退，下载仍优先直连） */
@@ -144,6 +150,33 @@ public class MainActivity extends Activity {
             || InsParser.isInsUrl(url)
             || (url != null && (url.contains("googlevideo.com")
                 || url.contains("videoplayback")));
+    }
+
+    /** 是否为「我们支持解析的平台」链接（含短链域名）。
+     *  用途：用户贴了 GitHub / 随便一个网址时提前拦住，别拿去做 JSON 解析后报
+     *  “Unexpected token 'B', Blocked by...” 这种莫名其妙的错。 */
+    static boolean isSupportedParseUrl(String url){
+        if(url == null || url.length() == 0) return false;
+        String u = url.toLowerCase();
+        // 抖音（含短链 v.douyin.com / iesdouyin / douyinpic 图床）
+        if(u.contains("douyin.com") || u.contains("iesdouyin.com")
+                || u.contains("amemv.com") || u.contains("snssdk.com")
+                || u.contains("douyinpic.com") || u.contains("douyinvod.com")) return true;
+        // 快手（含 short-v.kuaishou / kwaicdn）
+        if(u.contains("kuaishou.com") || u.contains("chenzhongtech.com")
+                || u.contains("kwaicdn.com") || u.contains("gifshow.com")) return true;
+        // TikTok（含短链 vm.tiktok / vt.tiktok）
+        if(isTikTokUrl(u)) return true;
+        // X / Twitter
+        if(isXDomain(u)) return true;
+        // YouTube（含 youtu.be / googlevideo）
+        if(YtParser.isYtUrl(u)) return true;
+        // B站（含 b23.tv 短链）
+        if(BiliParser.isBiliUrl(u) || u.contains("b23.tv") || u.contains("bilibili.com")
+                || u.contains("bilivideo.com")) return true;
+        // Instagram
+        if(InsParser.isInsUrl(u)) return true;
+        return false;
     }
 
     /** YouTube 登录模式（WebView 登录 → 抓 Cookie） */
@@ -1587,6 +1620,7 @@ public class MainActivity extends Activity {
             h.postDelayed(new Runnable(){ public void run(){ checkUpdate(true); } }, 1500);
         }
         videoBox=findViewById(R.id.videoBox);
+        miniTouch=findViewById(R.id.miniTouch);
         miniBar=findViewById(R.id.miniBar);
         miniTimeNow=(TextView)findViewById(R.id.miniTimeNow);
         miniTimeAll=(TextView)findViewById(R.id.miniTimeAll);
@@ -1594,6 +1628,7 @@ public class MainActivity extends Activity {
         miniSpeed=(TextView)findViewById(R.id.miniSpeed);
         miniFull=(TextView)findViewById(R.id.miniFull);
         miniSeek=(SeekBar)findViewById(R.id.miniSeek);
+        setupMiniBarAutoHide();
         img=(ImageView)findViewById(R.id.img);
         liveBadge=(TextView)findViewById(R.id.liveBadge);
         // 注意：WebView 的 WebSettings / WebViewClient / 注入脚本
@@ -2343,6 +2378,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
      *  剪贴板里有多条链接时：全部识别出来，一行一个填进输入框，并提示可批量解析。 */
     void autoFillFromClipboard(){
         try{
+            if(!clipAutoParseOn()) return;   // 设置里关了就完全不读剪贴板
             if(input == null) return;
             CharSequence cur = input.getText();
             if(cur != null && cur.toString().trim().length() > 0) return;   // 已有内容不打扰
@@ -2365,6 +2401,18 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 input.setSelection(u.length());
                 Log.i("DYP", "CLIP_AUTOFILL len=" + u.length() + " url=" + u.substring(0, Math.min(80, u.length())));
                 DiagLog.i(DiagLog.M_APP, "剪贴板自动填链接 | " + u);
+                if(clipAutoStartOn()){
+                    h.postDelayed(new Runnable(){ public void run(){
+                        Log.i("DYP", "CLIP_AUTO_PARSE_ONE");
+                        parse();
+                    }}, 700);
+                }
+                if(clipAutoStartOn()){
+                    h.postDelayed(new Runnable(){ public void run(){
+                        Log.i("DYP", "CLIP_AUTO_PARSE_ONE");
+                        parse();
+                    }}, 700);
+                }
             } else {
                 // 多条：一行一个，方便用户直接点解析走批量
                 StringBuilder sb = new StringBuilder();
@@ -2377,6 +2425,20 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 Log.i("DYP", "CLIP_AUTOFILL_MULTI n=" + urls.size());
                 DiagLog.i(DiagLog.M_APP, "剪贴板识别到 " + urls.size() + " 条链接，已按行填入");
                 showHintToast("剪贴板识别到 " + urls.size() + " 条链接，点解析将批量处理");
+                if(clipAutoStartOn()){
+                    final java.util.List<String> go = new java.util.ArrayList<String>(urls);
+                    h.postDelayed(new Runnable(){ public void run(){
+                        Log.i("DYP", "CLIP_AUTO_PARSE n=" + go.size());
+                        startBatchParse(go);
+                    }}, 700);
+                }
+                if(clipAutoStartOn()){
+                    final java.util.List<String> go = new java.util.ArrayList<String>(urls);
+                    h.postDelayed(new Runnable(){ public void run(){
+                        Log.i("DYP", "CLIP_AUTO_PARSE n=" + go.size());
+                        startBatchParse(go);
+                    }}, 700);
+                }
             }
         }catch(Throwable t){
             Log.i("DYP", "CLIP_AUTOFILL_ERR " + t);
@@ -2412,6 +2474,28 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
         }
         return out;
     }
+    // ===== 剪贴板设置 =====
+    static final String KEY_CLIP_AUTO = "clip_auto";        // 识别剪贴板（总开关）
+    static final String KEY_CLIP_START = "clip_auto_start"; // 识别后自动解析
+
+    /** 是否启用「识别剪贴板」 */
+    boolean clipAutoParseOn(){
+        return getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_CLIP_AUTO, true);
+    }
+
+    /** 是否启用「识别后自动解析」 */
+    boolean clipAutoStartOn(){
+        return getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_CLIP_START, false);
+    }
+
+    void setClipAuto(boolean on){
+        getSharedPreferences(SP, MODE_PRIVATE).edit().putBoolean(KEY_CLIP_AUTO, on).apply();
+    }
+
+    void setClipAutoStart(boolean on){
+        getSharedPreferences(SP, MODE_PRIVATE).edit().putBoolean(KEY_CLIP_START, on).apply();
+    }
+
     /** 上次处理过的剪贴板文本，避免同一内容反复覆盖输入框 */
     String clipLastSeen = "";
 
@@ -2654,10 +2738,10 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 }
                 if(ap){
                     if(hasVideo && !hasImgs){
-                        // 渲染阶段已按开关执行过 doPlay()（页内小窗起播），
-                        // 这里再开全屏播放器，实现「解析完直接看」。
-                        Log.i("DYP", "AUTO_PLAY 触发 openPlayer");
-                        openPlayer();
+                        // 自动播放默认留在页内小窗（不跳全屏），
+                        // 想看全屏让用户自己点「全屏」按钮。
+                        Log.i("DYP", "AUTO_PLAY 留在小窗");
+                        pokeMiniBar();     // 顺便把控制栏亮一下，告诉用户能操作
                     } else {
                         Log.i("DYP", "AUTO_PLAY 跳过 图集=" + hasImgs + " 视频=" + hasVideo);
                     }
@@ -2788,6 +2872,16 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 : "已关闭 · 退出后清空列表",
             new View.OnClickListener(){
                 public void onClick(View v){ setBatchKeep(!batchKeepOn()); buildSettingsPage(); }});
+         addSettingRow("识别剪贴板", clipAutoParseOn()
+                 ? "已开启 · 回前台自动读复制的内容，填进输入框"
+                 : "已关闭 · 不读取剪贴板，只能手动粘贴",
+             new View.OnClickListener(){
+                 public void onClick(View v){ setClipAuto(!clipAutoParseOn()); buildSettingsPage(); }});
+         addSettingRow("剪贴板自动解析", clipAutoStartOn()
+                 ? "已开启 · 识别到链接直接开始解析（多条走批量）"
+                 : "已关闭 · 只填进输入框，需手动点解析",
+             new View.OnClickListener(){
+                 public void onClick(View v){ setClipAutoStart(!clipAutoStartOn()); buildSettingsPage(); }});
 
         addSettingSection("后台保活（下载不中断）");
         addSettingRow("电池优化白名单", PowerHelper.stateLabel(this),
@@ -3862,7 +3956,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         +"var tags=[];try{var ss=document.querySelectorAll('script');for(var i=0;i<ss.length;i++){var s=ss[i];if((s.id&&/DATA|PROPS|RENDER|STATE|INIT/i.test(s.id))||s.type==='application/json'){tags.push((s.id||s.type)+'#'+(s.textContent?s.textContent.length:0));}}}catch(e){}out.tags=tags.join(',');"
         +"var ks=[];try{for(var k in window){try{if(/DATA|PROPS|RENDER|INIT|RSC/i.test(k))ks.push(k+':'+(typeof window[k]));}catch(e){}}}catch(e){}out.wkeys=ks.slice(0,50).join(',');"
         +"try{out.router=window._ROUTER_DATA?JSON.stringify(window._ROUTER_DATA).length:-1;out.routerFull=window._ROUTER_DATA?JSON.stringify(window._ROUTER_DATA).slice(0,20000):'no';}catch(e){}"
-        +"try{var rd=window._ROUTER_DATA;var ld=rd&&rd.loaderData;if(ld){for(var k in ld){var pg=ld[k];var il=(pg&&pg.videoInfoRes&&pg.videoInfoRes.item_list)||(pg&&pg.slidesInfoRes&&pg.slidesInfoRes.item_list)||(pg&&pg.imagesInfoRes&&pg.imagesInfoRes.item_list)||(pg&&pg.item_list);if(il&&il.length){var it=il[0];out.i_id=it.aweme_id;out.i_author=it.author?it.author.nickname:'';out.i_desc=it.desc||'';out.i_time=it.create_time;try{out.i_cover=(it.video&&it.video.cover&&it.video.cover.url_list)?it.video.cover.url_list[0]:'';}catch(e){}try{var pa=it.video&&it.video.play_addr;if(pa){out.i_play=(pa.url_list&&pa.url_list[0])?pa.url_list[0]:'';var uri=pa.uri||'';if(uri)out.i_ws='https://aweme.snssdk.com/aweme/v1/play/?video_id='+uri+'&ratio=1080p&line=0';}}catch(e){}try{out.i_dur=(it.video&&it.video.duration)?it.video.duration:0;}catch(e){}try{out.i_muHas=(it.music?1:0);var mu=it.music;if(mu){out.i_musicTitle=mu.title||'';out.i_musicAuthor=mu.author||'';out.i_musicMid=mu.mid||'';try{var mp=mu.play_url;if(mp&&mp.url_list&&mp.url_list.length)out.i_music=mp.url_list[0];}catch(e){}if(!out.i_music){try{var mpu=mu.play_url_uri||mu.uri;if(mpu)out.i_music=mpu;}catch(e){}}}}catch(e){}try{var po=it.poi||it.poi_info;if(po)out.i_poet=po.poi_name||po.name||'';if(!out.i_poet){var ct=it.city||(it.author&&it.author.city);if(ct)out.i_poet=ct;}}catch(e){}try{var te=it.text_extra;if(te&&te.length){var ts=[];for(var ti=0;ti<te.length;ti++){if(te[ti].hashtag_name)ts.push('#'+te[ti].hashtag_name);}out.i_tags=ts.join(' ');}}catch(e){}try{if(!out.i_tags){var cp=it.cha_list;if(cp&&cp.length){var cs=[];for(var ci=0;ci<cp.length;ci++){if(cp[ci].cha_name)cs.push('#'+cp[ci].cha_name);}out.i_tags=cs.join(' ');}}}catch(e){}try{out.i_region=(it.author&&it.author.region)?it.author.region:'';}catch(e){}try{var pc=it.poi;if(pc){out.i_poi=pc.poi_name||'';}}catch(e){}try{var imgsArr=it.images;if(!imgsArr&&it.image_post_info&&it.image_post_info.images)imgsArr=it.image_post_info.images;if(imgsArr&&imgsArr.length){var ar=[],dy=[];function pu(o){try{if(!o||!o.url_list||!o.url_list.length)return '';return o.url_list[o.url_list.length-1];}catch(e){return '';}}for(var j=0;j<imgsArr.length;j++){var im=imgsArr[j];var uu=im.url_list;ar.push(uu&&uu.length?uu[0]:'');var lv='';var v0=im.video;if(v0){lv=pu(v0.play_addr)||pu(v0.play_addr_h264)||pu(v0.download_addr)||pu(v0);}if(!lv&&im.live_photo&&im.live_photo.video){lv=pu(im.live_photo.video.play_addr)||pu(im.live_photo.video.download_addr);}if(!lv&&im.motion_photo&&im.motion_photo.video){lv=pu(im.motion_photo.video.play_addr)||pu(im.motion_photo.video.download_addr);}dy.push(lv||'');}out.i_imgs=ar.join('|');out.i_dyn=dy.join('|');out.i_live=1;}}catch(e){out.imgErr=''+e;}break;}}}}catch(e){out.iErr=''+e;}"
+        +"try{var rd=window._ROUTER_DATA;var ld=rd&&rd.loaderData;if(ld){for(var k in ld){var pg=ld[k];var il=(pg&&pg.videoInfoRes&&pg.videoInfoRes.item_list)||(pg&&pg.slidesInfoRes&&pg.slidesInfoRes.item_list)||(pg&&pg.imagesInfoRes&&pg.imagesInfoRes.item_list)||(pg&&pg.noteInfoRes&&(pg.noteInfoRes.item_list||pg.noteInfoRes.images))||(pg&&pg.imageInfoRes&&pg.imageInfoRes.item_list)||(pg&&pg.item_list);if(il&&il.length){var it=il[0];out.i_id=it.aweme_id;out.i_author=it.author?it.author.nickname:'';out.i_desc=it.desc||'';out.i_time=it.create_time;try{out.i_cover=(it.video&&it.video.cover&&it.video.cover.url_list)?it.video.cover.url_list[0]:'';}catch(e){}try{var pa=it.video&&it.video.play_addr;if(pa){out.i_play=(pa.url_list&&pa.url_list[0])?pa.url_list[0]:'';var uri=pa.uri||'';if(uri){out.i_uri=uri;out.i_ws='https://aweme.snssdk.com/aweme/v1/play/?video_id='+uri+'&ratio=1080p&line=0';}}}catch(e){}try{out.i_dur=(it.video&&it.video.duration)?it.video.duration:0;}catch(e){}try{out.i_muHas=(it.music?1:0);var mu=it.music;if(mu){out.i_musicTitle=mu.title||'';out.i_musicAuthor=mu.author||'';out.i_musicMid=mu.mid||'';try{var mp=mu.play_url;if(mp&&mp.url_list&&mp.url_list.length)out.i_music=mp.url_list[0];}catch(e){}if(!out.i_music){try{var mpu=mu.play_url_uri||mu.uri;if(mpu)out.i_music=mpu;}catch(e){}}}}catch(e){}try{var po=it.poi||it.poi_info;if(po)out.i_poet=po.poi_name||po.name||'';if(!out.i_poet){var ct=it.city||(it.author&&it.author.city);if(ct)out.i_poet=ct;}}catch(e){}try{var te=it.text_extra;if(te&&te.length){var ts=[];for(var ti=0;ti<te.length;ti++){if(te[ti].hashtag_name)ts.push('#'+te[ti].hashtag_name);}out.i_tags=ts.join(' ');}}catch(e){}try{if(!out.i_tags){var cp=it.cha_list;if(cp&&cp.length){var cs=[];for(var ci=0;ci<cp.length;ci++){if(cp[ci].cha_name)cs.push('#'+cp[ci].cha_name);}out.i_tags=cs.join(' ');}}}catch(e){}try{out.i_region=(it.author&&it.author.region)?it.author.region:'';}catch(e){}try{var pc=it.poi;if(pc){out.i_poi=pc.poi_name||'';}}catch(e){}try{var imgsArr=it.images;if(!imgsArr&&it.image_post_info&&it.image_post_info.images)imgsArr=it.image_post_info.images;if(imgsArr&&imgsArr.length){var ar=[],dy=[];function pu(o){try{if(!o||!o.url_list||!o.url_list.length)return '';return o.url_list[o.url_list.length-1];}catch(e){return '';}}for(var j=0;j<imgsArr.length;j++){var im=imgsArr[j];var uu=im.url_list;ar.push(uu&&uu.length?uu[0]:'');var lv='';var v0=im.video;if(v0){lv=pu(v0.play_addr)||pu(v0.play_addr_h264)||pu(v0.download_addr)||pu(v0);}if(!lv&&im.live_photo&&im.live_photo.video){lv=pu(im.live_photo.video.play_addr)||pu(im.live_photo.video.download_addr);}if(!lv&&im.motion_photo&&im.motion_photo.video){lv=pu(im.motion_photo.video.play_addr)||pu(im.motion_photo.video.download_addr);}dy.push(lv||'');}out.i_imgs=ar.join('|');out.i_dyn=dy.join('|');out.i_live=1;}}catch(e){out.imgErr=''+e;}break;}}}}catch(e){out.iErr=''+e;}"
         +"try{if(!out.i_id){var ad=document.getElementById('api-data');"
          +"if(ad){var tj=null;try{tj=JSON.parse(ad.textContent||ad.innerText||'');}catch(e){"
          +"var tx=ad.textContent||ad.innerText||'';var a0=tx.indexOf('{');if(a0>=0){try{tj=JSON.parse(tx.slice(a0));}catch(e2){}}}"
@@ -3897,7 +3991,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 +"try{out.hooked=window.__dyHooked?1:0;out.fetchType=(typeof window.fetch);}catch(e){}"
 +"function finish(){try{var cap=window.__dyCaptured||[];out.capN=cap.length;if(cap.length>0){out.detailLen=cap[0].b.length;out.detailHead=cap[0].b.slice(0,800);out.capUrl=cap[0].u;}}catch(e){}try{out.bodyText2=(document.body?document.body.innerText:'').slice(0,1500);}catch(e){}try{var mc=[];for(var ci=0;ci<(window.__dyCaptured||[]).length;ci++){var c=window.__dyCaptured[ci];mc.push((c.u||'').slice(0,120)+'#'+c.b.length);}out.capList=mc.join(' || ');}catch(e){}done();}"
 +"var _t=0;var _iv=setInterval(function(){_t++;var ok=false;"
-        +"try{var rd=window._ROUTER_DATA;if(rd&&rd.loaderData){for(var k in rd.loaderData){var pg=rd.loaderData[k];if(pg&&(pg.videoInfoRes||pg.slidesInfoRes||pg.imagesInfoRes)){ok=true;break;}}}}catch(e){}"
+        +"try{var rd=window._ROUTER_DATA;if(rd){var dj=JSON.stringify(rd);if(dj&&dj.indexOf('aweme_id')>=0)ok=true;if(!ok&&rd.loaderData){for(var k in rd.loaderData){var pg=rd.loaderData[k];if(pg&&(pg.videoInfoRes||pg.slidesInfoRes||pg.imagesInfoRes||pg.noteInfoRes||pg.imageInfoRes||pg.item_list)){ok=true;break;}}}}}catch(e){}"
         +"try{var vd=document.querySelector('video');if(vd&&vd.src)ok=true;}catch(e){}"
         +"try{if(window.__dyCaptured&&window.__dyCaptured.length>0)ok=true;}catch(e){}"
         +"if(ok){clearInterval(_iv);finish();return;}"
@@ -4596,10 +4690,93 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         renderMixList(n);
     }
 
-    /** 用 video_id / uri 拼无水印播放地址 */
+    /** 用 video_id / uri 拼无水印播放地址
+     *  ratio 可指定：4k / 1080p / 720p。
+     *  不传默认 1080p（兼容旧调用）。这个接口是「按 v id 现拼」的兜底路径，
+     *  只在拿不到 play_addr.url_list 原始直链时才走，避免把 4K 作品降级。 */
     static String playUrl(String vid){
+        return playUrl(vid, "1080p");
+    }
+
+    static String playUrl(String vid, String ratio){
         if(vid == null || vid.length() == 0) return "";
-        return "https://aweme.snssdk.com/aweme/v1/play/?video_id=" + vid + "&ratio=1080p&line=0";
+        if(ratio == null || ratio.length() == 0) ratio = "1080p";
+        return "https://aweme.snssdk.com/aweme/v1/play/?video_id=" + vid + "&ratio=" + ratio + "&line=0";
+    }
+
+    /**
+     * 原画地址（参考 JoeanAmier/TikTokDownloader 的 generate_original_quality_url）。
+     * 关键点：域名必须用 www.douyin.com，ratio 用 default，才拿到平台不限档的原始流；
+     * 用 aweme.snssdk.com + 4k 只会返回空体（实测 content-length: 0）。
+     */
+    static String playUrlOriginal(String vid){
+        if(vid == null || vid.length() == 0) return "";
+        return "https://www.douyin.com/aweme/v1/play/?video_id=" + vid + "&ratio=default";
+    }
+
+    /**
+     * 按播放地址判断文件后缀。
+     * 抖音原画（ratio=default）返回的是 WebM 容器（AV1+Opus），
+     * 扩展名写成 mp4 会让播放器按 MP4 解析而失败，必须区分。
+     */
+    static String extOf(String url){
+        if(url == null) return "mp4";
+        String u = url.toLowerCase(java.util.Locale.US);
+        if(u.indexOf("/aweme/v1/play/") >= 0 && u.indexOf("ratio=default") >= 0) return "webm";
+        if(u.indexOf(".webm") >= 0) return "webm";
+        if(u.indexOf(".m3u8") >= 0) return "mp4";
+        return "mp4";
+    }
+
+    /**
+     * 设备是否支持 AV1 硬解。
+     * 抖音的原画（ratio=default）是 WebM + AV1 + Opus，绝大多数机型（骁龙 8 Gen1 及更早、
+     * 天玑 1200 及更早）没有 AV1 解码器，硬塞进去就是「有声音没画面」。
+     * 所以必须先查 MediaCodec，别盲上原画。
+     */
+    static boolean hasAv1Decoder(){
+        try{
+            if(android.os.Build.VERSION.SDK_INT < 21) return false;
+            android.media.MediaCodecList list = new android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS);
+            android.media.MediaCodecInfo[] infos = list.getCodecInfos();
+            for(int i = 0; i < infos.length; i++){
+                android.media.MediaCodecInfo ci = infos[i];
+                if(ci == null || ci.isEncoder()) continue;
+                String[] types = ci.getSupportedTypes();
+                if(types == null) continue;
+                for(int j = 0; j < types.length; j++){
+                    if("video/av01".equalsIgnoreCase(types[j])) return true;
+                }
+            }
+        }catch(Throwable t){ Log.i("DYP", "AV1_CHECK_ERR " + t); }
+        return false;
+    }
+
+    /**
+     * 原画优先：能用才用。
+     * 参考 JoeanAmier/TikTokDownloader 的 __extract_video_download —— 先探体积再比大小。
+     * 这里额外加了 AV1 能力判断，因为实测 ratio=default 返回 WebM/AV1，
+     * 不支持 AV1 的机器会变成「有声音、黑屏」。
+     */
+    static String pickOriginalQuality(String vid, String curUrl, long curSize){
+        try{
+            if(!hasAv1Decoder()){
+                Log.i("DYP", "ORIG_SKIP 设备无 AV1 解码器");
+                return "";
+            }
+            String o = playUrlOriginal(vid);
+            if(o.length() == 0) return "";
+            long s = InnerDownloader.probeSizeRange(o);
+            Log.i("DYP", "ORIG_PROBE size=" + s + " cur=" + curSize);
+            if(s <= 0) return "";
+            if(curSize > 0 && s < curSize) return "";
+            return o;
+        }catch(Throwable t){ return ""; }
+    }
+
+    /** 同一个 uri 的 4K 兜底地址（起播失败降级或想拉原画时用） */
+    static String playUrl4k(String vid){
+        return playUrl(vid, "4k");
     }
 
     /** 兼容 JP 把数字解析成 Double 的情况：1 / 1.0 / true / "1" 都算真 */
@@ -4660,8 +4837,9 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     if(pa != null){
                         List ul = (List)get(pa, "url_list");
                         if(ul != null && ul.size() > 0) play = gs(ul.get(0));
+                        // 原始直链拿不到时才用 uri 现拼（否则会把 4K 作品硬降到 1080p）
                         String uri = gs(get(pa, "uri"));
-                        if(uri.length() > 0) play = playUrl(uri);
+                        if(play.length() == 0 && uri.length() > 0) play = playUrl(uri);
                     }
                     // 2) bit_rate 里挑最高码率
                     if(play.length() == 0){
@@ -6270,145 +6448,28 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v1.3.7.4】批量解析重构：静默解析 + 结果进列表 + 退出重进可恢复\n"
+            "【v1.3.7.5】画质大升级：支持抖音原画（最高 8K）\n"
              + "新增\n"
-             + "· 后台保活设置：设置 → 后台保活（下载不中断）\n"
-             + "  · 电池优化白名单：一键调起系统框，点「允许」后下载不会被省电策略限制\n"
-             + "  · 厂商后台限制：按机型直达「自启动 / 后台运行管理」页面\n"
-             + "    （华为/荣耀/小米/红米/OPPO/一加/真我/vivo/iQOO/魅族/华硕/三星）\n"
-             + "  · 首次启动会弹一次引导，已放行的设备不弹\n"
-             + "  · 这类设置属系统权限，App 不能替用户改，只能引导跳转\n"
-             + "· 更新源可自由切换：设置 → 更新源（Gitee / GitHub）\n"
-             + "· GitHub 访问方式（设置 → GitHub 访问方式）：镜像加速 / 直连\n"
-             + "  · 镜像加速会自动从 4 个公开镜像里挑可用的，全部失效时自动回退直连\n"
-             + "  · 不用自己挂代理也能在 GitHub 源下检查更新和下载 APK\n"
-             + "· 自动播放关闭时显示封面预览图：解析完不再黑屏，点「播放」直接切回视频\n"
-             + "· 解析后自动播放 / 自动下载开关（设置 → 解析后动作，默认都关闭），两个都开则同时进行\n"
-             + "· 解析成功后清空链接开关（默认关闭）：解析完自动清空输入框\n"
-             + "· 剪贴板自动识别（内置常开，无开关）：回前台自动读口令填链接，支持一次识别多条\n"
-             + "· 多链接批量解析：一行一个链接，串行静默执行，跑完统一进列表页\n"
-             + "· 批量结果进「列表」页：逐条可下载 / 解析看详情，结果追加不清掉上一次\n"
-             + "· 列表持久化（设置 → 保留解析列表，默认开启）：退出重进仍在，可继续追加\n"
-             + "· 清空列表按钮（带二次确认）、上一条 / 下一条导航（显示 2/3 位置）\n"
-             + "· 主页/合集批量下载可选第几个：[选择下载] 多选 + [下载全部]，只处理当前页\n"
-             + "· 主页 / 合集 / 短剧解析前置确认：说明会抓全量并清空列表；开了自动下载时额外警告\n"
+             + "· 抖音原画下载：可直接拿到平台原始画质（实测 8K / 4K，体积可达数 GB）\n"
+             + "· 播放器控制栏自动隐藏：小窗和全屏都是点一下出现，几秒后自动收起\n"
+             + "· 不支持的链接会给出友好提示，不再弹出技术报错\n"
              + "优化\n"
-             + "· 批量解析间隔：固定 15 秒改为「解析完 3 秒后推进」+ 60 秒兜底超时\n"
-             + "· 批量结果列表标题按来源区分：批量解析 / 主页\n"
-             + "· 主页 / 合集解析先自动清空列表（批量模式下不清，保护自己收集的结果）\n"
+             + "· 抖音画质档位识别更准，优先选分辨率最高的一档\n"
+             + "· 原画下载自动用正确文件格式保存，避免播放器打不开\n"
+             + "· 播放小窗点击响应更灵敏，点画面任意位置都能唤出进度条\n"
              + "修复\n"
-             + "· 批量解析最后一条永不渲染（列表空但清空说有 4 条记录）：batchItemFinished 里提前 return，\n"
-             + "  导致 BATCH_DONE 和列表渲染永不执行\n"
-             + "· 自动播放开关无效（默认关闭时解析视频仍会自动播放）：render 视频分支写死 doPlay()\n"
-             + "· 批量模式下主页判定误清空自己的结果：4 处主页入口无条件清空列表\n"
-             + "· 页面在确认框弹出瞬间就抓完整页数据绕过确认：现改为确认期间拦截请求 + 丢弃页面数据，\n"
-             + "  确认后再主动发起签名翻页\n"
-             + "· 华为 P40 / Android 10 等系统下载失败（能播能听就是下不了）：\n"
-             + "  Manifest 缺 requestLegacyExternalStorage，Android 10 强制分区存储导致写不进公共目录。\n"
-             + "  已补该开关，并新增 MediaStore 兜底：目录不可写时先下到私有目录，\n"
-             + "  下完自动搬进「内部存储/Download/DYParse/<分类>/」，Android 8~17 全兼容。\n"
-             + "  设置页新增「存储写入检测」，可自查权限与目录可写状态\n"
-             + "· Android 7/8 下载崩溃：通知用了 API 26+ 才有的双参构造，低版本会 NoSuchMethodError\n"
-             + "  导致前台服务起不来。已按版本分开构造，Android 7 起可正常下载\n"
-             + "· Android 7 权限被拒后无法下载：系统不再弹窗。现改为启动时主动申请一次，\n"
-             + "  被永久拒绝时弹「需要存储权限」引导，可直接跳系统设置开启\n"
-             + "· 后台下载几分钟就断 + 通知栏进度不同步（本次重点修复）：\n"
-             + "  · 读超时 30 秒太短，后台限流就断 → 改为 90 秒\n"
-             + "  · 重试 3 次无间隔 → 改为 6 次 + 递增退避（1/2/3/5/8 秒）\n"
-             + "  · 文件名带时间戳导致 .part 永远匹配不上，续传形同虚设 → 改为稳定文件名\n"
-             + "  · 失败后 .part 被删 → 改为保留，重新点下载自动接着传\n"
-             + "  · 通知栏从静态文字改为实时进度 + 速度（如 1.8MB/s），结束显示成功/失败数\n\n"
-             + "──────────────\n"
-             + "【v1.3.7.3】版本号算法重构 + 弹窗主题修复（重要）\n"
-             + "修复\n"
-             + "· 检查更新失效（一直提示「已是最新版」但实际有新版）：parseVer 只解析三段版本号，\n"
-             + "  v1.3.7.2 被算成 10307，远小于当前版本号 → 永远判「已是最新」\n"
-             + "· 更新源被错误覆盖：自建服务器拿到 tag 后会被 Gitee API 无条件覆盖，现改为只在更高版本时覆盖\n"
-             + "· 暗色模式下「发现新版本」等 15 处弹窗显示为亮色/深色错乱：全部统一走 App 主题\n"
-             + "变更\n"
-             + "· 版本号规则改为每段占两位：major*1000000 + minor*10000 + patch*100 + sub\n"
-             + "  1.3.7→1030700、1.3.7.1→1030701、1.3.7.3→1030703、1.3.8→1030800、1.4.0→1040000\n"
-             + "· 新增服务器公告通道 upgrade_notice：可下发标题/正文/链接/生效版本阈值\n"
-             + "提示\n"
-             + "· v1.3.7.1 和 v1.3.7.2 的版本号算法有缺陷，检测不到后续更新，\n"
-             + "  需到发布页手动下载一次（覆盖安装不丢数据），装完后续更新恢复正常\n\n"
-             + "──────────────\n"
-             + "【v1.3.7.2】抖音主页全量翻页 + 登录体验统一\n"
-             + "修复\n"
-             + "· 抖音主页只出 20 条就停：现按 max_cursor 反复翻页（每页重算 a_bogus 签名），\n"
-             + "  实测 280 条作品 16 页全部翻完\n"
-             + "· 连续解析两个主页时第二个只出一部分：主页模式状态未重置，旧数据不清 + 请求被挡\n"
-             + "· 抖音登录操作条崩溃（ClassCastException: LinearLayout cannot be cast to FrameLayout）\n"
-             + "新增\n"
-             + "· 抖音 / YouTube / B站 / Instagram 登录后自动退出登录页回到解析页，不保留网页\n\n"
-             + "──────────────\n"
-             + "【v1.3.7.1】抖音实况图凭据自动获取 + 本地解析\n"
-             + "新增\n"
-             + "· 抖音访客凭据自动获取：首次解析实况图时后台静默获取，实测 2-3 秒，全程无需操作\n"
-             + "· 设置 → 抖音访客凭据：可手动重新获取、手动粘贴、清空，并显示当前凭据状态\n"
-             + "· 抖音实况图改为「本地优先」解析：有凭据时直接本地签名，不再经过服务器\n"
-             + "· 获取失败时弹窗说明原因，提供「重试 / 手动填写」两个入口\n"
-             + "修复\n"
-             + "· 抖音实况图只有 1 张静态图、没有动图（LIVE 角标不出来）：详情接口强制要求访客凭据，\n"
-             + "  缺少时固定返回 403 Blocked by ArgusSecurityPlugin；现改为自动获取凭据后本地签名\n"
-             + "· 实况图下载提示文案错误：之前写「可存为 MP4」，实际一直是 .jpg 实况照片，已改正\n"
-             + "· 平台支持说明里抖音一栏补充实况图机制说明\n"
-             + "变更\n"
-             + "· 解析优先级调整：无凭据走服务器，有凭据走本地（本地失败自动回退服务器）\n"
-             + "· 服务端 8443 TLS 阻塞热修 + 自愈守卫（详见更新日志 v1.3.7）\n"
-             + "· 版本号规则支持四位（1.3.7.1 = build 103701）\n\n"
-             + "──────────────\n"
-             + "【v1.3.7】B站直连提速 + 合集解析 + YouTube回退修复 + TikTok图文修复\n"
-             + "修复\n"
-             + "· B站视频播放不再走服务器中转：CDN 现强制校验 buvid3 且拒绝手机 UA，已改为自动取 buvid3 + 桌面 UA 直连，秒开\n"
-             + "· B站下载同步改为直连，速度不再受服务器带宽限制\n"
-             + "· YouTube 第二次解析不再回退（没画面没进度条、过一会提示被 CDN 拒绝）：回退标志从不复位，已改为每次解析前重置\n"
-             + "· TikTok 图文加载不出来：服务器 fetch_media 缩进错误，缓存未命中时返回 None，已重写\n"
-             + "· TikTok 图文同一张图被并发重复请求导致连接被写坏，已加图片内存缓存与去重\n"
-             + "新增\n"
-             + "· B站合集解析：整个合集的每一集都列出来，每集用自己的 aid 下载/播放（合集里各集 aid 不同）\n"
-             + "· 抖音/B站合集统一进「列表」页，解析完自动切过去并提示，主解析页保留原详情\n"
-             + "· 列表「选择下载」：可勾选任意几集一起下，也有「全选」\n"
-             + "· B站画质升级 DASH：匿名 480P/720P，登录 1080P，大会员 1080P60，4K 原片可拿 4K\n"
-             + "· B站 Cookie（设置 → Cookie → B站 Cookie），填 SESSDATA 提画质；不填也能用\n"
-             + "变更\n"
-             + "· B站 CDN 拉流使用桌面 UA（仅 CDN，不影响 API）\n"
-             + "· B站播放下载改为视频轨+音频轨双轨，播放器合并、下载后无损合成 mp4\n\n"
-             + "──────────────\n"
-             + "【v1.3.6】Instagram 登录解析 + 代理简化\n"
-             + "新增\n"
-             + "· Instagram 登录解析：App 内登录 IG，Cookie 存手机本地（不上传），可解析 Reel 视频并下载\n"
-             + "· Instagram 主页解析：用户名主页列出全部作品，每页 100 条带翻页\n"
-             + "· Instagram 登录前风险提示（每次登录都会弹出，需确认后才进入）\n"
-             + "· B站解析：单视频 / av / BV / 分P合集 + 空间主页，本地直连\n"
-             + "· Cookie 本地保存：设置 → Cookie，一行一个 name=value，可手动填可清空\n"
-             + "· 设置页新增「Cookie（本地保存）」分区\n"
-             + "变更\n"
-             + "· 代理简化为单一「内置代理」开关（默认关）：开=海外平台走服务器中转，关=全部直连\n"
-             + "· 不再自动探测/套用用户代理，App 不干预你自己的 TUN / 代理\n"
-             + "· X 解析：内置代理关时优先直连，失败再兜底服务器\n"
-             + "· TikTok 请求与下载一律直连\n"
-             + "修复\n"
-             + "· X 单推文链接被主页判定误吞\n"
-             + "· IG 视频直链错放图集字段导致走图片队列\n\n"
-             + "──────────────\n"
-             + "【v1.3.5】YouTube 登录解析 + 下载提速\n"
-             + "新增\n"
-             + "· YouTube 登录：App 内登录 Google 账号，自动抓取 Cookie 上传服务器，解 YouTube 风控\n"
-             + "· YouTube 服务器流式中转（/api/yt/stream），带进度条拖动\n"
-            + "· YouTube 主页列表下载自动入队（解析完不用再点一次）\n"
-            + "优化\n"
-            + "· YouTube 下载走服务器中转（直链绑解析 IP 会 403），已缓存视频秒下\n"
-            + "· YouTube 播放直连优先，403 自动回退服务器中转\n"
-            + "· YouTube 优先 H.264（AV1 部分设备解码不了）\n"
-            + "· YouTube 解析合并 yt-dlp 调用（60s → 22s，二次解析 0s）\n"
-            + "· 服务器 yt-dlp-ejs + node 解 n-challenge（新格式全恢复）\n"
-            + "· 所有弹窗跟随 App 主题（修复暗色弹窗）\n"
-            + "修复\n"
-            + "· YouTube 下载空文件（403 时残留半成品）\n"
-            + "· 下载失败文件名空指针崩溃\n"
-            + "· 服务器地址弹窗精简为只有服务器地址\n"
-            + "· 用户协议/YouTube 登录弹窗暗色显示异常";
+             + "· 部分视频有声音没画面（设备不支持原画编码时自动降级到兼容档）\n"
+             + "· 图文、实况图解析后提示解析失败、图片加载不出来\n"
+             + "· 小窗进度条点了不显示、显示了不会自动隐藏\n"
+             + "· 全屏播放器控制栏不自动隐藏\n"
+             + "\n"
+             + "【历史版本】\n"
+             + "v1.3.7.4：批量解析重构，静默执行、结果进列表、退出重进可恢复\n"
+             + "· 后台保活设置、更新源切换、GitHub 镜像加速\n"
+             + "· 自动播放关闭时显示封面预览、批量结果列表持久化\n"
+             + "v1.3.7.3：修复下载中断、优化封面预览、适配 Android 7~17\n"
+             + "v1.3.7.2：修复实况图解析、优化访客凭据获取\n"
+             + "v1.3.7.1：新增实况照片支持、访客凭据管理\n";
     }
     static String changelogOld(){
         return
@@ -7455,41 +7516,52 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 web.evaluateJavascript("try{window.__dyStopScroll=1;}catch(e){}", null);
             }catch(Throwable t){}
         }
-        web.setVisibility(View.GONE);
     }
 
-    /** 主页条目下载：在 WebView 页面里发 detail 请求拿高清直链（利用页面已签名的环境） */
+    /** 主页条目下载：在 WebView 页面里发 detail 请求拿高清直链 */
     String pendingDetailId = "";
     String pendingDetailTag = "";
-    String pendingDetailSignedUrl = "";   // 页面自动加过 msToken+a_bogus 的完整 URL
+    String pendingDetailSignedUrl = "";
     /** 解析完成后自动入下载队列（主页列表抖音条目） */
     String pendingAutoDlTag = "";
     int pendingAutoDlIdx = -1;
-    void downloadProfileItemViaDetail(final String awemeId, final String tag){
-        if(web == null || !webReady) return;
-        pendingDetailId = awemeId;
-        pendingDetailTag = tag;
-        pendingDetailSignedUrl = "";
-        // 页面 fetch 会自动被抖音签名包装器补 msToken+a_bogus；
-        // 在 JS 里就地抽取直链字段，只传小 JSON 过桥（避免大字符串跨桥失败）。
-        String js = "(function(){try{"
-            + "var url='/aweme/v1/web/aweme/detail/?device_platform=webapp&aid=6383"
-            + "&channel=channel_pc_web&aweme_id=" + awemeId + "&pc_client_type=1&version_code=190500&version_name=19.5.0&cookie_enabled=true&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome&browser_version=120.0.0.0&browser_online=true';"
-            + "function pick(t){try{var j=JSON.parse(t);var out={};"
-            + "var ad=j.aweme_detail||j;"
-            + "out.aweme_id=ad.aweme_id||'';"
-            + "var v=ad.video;if(v&&v.play_addr){var ul=v.play_addr.url_list||[];out.vurl=ul[0]||'';}"
-            + "if(!out.vurl&&v&&v.download_addr){var dl=v.download_addr.url_list||[];out.vurl=dl[0]||'';}"
-            + "var imgs=ad.images;if(imgs&&imgs.length){var il=imgs[0].url_list||[];out.iurl=il[0]||'';}"
-            + "if(!out.vurl&&!out.iurl&&v&&v.bit_rate){for(var i=0;i<v.bit_rate.length;i++){var b=v.bit_rate[i];if(b.play_addr){var bl=b.play_addr.url_list||[];if(bl[0]){out.vurl=bl[0];break;}}}}"
-            + "return out;}catch(e){return {perr:''+e};}}"
-            + "fetch(url,{credentials:'include'}).then(function(r){return r.text();}).then(function(t){"
-            + "var o=pick(t);window.DyBridge.onDetailData(JSON.stringify(o));"
-            + "}).catch(function(e){window.DyBridge.onDetailData(JSON.stringify({ferr:''+e}));});"
-            + "}catch(e){window.DyBridge.onDetailData(JSON.stringify({err:''+e}));}})()";
-        web.evaluateJavascript(js, null);
-    }
 
+    /** 移动端 detail 补抓：PC detail 只给到 720P，移动端才下发 4K/8K 档。 */
+    void fetchDetailMobile(final String awemeId){
+        if(web == null || !webReady){ Log.i("DYP", "MOB_SKIP not ready"); return; }
+        if(awemeId == null || awemeId.length() == 0) return;
+        // 关键：参数必须和页面环境（PC Chrome UA）完全一致，否则抖音风控
+        // 直接返回 "Blocked by..." HTML 拦截页，JSON.parse 就报 SyntaxError。
+        // 之前用 version_code=290100 + support_h265 就是这个下场。
+        // 现在完全照搬页面自身 detail 请求的参数形态。
+        String url = "/aweme/v1/web/aweme/detail/?device_platform=webapp&aid=6383"
+            + "&channel=channel_pc_web&aweme_id=" + awemeId
+            + "&pc_client_type=1&version_code=190500&version_name=19.5.0"
+            + "&cookie_enabled=true&screen_width=1536&screen_height=864"
+            + "&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
+            + "&browser_version=120.0.0.0&browser_online=true";
+        StringBuilder sb = new StringBuilder();
+        sb.append("(function(){try{");
+        sb.append("var U='").append(url).append("';");
+        sb.append("fetch(U,{credentials:'include'}).then(function(r){return r.text();}).then(function(t){");
+        sb.append("if(!t||t.charAt(0)!='{'&&t.charAt(0)!='['){");
+        sb.append("window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'BLOCKED:'+t.slice(0,60)}));return;}");
+        sb.append("try{var j=JSON.parse(t);var ad=j.aweme_detail;");
+        sb.append("if(!ad){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'nd'}));return;}");
+        sb.append("var v=ad.video||{};var brs=v.bit_rate||[];var best=null;var bw=0;");
+        sb.append("for(var i=0;i<brs.length;i++){var b=brs[i];var pa=b.play_addr;");
+        sb.append("if(!pa)continue;var ww=(pa.width||0)*(pa.height||0);");
+        sb.append("if(ww>=bw){bw=ww;best=b;}}");
+        sb.append("var o={mob:1,n:brs.length};");
+        sb.append("if(best&&best.play_addr){var ul=best.play_addr.url_list||[];");
+        sb.append("o.vurl=ul[0]||'';o.mw=best.play_addr.width||0;o.mh=best.play_addr.height||0;}");
+        sb.append("window.DyBridge.onDetailData(JSON.stringify(o));");
+        sb.append("}catch(e){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'p'+e}));}");
+        sb.append("}).catch(function(e){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'f'+e}));});");
+        sb.append("}catch(e){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'x'+e}));}})()");
+        Log.i("DYP", "DETAIL_MOBILE_START id=" + awemeId);
+        web.evaluateJavascript(sb.toString(), null);
+    }
     /** 解析 JS 回传的直链小 JSON（{vurl|iurl|err}），入下载队列 */
     void parseDetailBody(final String body){
         try{
@@ -7502,6 +7574,40 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 return;
             }
             Map m = (Map) root;
+            // ===== 移动端 detail 补抓结果：只用于替换更高画质的播放地址 =====
+            if(parseLong(get(m, "mob"), 0) == 1){
+                // 补抓失败是内部行为，用户已经在看 720P 了，不该弹「解析失败」吓他
+                String mErr = gs(get(m, "err"));
+                if(mErr.length() > 0){
+                    Log.i("DYP", "DETAIL_MOBILE_ERR " + mErr.substring(0, Math.min(80, mErr.length())));
+                    return;
+                }
+                String mvurl = gs(get(m, "vurl"));
+                String mw = gs(get(m, "mw")), mh = gs(get(m, "mh"));
+                String gearN = gs(get(m, "gearN"));
+                Log.i("DYP", "DETAIL_MOBILE_OK " + mw + "x" + mh + " gears=" + gearN
+                    + " url=" + (mvurl.length() > 60 ? mvurl.substring(0, 60) : mvurl));
+                if(mvurl.length() > 0){
+                    long nw = parseLong(mw, 0), nh = parseLong(mh, 0);
+                    long curShort = 0;
+                    if(curGears.size() > 0){
+                        curShort = Math.min(parseLong(curGears.get(0)[5], 0), parseLong(curGears.get(0)[6], 0));
+                    }
+                    long newShort = Math.min(nw, nh);
+                    if(newShort > curShort){
+                        Log.i("DYP", "DETAIL_MOBILE_UPGRADE " + curShort + " -> " + newShort);
+                        curPlay = mvurl;
+                        startedUrl = "";
+                        miniProxyKey = null;
+                        try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                        final String tip = "已拿到 " + nw + "x" + nh + " 原画，可点播放";
+                        h.post(new Runnable(){ public void run(){ showHintToast(tip); }});
+                    } else {
+                        Log.i("DYP", "DETAIL_MOBILE_NO_GAIN cur=" + curShort + " new=" + newShort);
+                    }
+                }
+                return;   // 移动端回包不走进下载队列逻辑
+            }
             String err = gs(get(m, "err")) + gs(get(m, "ferr")) + gs(get(m, "perr"));
             String vurl = gs(get(m, "vurl"));
             String iurl = gs(get(m, "iurl"));
@@ -8497,8 +8603,68 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         if(iid.length()>0){
             curId=iid;
             curDesc=gs(get(m,"i_desc"));
-            curPlay=gs(get(m,"i_ws"));
-            if(curPlay.length()==0) curPlay=gs(get(m,"i_play"));
+            // ===== 清晰度档位（4K/8K/HDR/高帧率）=====
+            // i_gears 是按「清晰度+码率」从高到低排好的数组，[0] 就是最高画质。
+            parseGears(gs(get(m,"i_gears")));
+            // 选流：原始直链（i_play）优先，避免把 4K 作品硬降到 1080p。
+            // i_ws 是按 uri 现拼的 ratio=1080p 地址，只作兜底与降级源。
+            String rawPlay = gs(get(m,"i_play"));
+            String wsPlay  = gs(get(m,"i_ws"));
+            // 有清晰度档时，最高档优先（这才是真正的 4K 原画）
+            String bestGear = gearUrl(0);
+            if(bestGear.length() > 0){
+                Log.i("DYP", "PLAY_BEST_GEAR " + gearLabel(0) + " " + bestGear.substring(0, Math.min(70, bestGear.length())));
+                rawPlay = bestGear;
+            }
+            // ===== 原画优先（参考 JoeanAmier/TikTokDownloader）=====
+            // 抖音的 ratio=default 才是真原画（实测 4.36GB vs 1080p 160MB，差 27 倍），
+            // 但它是 WebM + AV1 + Opus，没 AV1 硬解的机器会「有声音没画面」。
+            // 所以：设备支持 AV1 且原画体积更大 → 用原画；否则老实走档位。
+            String vidUri = gs(get(m,"i_uri"));
+            curPlay = rawPlay.length() > 0 ? rawPlay : wsPlay;
+            // 记下这条作品的 1080p 兜底地址：4K 起播失败 / 解码不支持时自动降级
+            curFallbackPlay = (wsPlay.length() > 0 && !wsPlay.equals(curPlay)) ? wsPlay : "";
+            curVidUri = gs(get(m,"i_uri"));
+            // 原画探测放到后台线程（主线程发网络请求会 NetworkOnMainThreadException）。
+            // 探到了再替换 curPlay / curDlPlay，此时用户可能已经在看档位流，不阻塞。
+            final String vUriBg = curVidUri;
+            if(vUriBg.length() > 0){
+                new Thread(new Runnable(){ public void run(){
+                    try{
+                        final String orig = pickOriginalQuality(vUriBg, curPlay, 0);
+                        if(orig.length() > 0){
+                            Log.i("DYP", "PLAY_ORIGINAL " + orig.substring(0, Math.min(70, orig.length())));
+                            h.post(new Runnable(){ public void run(){
+                                if(orig.equals(curPlay)) return;
+                                curPlay = orig;
+                                curFallbackPlay = "";      // 原画成功就别再降级到 1080p
+                                startedUrl = "";           // 清掉「同一地址不重复起播」的锁
+                                Log.i("DYP", "PLAY_ORIGINAL_APPLIED");
+                                // 原画是 WebM/AV1，播放器必须重新初始化才能换解码器
+                                doPlay();
+                            }});
+                        }
+                    }catch(Throwable t){ Log.i("DYP", "ORIG_BG_ERR " + t); }
+                }}).start();
+            }
+            playFallbackDone = false;   // 新作品：允许再次降级
+            // 抖音视频：PC detail 只给 720P，异步补抓一次移动端 detail 看能否升到 4K。
+            // 有结果再替换 curPlay，用户此时可能还在看 720P，不阻塞。
+            final String fid = iid;
+            int topShort = 0;
+            if(curGears.size() > 0){
+                topShort = (int)Math.min(parseLong(curGears.get(0)[5], 0), parseLong(curGears.get(0)[6], 0));
+            }
+            Log.i("DYP", "MOBILE_CHECK id=" + fid + " gears=" + curGears.size() + " topShort=" + topShort);
+            if(fid.length() > 0 && topShort < 1400){
+                // 延时等 WebView 页面稳定，再发移动端 detail
+                h.postDelayed(new Runnable(){ public void run(){
+                    try{ fetchDetailMobile(fid); }catch(Throwable t){ Log.i("DYP", "MOB_ERR " + t); }
+                }}, 2500);
+            }
+            if(curFallbackPlay.length() > 0){
+                Log.i("DYP", "PLAY_FALLBACK_SAVED " + curFallbackPlay.substring(0, Math.min(70, curFallbackPlay.length())));
+            }
             // YouTube direct：独立音轨（googlevideo itag 140 m4a），播放器合并、下载后本地 mux
             curAudio=gs(get(m,"i_audio"));
             curCover=gs(get(m,"i_cover"));
@@ -9194,6 +9360,148 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         }}, 3000);
     }
 
+    // ===== 小窗控制栏自动隐藏 =====
+    /** 小窗控制栏是否可见 */
+    boolean miniBarShown = false;
+    /** 小窗点按判定：移动超过阈值就算拖动，不算点击 */
+    boolean miniTapMoved = false;
+    float miniTapX = 0, miniTapY = 0;
+    /** 自动隐藏计时器代次（每次显隐自增，避免旧回调误隐藏） */
+    int miniBarGen = 0;
+    static final int MINI_BAR_HIDE_MS = 3000;
+
+    /** 绑定小窗点按显隐 + 3 秒自动淡出 */
+    void setupMiniBarAutoHide(){
+        try{
+            if(videoBox == null || miniBar == null) return;
+            // 初始隐藏，等用户点一下再显示（不点击不显示）
+            miniBar.setVisibility(View.GONE);
+            miniBarShown = false;
+            // control layer：和 ExoPlayer PlayerView 一样，画面之上这一层统一接点击
+            if(miniTouch != null){
+                miniTouch.setClickable(true);
+                miniTouch.setOnClickListener(new View.OnClickListener(){
+                    public void onClick(View v){
+                        Log.i("DYP", "MINI_CLICK layer");
+                        toggleMiniBar();
+                    }
+                });
+            }
+            // 关键：videoBox 在 ScrollView 内部，onTouch 会被 ScrollView 拦截，
+            // 收不到 ACTION_UP。必须用 OnClickListener（系统能正确处理滚动容器内的点击）。
+            videoBox.setClickable(true);
+            videoBox.setFocusable(true);
+            videoBox.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    Log.i("DYP", "MINI_CLICK box");
+                    toggleMiniBar();
+                }
+            });
+            // video 是 TextureView，同样用 OnClickListener；
+            // 它会盖在 videoBox 上，所以要单独绑。
+            try{
+                if(video != null){
+                    video.setClickable(true);
+                    video.setFocusable(true);
+                    video.setOnClickListener(new View.OnClickListener(){
+                        public void onClick(View v){
+                            Log.i("DYP", "MINI_CLICK video");
+                            toggleMiniBar();
+                        }
+                    });
+                }
+            }catch(Throwable t){}
+            // 点控制栏本身：只续命，不隐藏（不能设 OnClickListener，会吞掉子按钮）
+            miniBar.setOnTouchListener(new View.OnTouchListener(){
+                public boolean onTouch(View v, android.view.MotionEvent e){
+                    if(e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN){
+                        pokeMiniBar();
+                    }
+                    return false;
+                }
+            });
+            // 拖进度条时不要自动隐藏
+            miniSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
+                public void onProgressChanged(SeekBar sb, int p, boolean fromUser){}
+                public void onStartTrackingTouch(SeekBar sb){ miniBarGen++; }
+                public void onStopTrackingTouch(SeekBar sb){ pokeMiniBar(); }
+            });
+            Log.i("DYP", "MINI_BAR_AUTOHIDE ready");
+        }catch(Throwable t){ Log.i("DYP", "MINI_BAR_INIT_ERR " + t); }
+    }
+
+
+    /** 显示控制栏并重置 3 秒计时 */
+    void pokeMiniBar(){
+        try{
+            if(miniBar == null) return;
+            // 以实际可见性为唯一真相（不依赖 miniBarShown 变量，避免脱钩）
+            if(miniBar.getVisibility() != View.VISIBLE){
+                miniBar.setAlpha(1f);
+                miniBar.setVisibility(View.VISIBLE);
+                Log.i("DYP", "MINI_BAR_SHOW");
+            }
+            miniBarShown = true;
+            final int myGen = ++miniBarGen;
+            Log.i("DYP", "MINI_BAR_POKE gen=" + myGen);
+            h.postDelayed(new Runnable(){ public void run(){
+                if(myGen != miniBarGen){
+                    Log.i("DYP", "MINI_BAR_TIMER_SKIP gen=" + myGen + " cur=" + miniBarGen);
+                    return;                              // 期间又点过，重新计时
+                }
+                Log.i("DYP", "MINI_BAR_TIMER_FIRE gen=" + myGen);
+                hideMiniBar();
+            }}, MINI_BAR_HIDE_MS);
+        }catch(Throwable t){ Log.i("DYP", "MINI_POKE_ERR " + t); }
+    }
+
+    /** 隐藏控制栏 */
+    void hideMiniBar(){
+        try{
+            if(miniBar == null) return;
+            if(miniBar.getVisibility() != View.VISIBLE){
+                Log.i("DYP", "MINI_BAR_ALREADY_HIDDEN");
+                return;
+            }
+            miniBarShown = false;
+            miniBarGen++;                 // 让所有在途定时器作废
+            // 直接隐藏，不用动画（动画在 View 被 GONE 时 withEndAction 不一定回调，
+            // 之前就是靠动画才出现「有时不隐藏」的诡异现象）
+            miniBar.setVisibility(View.GONE);
+            miniBar.setAlpha(1f);
+            Log.i("DYP", "MINI_BAR_HIDE gen=" + miniBarGen);
+        }catch(Throwable t){ Log.i("DYP", "MINI_HIDE_ERR " + t); }
+    }
+
+    /** 切换显隐 */
+    void toggleMiniBar(){
+        try{
+            if(miniBar == null) return;
+            boolean vis = miniBar.getVisibility() == View.VISIBLE;
+            Log.i("DYP", "MINI_TOGGLE vis=" + vis);
+            if(vis) hideMiniBar();
+            else pokeMiniBar();
+        }catch(Throwable t){ Log.i("DYP", "MINI_TOGGLE_ERR " + t); }
+    }
+
+    /** 用户贴了不支持的网址：说清楚支持哪些平台，不抛技术错误 */
+    void showUnsupportedUrlDialog(final String url){
+        String host = url;
+        try{
+            java.net.URL u = new java.net.URL(url);
+            host = u.getHost();
+        }catch(Throwable t){}
+        dypDlg()
+            .setTitle("这个链接暂不支持")
+            .setMessage("你贴的是：\n" + host + "\n\n"
+                + "目前支持解析的平台：\n"
+                + "抖音、快手、TikTok、X（推特）、YouTube、B 站、Instagram\n\n"
+                + "请把对应平台的分享链接贴进来。")
+            .setPositiveButton("知道了", null)
+            .show();
+        s("暂不支持该平台");
+    }
+
     void parse(){
          final String raw=input.getText().toString().trim();
          if(raw.length()==0){ s("空链接"); return; }
@@ -9222,6 +9530,14 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
              input.setSelection(url.length());
          }
          if(url==null){ s("未找到链接"); return; }
+         // ===== 平台前置校验 =====
+         // 用户贴了不支持的网址（例如 GitHub 仓库）时，别丢进解析链路，
+         // 否则会拿到 HTML 再当 JSON 解析，报 "Unexpected token 'B', Blocked by..." 这种莫名其妙的错。
+         if(!isSupportedParseUrl(url)){
+             Log.i("DYP", "PARSE_UNSUPPORTED " + url);
+             showUnsupportedUrlDialog(url);
+             return;
+         }
           // 主页 / 合集解析前置确认：这类解析会抓全量作品、并清空列表，先让用户确认
           if(needConfirmBigParse(url)){
               final String u0 = url;
@@ -9983,6 +10299,295 @@ webDone=false;
         return mm.find() ? mm.group(1) : "";
     }
 
+    /** 调试用：把一档的 JSON 压成短串，方便日志里一眼看完所有档位 */
+    static String shortGear(String row){
+        if(row == null) return "?";
+        try{
+            java.util.regex.Matcher mw = java.util.regex.Pattern.compile("\"w\":(\\d+)").matcher(row);
+            java.util.regex.Matcher mh = java.util.regex.Pattern.compile("\"h\":(\\d+)").matcher(row);
+            java.util.regex.Matcher mf = java.util.regex.Pattern.compile("\"fps\":(\\d+)").matcher(row);
+            java.util.regex.Matcher mb = java.util.regex.Pattern.compile("\"br\":(\\d+)").matcher(row);
+            java.util.regex.Matcher mg = java.util.regex.Pattern.compile("\"g\":\"([^\"]*)\"").matcher(row);
+            String w = mw.find() ? mw.group(1) : "0";
+            String h = mh.find() ? mh.group(1) : "0";
+            String f = mf.find() ? mf.group(1) : "0";
+            String br = mb.find() ? mb.group(1) : "0";
+            String g = mg.find() ? mg.group(1) : "";
+            long brv = 0;
+            try{ brv = Long.parseLong(br); }catch(Throwable t){}
+            return w + "x" + h + "@" + f + "/" + (brv / 1000000) + "M/" + g;
+        }catch(Throwable t){ return "?"; }
+    }
+
+    /** 图集取原图：url_list 里最后一项通常是最高分辨率那一份。
+     *  同时去掉抖音的缩略图处理参数，这类参数会让服务端返回压缩图。 */
+    static String bestImgUrl(Object urls){
+        if(!(urls instanceof java.util.List)) return "";
+        java.util.List ul = (java.util.List)urls;
+        if(ul.isEmpty()) return "";
+        // 经验：url_list[0] 是页面实际渲染用的地址，一定有效；
+        // 后面的（尤其是 p3-pc-sign / p*-ex-* 这类）有些会 404。
+        // 所以用第 0 项做基准，只把它的小尺寸模板换成大尺寸。
+        Object u0 = ul.get(0);
+        String first = u0 == null ? "" : String.valueOf(u0);
+        if(first.length() == 0){
+            for(int i = 1; i < ul.size(); i++){
+                Object uo = ul.get(i);
+                String u = uo == null ? "" : String.valueOf(uo);
+                if(u.length() > 0){ first = u; break; }
+            }
+        }
+        if(first.length() == 0) return "";
+        return stripImgResize(first);
+    }
+
+    /** 图片 URL 处理：把「缩略图模板」换成「原图模板」，保持路径结构不变。
+     *  重要教训：不能把 ~tplv-xxx 整段删掉！
+     *  抖音 CDN 的路径里 ~tplv- 段是资源名的一部分，删了直接 404（FileNotFoundException）。
+     *  正确做法是只替换 tplv 后面的缩放规格：
+     *    ~tplv-dy-shrink:480:853.webp   →  ~tplv-dy-aweme-images:q100.jpeg
+     *  拿不准时原样返回，宁可用缩略图也不要 404。 */
+    static String stripImgResize(String u){
+        if(u == null || u.length() == 0) return "";
+        try{
+            int t = u.indexOf("~tplv-");
+            if(t <= 0) return u;                       // 没有模板段，原样用
+            // 找模板段的结束位置（? 之前）
+            int q = u.indexOf('?', t);
+            int end = (q > 0) ? q : u.length();
+            String tplv = u.substring(t, end);
+            // 只处理「带尺寸收缩参数」的模板：xxx:480:853.webp 这种
+            // 判据：模板段里含 ":" 且带 .webp/.jpeg/.jpg/.heic 后缀
+            boolean hasSize = tplv.indexOf(":") > 0;
+            boolean isShrink = tplv.toLowerCase().indexOf("shrink") >= 0
+                            || tplv.toLowerCase().indexOf("resize") >= 0
+                            || tplv.toLowerCase().indexOf("-image") >= 0;
+            if(!hasSize && !isShrink) return u;        // 不是缩放模板，不动
+            // 策略：优先把已知的「小尺寸收缩」模板换成大尺寸，同一个模板家族服务端一定认；
+            // 认不出的模板一律原样返回（宁可缩略图，不要 404）。
+            String lower = tplv.toLowerCase();
+            String head = u.substring(0, t);
+            String tail = (q > 0) ? u.substring(q) : "";
+            // ~tplv-dy-shrink:480:853.webp → 去掉尺寸，换成 ~tplv-dy-shrink.jpeg
+            // （shrink 家族去掉 :w:h 后按原尺寸出图）
+            if(lower.indexOf("shrink") >= 0 || lower.indexOf("resize") >= 0){
+                int colon = tplv.indexOf(':');
+                if(colon > 0){
+                    String fam = tplv.substring(0, colon);            // ~tplv-dy-shrink
+                    String ext = ".jpeg";
+                    int dot = tplv.lastIndexOf('.');
+                    if(dot > colon) ext = tplv.substring(dot);        // 保留原扩展名
+                    String nu = head + fam + ext + tail;
+                    Log.i("DYP", "IMG_TPL " + tplv + " -> " + fam + ext);
+                    return nu;
+                }
+            }
+            return u;   // 认不出就不动
+        }catch(Throwable t){ return u; }
+    }
+
+    /** 当前作品的全部清晰度档（已按最高画质在前排序）
+     *  每项：[0]=档位名 [1]=清晰度等级 [2]=码率 [3]=HDR [4]=HEVC [5]=宽 [6]=高 [7]=帧率 [8]=地址 */
+    java.util.List<String[]> curGears = new java.util.ArrayList<String[]>();
+    /** 当前正在播的是第几档（默认 0 = 最高画质） */
+    int curGearIdx = 0;
+
+    /** 把 buildGearsJson 产出的 JSON 数组解析成 curGears */
+    void parseGears(String json){
+        curGears.clear();
+        curGearIdx = 0;
+        if(json == null || json.length() < 5) return;
+        try{
+            Object o = new JP(json).parse();
+            if(!(o instanceof java.util.List)) return;
+            java.util.List arr = (java.util.List)o;
+            for(int i = 0; i < arr.size(); i++){
+                Object e = arr.get(i);
+                if(!(e instanceof Map)) continue;
+                Map em = (Map)e;
+                curGears.add(new String[]{
+                    gs(get(em, "g")),
+                    gs(get(em, "q")),
+                    gs(get(em, "br")),
+                    gs(get(em, "hdr")),
+                    gs(get(em, "hevc")),
+                    gs(get(em, "w")),
+                    gs(get(em, "h")),
+                    gs(get(em, "fps")),
+                    gs(get(em, "u"))
+                });
+            }
+            Log.i("DYP", "GEARS_PARSED n=" + curGears.size()
+                + (curGears.size() > 0 ? " best=" + gearLabel(0) : ""));
+        }catch(Throwable t){
+            Log.i("DYP", "GEARS_PARSE_ERR " + t);
+        }
+    }
+
+    /** 第 i 档的播放地址，越界返回空 */
+    String gearUrl(int i){
+        if(i < 0 || i >= curGears.size()) return "";
+        String u = curGears.get(i)[8];
+        return u == null ? "" : u;
+    }
+
+    /** 第 i 档的人话标签，如「4K 120fps HDR」「1080P」「720P」 */
+    String gearLabel(int i){
+        if(i < 0 || i >= curGears.size()) return "";
+        String[] g = curGears.get(i);
+        StringBuilder b = new StringBuilder();
+        int w = (int)parseLong(g[5], 0);
+        int h = (int)parseLong(g[6], 0);
+        int fps = (int)parseLong(g[7], 0);
+        int shortSide = Math.min(w, h);
+        if(shortSide >= 2000) b.append("8K");
+        else if(shortSide >= 1400) b.append("4K");
+        else if(shortSide >= 900) b.append("1080P");
+        else if(shortSide >= 600) b.append("720P");
+        else if(shortSide >= 400) b.append("540P");
+        else b.append("低清");
+        if(w > 0 && h > 0) b.append(" ").append(w).append("×").append(h);
+        if(fps >= 100) b.append(" ").append(fps).append("fps");
+        else if(fps >= 50) b.append(" ").append(fps).append("fps");
+        if("1".equals(g[3])) b.append(" HDR");
+        if("1".equals(g[4])) b.append(" H.265");
+        long br = parseLong(g[2], 0);
+        if(br > 0) b.append(" ").append(String.format(java.util.Locale.US, "%.1f", br / 1000000.0)).append("Mbps");
+        return b.toString();
+    }
+
+    /** 找第一个「短边 < 1400」的档（即 4K 以下），用于起播失败降级；找不到返回 -1 */
+    int findLowerGear(){
+        for(int i = 0; i < curGears.size(); i++){
+            int w = (int)parseLong(curGears.get(i)[5], 0);
+            int h = (int)parseLong(curGears.get(i)[6], 0);
+            int shortSide = Math.min(w, h);
+            if(shortSide > 0 && shortSide < 1400) return i;
+        }
+        return -1;
+    }
+
+    /** 判断当前是不是高画质档（4K+ 或高帧率），需要特别照顾解码兼容性 */
+    boolean isHighGearNow(){
+        if(curGearIdx < 0 || curGearIdx >= curGears.size()) return false;
+        String[] g = curGears.get(curGearIdx);
+        int w = (int)parseLong(g[5], 0);
+        int h = (int)parseLong(g[6], 0);
+        int fps = (int)parseLong(g[7], 0);
+        return Math.min(w, h) >= 1400 || fps >= 100;
+    }
+
+    /** 解析 video.bit_rate 数组，输出全部清晰度档的 JSON 数组。
+     *  抖音把 4K/8K/HDR/高帧率放在这里，每档字段：
+     *    gear_name（档位名，如 normal_4k / adapt_lowest_1080_1）
+     *    quality_type（清晰度等级，数字越大越清晰）
+     *    bit_rate（码率 bps）
+     *    play_addr{uri,url_list}（该档的播放地址）
+     *    is_hdr / is_bytevc1（HDR / H.265）
+     *  返回形如 [{"g":"normal_4k","q":28,"br":12345,"u":"https://...","hdr":1,"hevc":1,"w":3840,"h":2160,"fps":120}, ...]
+     *  按「清晰度 + 码率」从高到低排序，第一个就是最高画质。 */
+    String buildGearsJson(Map vd){
+        try{
+            Object bro = get(vd, "bit_rate");
+            if(!(bro instanceof java.util.List)) return "";
+            java.util.List brs = (java.util.List)bro;
+            // 首次调试：把第一档的字段名全打出来，确认分辨率字段叫什么
+            if(brs.size() > 0 && brs.get(0) instanceof Map){
+                Map b0 = (Map)brs.get(0);
+                StringBuilder fk = new StringBuilder();
+                for(Object k : b0.keySet()){
+                    Object vv = b0.get(k);
+                    if(vv instanceof Map){
+                        StringBuilder ik = new StringBuilder();
+                        for(Object k2 : ((Map)vv).keySet()) ik.append(k2).append(',');
+                        fk.append(k).append("{").append(ik).append("},");
+                    } else if(vv instanceof java.util.List){
+                        fk.append(k).append("[list").append(((java.util.List)vv).size()).append("],");
+                    } else {
+                        fk.append(k).append('=').append(String.valueOf(vv).length() > 40 ? "LONG" : vv).append(',');
+                    }
+                }
+                Log.i("DYP", "GEAR_KEYS " + fk);
+            }
+            java.util.List<String> rows = new java.util.ArrayList<String>();
+            java.util.List<long[]> keys = new java.util.ArrayList<long[]>();
+            for(int i = 0; i < brs.size(); i++){
+                Object bo = brs.get(i);
+                if(!(bo instanceof Map)) continue;
+                Map bm = (Map)bo;
+                Map bpa = (Map)get(bm, "play_addr");
+                if(bpa == null) continue;
+                String u = firstUrl(get(bpa, "url_list"));
+                String uri = gs(get(bpa, "uri"));
+                if(u.length() == 0 && uri.length() > 0) u = playUrl(uri, "1080p");
+                if(u.length() == 0) continue;
+                String gear = gs(get(bm, "gear_name"));
+                long q = parseLong(get(bm, "quality_type"), 0);
+                long br = parseLong(get(bm, "bit_rate"), 0);
+                // HDR / H.265 标识：抖音用 HDR_type / HDR_bit / is_h265 / is_bytevc1
+                long hdr = (truthy(get(bm, "is_hdr")) || gs(get(bm, "HDR_type")).length() > 0
+                            || gs(get(bm, "HDR_bit")).length() > 0) ? 1 : 0;
+                long hevc = (truthy(get(bm, "is_bytevc1")) || truthy(get(bm, "is_h265"))) ? 1 : 0;
+                // 分辨率：实测它在 play_addr.width / play_addr.height 里，
+                // 不在 bit_rate 顶层，也不在 video 顶层（顶层是最高档）。
+                long w = parseLong(get(bpa, "width"), 0);
+                long h = parseLong(get(bpa, "height"), 0);
+                if(w <= 0) w = parseLong(get(bm, "width"), 0);
+                if(h <= 0) h = parseLong(get(bm, "height"), 0);
+                // 帧率字段是大写 FPS
+                long fps = parseLong(get(bm, "FPS"), 0);
+                if(fps <= 0) fps = parseLong(get(bm, "fps"), 0);
+                if(fps <= 0) fps = parseLong(get(vd, "fps"), 0);
+                StringBuilder r = new StringBuilder();
+                r.append("{\"g\":\"").append(gear.replace("\"", "")).append("\"");
+                r.append(",\"q\":").append(q);
+                r.append(",\"br\":").append(br);
+                r.append(",\"hdr\":").append(hdr);
+                r.append(",\"hevc\":").append(hevc);
+                r.append(",\"w\":").append(w);
+                r.append(",\"h\":").append(h);
+                r.append(",\"fps\":").append(fps);
+                r.append(",\"u\":\"").append(u.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"}");
+                rows.add(r.toString());
+                // 排序键：像素数优先，其次码率。
+                // quality_type（q）在抖音侧并不单调（实测 8K 档 q=292 却排在 1080 之后），
+                // 只能作辅助，不能当主键。
+                keys.add(new long[]{ w * h, br, q, i });
+            }
+            if(rows.isEmpty()) return "";
+            // 按 q 高→低，q 相同按 br 高→低，再按像素数
+            Integer[] idx = new Integer[rows.size()];
+            for(int i = 0; i < idx.length; i++) idx[i] = i;
+            final java.util.List<long[]> kk = keys;
+            java.util.Arrays.sort(idx, new java.util.Comparator<Integer>(){
+                public int compare(Integer a, Integer b){
+                    long[] x = kk.get(a), y = kk.get(b);
+                    if(x[0] != y[0]) return Long.compare(y[0], x[0]);   // 像素数高优先
+                    if(x[1] != y[1]) return Long.compare(y[1], x[1]);   // 码率高优先
+                    if(x[2] != y[2]) return Long.compare(y[2], x[2]);
+                    return 0;
+                }
+            });
+            StringBuilder out = new StringBuilder("[");
+            for(int i = 0; i < idx.length; i++){
+                if(i > 0) out.append(',');
+                out.append(rows.get(idx[i]));
+            }
+            out.append(']');
+            String res = out.toString();
+            StringBuilder dbg = new StringBuilder();
+            for(int i = 0; i < idx.length; i++){
+                if(i > 0) dbg.append(" | ");
+                dbg.append(i).append(':').append(shortGear(rows.get(idx[i])));
+            }
+            Log.i("DYP", "GEARS_N=" + rows.size() + " -> " + dbg);
+            return res;
+        }catch(Throwable t){
+            Log.i("DYP", "GEARS_ERR " + t);
+            return "";
+        }
+    }
+
     /** 把 detail 接口响应的 aweme_detail 转成 render 消息 JSON */
     String detailToResult(String body){
         try{
@@ -10002,10 +10607,25 @@ webDone=false;
                 Map pa = (Map)get(vd, "play_addr");
                 putQ(b, "i_play", pa == null ? "" : firstUrl(get(pa, "url_list")));
                 putQ(b, "i_ws", pa == null ? "" : ("https://aweme.snssdk.com/aweme/v1/play/?video_id=" + gs(get(pa, "uri")) + "&ratio=1080p&line=0"));
+                putQ(b, "i_uri", pa == null ? "" : gs(get(pa, "uri")));
+                // ===== 全部清晰度档（bit_rate）=====
+                // 抖音把 4K / 8K / HDR / 高帧率都放在 bit_rate 数组里，每档自带
+                // play_addr / gear_name / quality_type / 分辨率与帧率。
+                // 只读 play_addr 会永远拿到默认档（多为 720p/1080p），4K 作品拿不到原画。
+                String gears = buildGearsJson(vd);
+                if(gears.length() > 0){
+                    b.append("\"i_gears\":").append(gears).append(",");
+                    Log.i("DYP", "DETAIL_GEARS " + gears.length() + " bytes");
+                }
                 Object dur = get(vd, "duration");
                 putQ(b, "i_dur", dur == null ? "" : String.valueOf(dur));
                 Map cov = (Map)get(vd, "cover");
                 putQ(b, "i_cover", cov == null ? "" : firstUrl(get(cov, "url_list")));
+                // 视频本身的分辨率/帧率（用于判断是不是 4K / 高帧率）
+                putQ(b, "i_vw", gs(get(vd, "width")));
+                putQ(b, "i_vh", gs(get(vd, "height")));
+                putQ(b, "i_fps", gs(get(vd, "fps")));
+                putQ(b, "i_ratio", gs(get(vd, "ratio")));
             }
             // 图集 + 实况动轨
             Object imgs = get(ad, "images");
@@ -10026,7 +10646,9 @@ webDone=false;
                     // dynS 还是空的，会导致第 2 张的实况地址被塞到第 1 个位置。
                     if(seq > 0){ imgS.append('|'); dynS.append('|'); }
                     seq++;
-                    imgS.append(firstUrl(get(im, "url_list")));
+                    // 取原图：url_list 里最后一项通常是最高分辨率，
+                    // 第一项是压缩缩略图（约 1080 宽），4K 壁纸拿不到原图。
+                    imgS.append(bestImgUrl(get(im, "url_list")));
                     String lv = "";
                     Object v0 = get(im, "video");
                     if(v0 instanceof Map){
@@ -10506,7 +11128,15 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     };
                 }
                 dsf[0] = f;
-                miniPlayer = new androidx.media3.exoplayer.ExoPlayer.Builder(this)
+                // 解码器策略：优先硬解，硬解失败（4K/8K/HDR/HEVC 在部分机型解不出来，
+                // 表现就是「有声音没画面」）自动回退软件解码。
+                // 不设这个的话，ExoPlayer 默认只在硬解创建失败时回退，解码中途失败不回落。
+                androidx.media3.exoplayer.DefaultRenderersFactory rf =
+                    new androidx.media3.exoplayer.DefaultRenderersFactory(this);
+                rf.setExtensionRendererMode(
+                    androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER);
+                rf.setEnableDecoderFallback(true);
+                miniPlayer = new androidx.media3.exoplayer.ExoPlayer.Builder(this, rf)
                     .setMediaSourceFactory(new androidx.media3.exoplayer.source.DefaultMediaSourceFactory(f))
                     .build();
                 miniWasTT = ttUrl;
@@ -10564,6 +11194,48 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                     }
                                 }});
                             }}).start();
+                            return;
+                        }
+// ===== 抖音多清晰度降级 =====
+                        // 4K / 8K / HDR / 120fps 档在部分机型上解码器不支持，
+                        // 表现就是「有声音没画面」：音频能解、视频解不出来。
+                        // 这里按清晰度档逐级往下掉，一次掉一档，直到能播。
+                        if(curGears.size() > 1 && curGearIdx + 1 < curGears.size()){
+                            int next = curGearIdx + 1;
+                            String nu = gearUrl(next);
+                            if(nu.length() > 0){
+                                Log.i("DYP", "GEAR_DOWN " + gearLabel(curGearIdx) + " -> " + gearLabel(next)
+                                    + " err=" + e.getErrorCodeName());
+                                curGearIdx = next;
+                                playFallbackDone = true;
+                                final String lbl = gearLabel(next);
+                                final String url = nu;
+                                h.post(new Runnable(){ public void run(){
+                                    s("这档画质本机放不了，已切到 " + lbl);
+                                }});
+                                curPlay = url;
+                                miniProxyKey = null;
+                                startedUrl = "";
+                                try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                                doPlay();
+                                return;
+                            }
+                        }
+                        // 档位掉完了还不行：退回 1080p 兜底地址
+                        if(!playFallbackDone && curFallbackPlay != null && curFallbackPlay.length() > 0){
+                            playFallbackDone = true;
+                            final String fb = curFallbackPlay;
+                            final String fbAlt = curVidUri.length() > 0 ? playUrl(curVidUri, "1080p") : "";
+                            Log.i("DYP", "PLAY_FALLBACK 4K 失败降 1080p err=" + e.getErrorCodeName());
+                            h.post(new Runnable(){ public void run(){
+                                s("播放源不支持，已自动切到 1080p");
+                            }});
+                            curPlay = fb;
+                            curFallbackPlay = fbAlt;
+                            miniProxyKey = null;
+                            startedUrl = "";
+                            try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                            doPlay();
                             return;
                         }
                         // B 站直连 CDN 失败：自动回退服务器中转（buvid3/UA 变化或网络异常时）
@@ -11762,6 +12434,50 @@ boolean ttUrl = isTikTokUrl(curPlay);
         }
     }
 
+    /** 大文件阈值：超过 300MB 就当原片处理，先问用户下哪个画质 */
+    static final long BIG_FILE_BYTES = 300L * 1024 * 1024;
+
+    /** 抖音视频下载前的画质选择：
+     *  先 HEAD 探测这条直链真实体积，超阈值就弹窗让用户选「原画（大）」还是「1080p（小）」。
+     *  探测失败或文件不大 → 直接下原画，不打扰。
+     *  ratioOrNull：原画直链；fallbackPlay：已有的 1080p 地址（可能为空） */
+    void chooseDyQualityThenDownload(final String rawPlay, final String fallbackPlay,
+                                     final String vidUri, final Runnable onRaw, final Runnable on1080){
+        new Thread(new Runnable(){ public void run(){
+            long size = InnerDownloader.probeSize(rawPlay);
+            Log.i("DYP", "DL_PROBE size=" + size + " url=" + rawPlay.substring(0, Math.min(60, rawPlay.length())));
+            if(size <= 0 || size < BIG_FILE_BYTES){
+                h.post(new Runnable(){ public void run(){ onRaw.run(); }});
+                return;
+            }
+            // 体积较大：算一下 1080p 版大概多大（按 1/6 估，仅用于提示）
+            final long sz = size;
+            final String rawTxt = InnerDownloader.sizeText(size);
+            final String est1080 = InnerDownloader.sizeText(Math.max(size / 6, 30L * 1024 * 1024));
+            h.post(new Runnable(){ public void run(){
+                dypDlg()
+                    .setTitle("这条是 4K 原片")
+                    .setMessage("原画文件约 " + rawTxt + "（4K，体积大、部分机型放不了）。\n\n"
+                        + "1080p 约 " + est1080 + "，兼容性和体积都更稳。\n\n"
+                        + "要下哪个？")
+                    .setPositiveButton("原画 " + rawTxt, new android.content.DialogInterface.OnClickListener(){
+                        public void onClick(android.content.DialogInterface d, int w){
+                            DiagLog.i(DiagLog.M_DOWNLOAD, "用户选原画 " + rawTxt);
+                            onRaw.run();
+                        }
+                    })
+                    .setNegativeButton("1080p 约" + est1080, new android.content.DialogInterface.OnClickListener(){
+                        public void onClick(android.content.DialogInterface d, int w){
+                            DiagLog.i(DiagLog.M_DOWNLOAD, "用户选 1080p");
+                            on1080.run();
+                        }
+                    })
+                    .setNeutralButton("取消", null)
+                    .show();
+            }});
+        }}).start();
+    }
+
     /** 下载视频前的大文件提醒：
      *  内置代理开着 → X/YouTube 走服务器中转（弹确认）；
      *  关着 → 直连（用户自己代理 / TUN 生效），直接下。 */
@@ -11846,6 +12562,32 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 }
                 // 其他平台 direct：带独立音轨，下载后本地合成
                 String au = (curAudio != null && curAudio.startsWith("http")) ? curAudio : "";
+                // 抖音：4K 原片可能 1~2GB，先探测体积让用户选画质（非 4K 不打扰）
+                boolean isDy = !isXDomain(curUrl) && !YtParser.isYtUrl(curUrl)
+                        && KsParser.isKsUrl(curUrl) == false && BiliParser.isBiliUrl(curUrl) == false
+                        && !isTikTokUrl(curUrl) && !InsParser.isInsUrl(curUrl);
+                if(isDy && curPlay != null && curPlay.length() > 0){
+                    final String rawP = curPlay;
+                    final String fbP = curFallbackPlay == null ? "" : curFallbackPlay;
+                    final String uriP = curVidUri == null ? "" : curVidUri;
+                    final String auF = au;
+                    chooseDyQualityThenDownload(rawP, fbP, uriP,
+                        new Runnable(){ public void run(){
+                            enqueueDownloadWithAudio(rawP, "视频", extOf(rawP), "视频", "", auF);
+                        }},
+                        new Runnable(){ public void run(){
+                            // 用户选 1080p：优先用已有兜底地址，没有就用 uri 现拼
+                            String pick = fbP;
+                            if(pick.length() == 0 && uriP.length() > 0) pick = playUrl(uriP, "1080p");
+                            if(pick.length() == 0){
+                                showHintToast("拿不到 1080p 地址，改为下载原画");
+                                pick = rawP;
+                            }
+                            Log.i("DYP", "DL_PICK_1080 " + pick.substring(0, Math.min(60, pick.length())));
+                            enqueueDownloadWithAudio(pick, "视频", "mp4", "视频", "", auF);
+                        }});
+                    return;
+                }
                 enqueueDownloadWithAudio(curPlay, "视频", "mp4", "视频", "", au);
             }});
             return;
