@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 播放器底栏渐变遮罩：从下到上 黑 90% -> 透明 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient android:startColor="#E6000000" android:centerColor="#99000000"
+        android:endColor="#00000000" android:angle="90"/>
+</shape>
