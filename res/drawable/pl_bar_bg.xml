@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 小窗控制栏底：深色半透明圆角卡片，保证在亮/暗画面上都能看清 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <corners android:radius="12dp"/>
+    <solid android:color="#B3000000"/>
+</shape>
