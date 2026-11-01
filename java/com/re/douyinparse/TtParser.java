@@ -150,14 +150,6 @@ public class TtParser {
             || u.contains("ibytedtos") || u.contains("muscdn");
     }
 
-    /** 该 CDN host 是不是「直连优先」那类（tiktokcdn 系） */
-    public static boolean preferDirect(String url){
-        if(url == null) return false;
-        String u = url.toLowerCase();
-        // 实测：v16m.tiktokcdn.com 直连 200，走代理 SSL_ERROR_SYSCALL
-        return u.contains("tiktokcdn.com") && !u.contains("webapp-prime");
-    }
-
     // ================= URL 处理 =================
 
     /** 短链换完整链接；短链失败时用 @i 占位兜底 */
@@ -237,21 +229,10 @@ public class TtParser {
         return cur;
     }
 
-    /** 打开连接；useProxy 为 null 时按 URL 自动判断 */
+    /** 打开连接：一律直连（用户自己的网络/代理/TUN 自然生效，App 不套 Proxy） */
     static HttpURLConnection open(Context ctx, String url, Session s, Boolean useProxy) throws Exception{
         URL u = new URL(url);
-        boolean proxy;
-        if(useProxy == null){
-            proxy = MainActivity.staticProxyFor(ctx, url) != null;
-        } else {
-            proxy = useProxy;
-        }
-        java.net.Proxy px = proxy ? MainActivity.staticProxyFor(ctx, url) : null;
-        if(px == null && useProxy != null && useProxy){
-            // 明确要求代理但没配，退回直连
-            px = null;
-        }
-        HttpURLConnection c = (HttpURLConnection)(px != null ? u.openConnection(px) : u.openConnection());
+        HttpURLConnection c = (HttpURLConnection) u.openConnection(java.net.Proxy.NO_PROXY);
         c.setRequestProperty("User-Agent", MUA);
         c.setRequestProperty("Referer", s != null ? s.referer : REFERER);
         String ck = s != null ? s.cookieHeader() : "";
@@ -579,50 +560,30 @@ public class TtParser {
     // ================= 下载分流 =================
 
     /**
-     * 打开一个用于下载的流，自动处理「代理/直连」分流 + 失败降级。
-     *
-     * 实测两套 CDN 行为相反：
-     *   v16m.tiktokcdn.com       直连 200，走代理 SSL_ERROR_SYSCALL
-     *   v16-webapp-prime.tiktok.com  必须走代理
-     * 所以策略是：按 host 选首选方式，失败自动换另一种。
+     * 打开一个用于下载的流：一律直连（用户自己的网络/代理/TUN 自然生效）。
      *
      * @return 连接成功（2xx）的 HttpURLConnection，调用方负责读流和 disconnect
      */
     public static HttpURLConnection openDownload(Context ctx, String url, Session s){
-        boolean directFirst = preferDirect(url);
-        // 先首选，再另一种
-        Boolean[] order = directFirst
-            ? new Boolean[]{ Boolean.FALSE, Boolean.TRUE }
-            : new Boolean[]{ Boolean.TRUE, Boolean.FALSE };
-
-        for(int i = 0; i < order.length; i++){
-            Boolean useProxy = order[i];
-            // 要求代理但没配代理，跳过
-            if(useProxy.booleanValue() && MainActivity.staticProxyFor(ctx, url) == null){
-                Log.i(TAG, "TT_DL skip proxy (not configured)");
-                continue;
+        HttpURLConnection c = null;
+        try{
+            c = open(ctx, url, s, false);
+            c.setInstanceFollowRedirects(true);
+            c.setRequestProperty("Accept", "*/*");
+            c.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+            c.setRequestProperty("Sec-Fetch-Dest", "video");
+            c.setRequestProperty("Sec-Fetch-Mode", "no-cors");
+            c.setRequestProperty("Sec-Fetch-Site", "same-site");
+            if(s != null) c.setRequestProperty("Referer", s.referer);
+            int code = c.getResponseCode();
+            Log.i(TAG, "TT_DL " + code + " " + trim(url));
+            if(code >= 200 && code < 400){
+                return c;
             }
-            HttpURLConnection c = null;
-            try{
-                c = open(ctx, url, s, useProxy);
-                c.setInstanceFollowRedirects(true);
-                c.setRequestProperty("Accept", "*/*");
-                c.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-                c.setRequestProperty("Sec-Fetch-Dest", "video");
-                c.setRequestProperty("Sec-Fetch-Mode", "no-cors");
-                c.setRequestProperty("Sec-Fetch-Site", "same-site");
-                if(s != null) c.setRequestProperty("Referer", s.referer);
-                int code = c.getResponseCode();
-                Log.i(TAG, "TT_DL " + code + " proxy=" + useProxy + " " + trim(url));
-                if(code >= 200 && code < 400){
-                    return c;
-                }
-                // 4xx/5xx 换下一种方式
-                try{ c.disconnect(); }catch(Throwable t){}
-            }catch(Throwable t){
-                Log.i(TAG, "TT_DL_ERR proxy=" + useProxy + " " + t);
-                try{ if(c != null) c.disconnect(); }catch(Throwable x){}
-            }
+            try{ c.disconnect(); }catch(Throwable t){}
+        }catch(Throwable t){
+            Log.i(TAG, "TT_DL_ERR " + t);
+            try{ if(c != null) c.disconnect(); }catch(Throwable x){}
         }
         return null;
     }
