@@ -48,6 +48,10 @@ public class CookieStore {
     public static final String PLATFORM_BILI = "bilibili";
     /** 抖音主页登录 Cookie（本地保存，绝不上传服务器） */
     public static final String PLATFORM_DY = "douyin";
+    /** 小红书 Cookie（web_session 是登录依据，本地保存不上传） */
+    public static final String PLATFORM_XHS = "xiaohongshu";
+    /** 汽水音乐 Cookie（留位，以后可能用得上） */
+    public static final String PLATFORM_QS = "qishui";
 
     /** Cookie 根目录：优先外部私有目录 Android/data/{包名}/files/cookies */
     static File dirOf(Context ctx){
@@ -301,5 +305,25 @@ public class CookieStore {
     public static boolean biliReady(Context ctx){
         String s = load(ctx, PLATFORM_BILI).get("SESSDATA");
         return s != null && s.length() >= 8;
+    }
+
+    /** 小红书登录态：有 web_session 就算登录 */
+    public static boolean xhsReady(Context ctx){
+        java.util.Map<String, String> m = load(ctx, PLATFORM_XHS);
+        String a = m.get("web_session");
+        if(a != null && a.length() >= 8) return true;
+        String b = m.get("a1");
+        return b != null && b.length() >= 8;
+    }
+
+    /** 拼成 k=v; k=v 形式的 Cookie 串，没有返回空串 */
+    public static String xhsCookieString(Context ctx){
+        java.util.Map<String, String> m = load(ctx, PLATFORM_XHS);
+        StringBuilder b = new StringBuilder();
+        for(java.util.Map.Entry<String, String> e : m.entrySet()){
+            if(b.length() > 0) b.append("; ");
+            b.append(e.getKey()).append("=").append(e.getValue());
+        }
+        return b.toString();
     }
 }
