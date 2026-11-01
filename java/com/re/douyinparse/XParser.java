@@ -206,12 +206,11 @@ public class XParser {
     }
 
     /** 主入口：解析一条 X 链接。失败返回带 err 的对象，不返回 null
-     *  优先级（v1.3.4）：
-     *    1) 用户自己挂了代理 → 直连 fxtwitter / syndication（不烧机场流量，
-     *       服务器到期后依然可用）；媒体 URL 保持原始 CDN 直链，
-     *       下载时也走用户代理（InnerDownloader 已支持）。
-     *    2) 没代理 → 走自建服务器中转（服务器走机场代理，媒体可下）。
-     *    3) 服务器不可用 → 回退本地直连（解析可用，下载需自己挂代理）。 */
+     *  优先级（v1.3.6）：
+     *    1) 内置代理开着 → 走自建服务器中转（服务器带机场代理，媒体可下）。
+     *    2) 内置代理关着 → 直连 fxtwitter / syndication（走用户自己的网络，
+     *       用户自己挂的代理 / TUN 自然生效，App 不干预）。
+     *    3) 直连失败 → 回退服务器中转 → 再回退本地直连。 */
     public static XVideo resolve(Context ctx, String url){
         XVideo v = new XVideo();
         v.pageUrl = url;
@@ -221,23 +220,35 @@ public class XParser {
         if(id.length() == 0){ v.err = "链接里没找到 tweet id"; return v; }
         v.id = id;
 
-        // ---- 源 0（用户代理直连）：fxtwitter → syndication ----
-        // 用户开了代理就不走服务器，国外数据源直连（保服务器到期后可用）。
-        if(ProxyPolicy.hasUserProxy(ctx)){
-            Log.i(TAG, "X_DIRECT user-proxy try id=" + id);
-            if(tryDirectSources(ctx, v, url, id)){
-                Log.i(TAG, "X_DIRECT ok id=" + id + " videos=" + v.videos.size()
-                        + " imgs=" + v.images.size());
-                return v;
+        // ---- 内置代理开着：优先服务器中转 ----
+        if(ProxyPolicy.builtinOn(ctx)){
+            String srv0 = MainActivity.effSrvS(ctx);
+            if(srv0.length() > 0){
+                try{
+                    String js0 = httpGetText(ctx,
+                            srv0 + "/api/x/parse?url=" + java.net.URLEncoder.encode(url, "UTF-8"),
+                            15000, true);
+                    if(js0 != null && js0.length() > 100 && js0.indexOf("\"ok\"") >= 0
+                            && parseServerJson(js0, v)){
+                        Log.i(TAG, "X_SRV ok id=" + id + " videos=" + v.videos.size()
+                                + " imgs=" + v.images.size());
+                        return v;
+                    }
+                }catch(Throwable t){
+                    Log.i(TAG, "X_SRV_ERR " + t);
+                }
             }
-            Log.i(TAG, "X_DIRECT fail id=" + id + " -> fallback srv");
-            v = new XVideo();
-            v.pageUrl = url;
-            v.ctxRef = new java.lang.ref.WeakReference<Context>(ctx);
-            v.id = id;
         }
 
-        // ---- 源 1：自建服务器（带机场代理，媒体可下）----
+        // ---- 直连数据源（走用户自己的网络）：fxtwitter → syndication ----
+        Log.i(TAG, "X_DIRECT try id=" + id);
+        if(tryDirectSources(ctx, v, url, id)){
+            Log.i(TAG, "X_DIRECT ok id=" + id + " videos=" + v.videos.size()
+                    + " imgs=" + v.images.size());
+            return v;
+        }
+
+        // ---- 兜底：服务器中转（内置代理关着时直连失败也用服务器救一把）----
         String srv = MainActivity.effSrvS(ctx);
         if(srv.length() > 0){
             try{
@@ -258,10 +269,7 @@ public class XParser {
                 Log.i(TAG, "X_SRV_ERR " + t);
             }
         }
-
-        // ---- 源 2：本地直连（fxtwitter → syndication，作为最后兜底）----
-        if(tryDirectSources(ctx, v, url, id)) return v;
-if(!v.ok()) v.err = "所有数据源都没拿到媒体（作品可能已删除/受保护/仅登录可见）";
+        if(!v.ok()) v.err = "所有数据源都没拿到媒体（作品可能已删除/受保护/仅登录可见）";
         return v;
     }
 
@@ -645,12 +653,8 @@ if(!v.ok()) v.err = "所有数据源都没拿到媒体（作品可能已删除/�
     static String httpGetText(Context ctx, String url, int timeout, boolean isApi){
         HttpURLConnection c = null;
         try{
-            // openConnection(null) 会抛 IllegalArgumentException，
-            // 没配代理时必须显式传 Proxy.NO_PROXY。
-            // isApi = 服务器 API：永不套用户代理（用户代理可能不通，服务器必须直连）
-            java.net.Proxy px = isApi ? null : MainActivity.staticProxyFor(ctx, url);
-            c = (HttpURLConnection) new URL(url).openConnection(
-                    px != null ? px : java.net.Proxy.NO_PROXY);
+            // 一律直连（用户自己的网络/代理/TUN 自然生效）
+            c = (HttpURLConnection) new URL(url).openConnection(java.net.Proxy.NO_PROXY);
             c.setRequestProperty("User-Agent", UA);
             c.setRequestProperty("Accept", "application/json,*/*");
             if(isApi){
