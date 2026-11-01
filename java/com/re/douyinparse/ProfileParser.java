@@ -64,8 +64,11 @@ public class ProfileParser {
         if(u.contains("tiktok.com/@") && !u.contains("/video/") && !u.contains("/photo/")){
             return true;
         }
-        // X 用户主页（x.com/xxx，不是 /status/）
+        // X 用户主页（x.com/xxx，不带 /status/ /photo/ 等作品路径）
         if((u.contains("x.com/") || u.contains("twitter.com/"))){
+            if(u.contains("/status") || u.contains("/photo/") || u.contains("/video/")){
+                return false;
+            }
             Pattern p = Pattern.compile("(?:x|twitter)\\.com/([A-Za-z0-9_]+)(?:[/?].*)?$");
             Matcher m = p.matcher(u);
             if(m.find()){
@@ -78,7 +81,191 @@ public class ProfileParser {
         if(u.contains("youtube.com/@") && !u.contains("watch?") && !u.contains("playlist?")){
             return true;
         }
+        // Instagram 用户主页：instagram.com/{username}，不带 /p/ /reel/ /stories/
+        if(u.contains("instagram.com/") || u.contains("instagr.am/")){
+            if(u.contains("/p/") || u.contains("/reel/") || u.contains("/reels/")
+                    || u.contains("/tv/") || u.contains("/stories/") || u.contains("/explore/")){
+                return false;
+            }
+            Matcher m = Pattern.compile("instagram\\.com/([A-Za-z0-9_.]{2,30})(?:[/?#].*)?$").matcher(u);
+            if(m.find()){
+                String name = m.group(1);
+                return !name.equals("accounts") && !name.equals("about")
+                        && !name.equals("developer") && !name.equals("legal")
+                        && !name.equals("directory") && !name.equals("web");
+            }
+        }
         return false;
+    }
+
+    /** 从 IG 主页链接里取用户名 */
+    public static String igUsername(String url){
+        if(url == null) return "";
+        Matcher m = Pattern.compile("instagram\\.com/([A-Za-z0-9_.]{2,30})(?:[/?#]|$)")
+                .matcher(url.toLowerCase());
+        return m.find() ? m.group(1) : "";
+    }
+
+    /**
+     * Instagram 主页列表：本地带 Cookie 直连 web_profile_info（走用户自己网络）。
+     * 没 Cookie 或失败返回 null，lastErr 写好。
+     */
+    public static List<ProfileItem> resolveInsProfile(Context ctx, String url){
+        lastErr = "";
+        String user = igUsername(url);
+        if(user.length() == 0){
+            lastErr = "链接里没找到 IG 用户名";
+            return null;
+        }
+        if(!CookieStore.insReady(ctx)){
+            lastErr = "IG 主页需要登录：设置 → Instagram Cookie";
+            return null;
+        }
+        String ck = CookieStore.header(ctx, CookieStore.PLATFORM_INS);
+        String csrf = CookieStore.get(ctx, CookieStore.PLATFORM_INS, "csrftoken");
+        if(csrf == null) csrf = "";
+
+        String api = "";
+        String body = null;
+        int code = 0;
+        HttpURLConnection c = null;
+        // 多端点重试：i 站、www 站、usernameinfo POST
+        String[] eps = {
+            "https://i.instagram.com/api/v1/users/web_profile_info/?username=",
+            "https://www.instagram.com/api/v1/users/web_profile_info/?username="
+        };
+        for(int ei = 0; ei < eps.length; ei++){
+        try{
+            api = eps[ei] + java.net.URLEncoder.encode(user, "UTF-8");
+            c = (HttpURLConnection) new URL(api).openConnection(java.net.Proxy.NO_PROXY);
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(20000);
+            c.setRequestProperty("User-Agent", UA);
+            c.setRequestProperty("Cookie", ck);
+            c.setRequestProperty("X-IG-App-ID", "936619743392459");
+            c.setRequestProperty("X-ASBD-ID", "129477");
+            c.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+            if(csrf.length() > 0) c.setRequestProperty("X-CSRFToken", csrf);
+            c.setRequestProperty("Referer", "https://www.instagram.com/" + user + "/");
+            c.setRequestProperty("Accept", "*/*");
+            code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while(in != null && (n = in.read(buf)) > 0) bo.write(buf, 0, n);
+            if(in != null) in.close();
+            body = bo.toString("UTF-8");
+        }catch(Throwable t){
+            Log.i(TAG, "INS_PROFILE_ERR[" + ei + "] " + t);
+            lastErr = "连不上 Instagram（" + t + "）";
+            continue;
+        }finally{
+            try{ if(c != null) c.disconnect(); }catch(Throwable t){}
+        }
+        Log.i(TAG, "INS_PROFILE_HTTP[" + ei + "] " + code + " user=" + user
+                + " len=" + (body == null ? 0 : body.length())
+                + " head=" + (body == null ? "" : body.substring(0, Math.min(200, body.length())).replace("\n", " ")));
+
+        if(code != 200 || body == null || body.length() == 0){
+            lastErr = "IG 主页接口 HTTP " + code;
+            continue;
+        }
+        List<ProfileItem> out = parseInsTimeline(body);
+        if(out.isEmpty()){
+            lastErr = "主页没有作品（或账号私密）";
+            continue;
+        }
+        return out;
+        }
+        return null;
+    }
+
+    /** 解析 IG web_profile_info 的 JSON，抽出最近作品 */
+    static List<ProfileItem> parseInsTimeline(String json){
+        List<ProfileItem> out = new ArrayList<ProfileItem>();
+        try{
+            int k = json.indexOf("\"edge_owner_to_timeline_media\"");
+            if(k < 0) k = json.indexOf("\"edges\"");
+            if(k < 0) return out;
+            // 逐个找 shortcode
+            int p = k;
+            int guard = 0;
+            while(guard++ < 200){
+                int sc = json.indexOf("\"shortcode\":\"", p);
+                if(sc < 0) break;
+                int s1 = sc + 13;
+                int s2 = json.indexOf('"', s1);
+                if(s2 <= s1) break;
+                String code = json.substring(s1, s2);
+                // 这一段里的字段
+                int seg = json.indexOf("\"shortcode\":\"", s2);
+                String slice = json.substring(sc, seg > 0 ? Math.min(seg, sc + 4000) : Math.min(json.length(), sc + 4000));
+
+                ProfileItem it = new ProfileItem();
+                it.id = code;
+                it.url = "https://www.instagram.com/p/" + code + "/";
+                it.title = insStr(slice, "edge_media_to_caption") ;
+                if(it.title.length() == 0) it.title = insStr(slice, "text");
+                if(it.title.length() == 0) it.title = "Instagram " + code;
+                boolean isVideo = slice.indexOf("\"is_video\":true") >= 0
+                        || slice.indexOf("\"media_type\":2") >= 0;
+                it.isImage = !isVideo;
+                long dur = insNum(slice, "video_duration");
+                it.durSec = dur;
+                if(code.length() >= 5) out.add(it);
+                p = s2;
+            }
+        }catch(Throwable t){
+            Log.i(TAG, "INS_PROFILE_PARSE_ERR " + t);
+        }
+        Log.i(TAG, "INS_PROFILE_PARSE n=" + out.size());
+        return out;
+    }
+
+    /** 从 JSON 片段里取 "key":"value" 的字符串值（去掉转义） */
+    static String insStr(String json, String key){
+        try{
+            int k = json.indexOf("\"" + key + "\"");
+            if(k < 0) return "";
+            int c = json.indexOf(':', k + key.length() + 2);
+            if(c < 0) return "";
+            int q = json.indexOf('"', c);
+            if(q < 0) return "";
+            int j = q + 1;
+            StringBuilder sb = new StringBuilder();
+            while(j < json.length()){
+                char ch = json.charAt(j);
+                if(ch == '\\'){
+                    char nx = j + 1 < json.length() ? json.charAt(j + 1) : 0;
+                    if(nx == 'n'){ sb.append(' '); j += 2; continue; }
+                    if(nx == 'u'){ j += 6; continue; }
+                    j += 2; continue;
+                }
+                if(ch == '"') break;
+                sb.append(ch);
+                j++;
+            }
+            String s = sb.toString().trim();
+            if(s.length() > 80) s = s.substring(0, 80) + "…";
+            return s;
+        }catch(Throwable t){ return ""; }
+    }
+
+    static long insNum(String json, String key){
+        try{
+            int k = json.indexOf("\"" + key + "\":");
+            if(k < 0) return 0;
+            int j = k + key.length() + 3;
+            StringBuilder sb = new StringBuilder();
+            while(j < json.length()){
+                char ch = json.charAt(j);
+                if(Character.isDigit(ch) || ch == '.') sb.append(ch);
+                else if(sb.length() > 0) break;
+                j++;
+            }
+            return (long) Double.parseDouble(sb.toString());
+        }catch(Throwable t){ return 0; }
     }
 
     /** 解析主页列表；失败返回 null 并把 lastErr 写好 */
