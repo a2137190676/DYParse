@@ -4,7 +4,8 @@
 
 一个轻量级的多平台内容解析 Android 客户端：粘贴分享链接即可解析视频、图文、动图，并内置独立播放器。
 
-当前支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube / B站 / Instagram** 七个平台。
+当前支持 **20 个平台**：
+**抖音 / 快手 / TikTok / X（推特）/ YouTube / B站 / Instagram / 小红书 / 微信视频号 / 微信公众号 / 微博 / 今日头条 / 西瓜视频 / AcFun / 好看视频 / 最右 / 皮皮虾 / 皮皮搞笑 / 微视 / 豆包**。
 
 > ⚠️ **仅供个人学习与技术研究使用**。请勿用于任何商业用途、批量抓取或侵犯他人权益的场景。内容版权归原作者所有。
 
@@ -23,7 +24,9 @@
 
 ## 功能
 
-- 支持 **抖音 / 快手 / TikTok / X（推特）/ YouTube / B站 / Instagram** 的 **视频 / 图文 / 动图** 解析
+- 支持 **20 个平台**的 **视频 / 图文 / 动图 / 音频** 解析：
+  抖音、快手、TikTok、X（推特）、YouTube、B站、Instagram、小红书、微信视频号、微信公众号、微博、今日头条、西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包
+- **多平台本地直连**（v1.3.7.7）：微博 / 微信公众号 / 今日头条 / 西瓜视频 / AcFun / 好看视频 / 最右 / 皮皮虾 / 皮皮搞笑 全部纯 HTTP 本地解析，免 Cookie、免服务器、免第三方 API
 - **主页列表**：YouTube 频道 / TikTok 用户 / X 用户主页 / B站空间 / Instagram 用户主页 / **抖音主页** 一键列出全部作品，支持逐条下载与全部下载（每页 100 条，带翻页）
 - **抖音主页全量翻页（v1.3.7.2）**：主页作品列表一次拿全，实测 280 条作品 16 页全部翻完；需登录 Cookie（登录一次即可，Cookie 只存本机不上传）
 - **Instagram 登录解析**：App 内登录 IG 抓 Cookie 存本地（不上传），带登录态直连解析 Reel 视频流与主页作品列表
@@ -79,6 +82,17 @@
 | 抖音 | `WebView` 加载分享页，注入 JS hook 捕获 `fetch` / `XMLHttpRequest` 中的 `aweme_detail` 响应 |
 | 抖音主页 | PC 主页（`www.douyin.com/user/{sec_uid}` + 桌面 UA）+ 签名接口 `aweme/v1/web/aweme/post/`（`aid=6383`、`count=18`、`a_bogus` + secsdk）+ 1500ms 间隔逐页翻完；同 sec_uid 只翻一次，完成后收起 WebView |
 | 快手 | 纯 HTTP，无 WebView，解析分享页 SSR 里的 `window.INIT_STATE` |
+| 微信视频号 | 本地 POST `finder-preview/api/feed/get_feed_info`，`{"baseReq":{"generalToken":""},"shortUri":"xxx"}`；**正常响应码是 201**，必须用 `2xx` 判定。视频流需元宝 Cookie 换 `generalToken` |
+| 微信公众号 | SSR 直出，直接抽 `var msg_title` / `var nickname` / `var ct`；正文图 `data-src` 尺寸段改 `/0` 取无损原图；内嵌视频 `mpvideo.qpic.cn` 按 `file_id` 分组取 `.f10104` 最高码率 |
+| 微博 | `genvisitor` 拿 `tid` → `incarnate` 换 `SUB/SUBP`；视频专页走 `weibo.com/tv/api/component`，**必须带 `PAGE-REFERER` 头**（不带返 200 空 body），拿 2K/1080P/720P/480P 四档；图床 `osj1080` 去水印 |
+| 今日头条 | `m.toutiao.com/article/{id}/` 的 `script#RENDER_DATA`（URL 编码 JSON）→ `playAuthTokenV2`（base64）→ `GetPlayInfoToken` → `vod.bytedanceapi.com` → `PlayInfoList`；`/group/` 会 301 到 `/article/` |
+| 西瓜视频 | 已纯 SPA无内嵌数据，同一 ID 在头条 `article` 页有完整 `RENDER_DATA`，直接复用头条 VOD 链路 |
+| AcFun | `m.acfun.cn/v/?ac={id}` 页面 `window.videoInfo` + `var playInfo`（`streams[].cdnUrls[]`）；老接口 `/rest/pc-direct/play/playInfo` 已全 404 |
+| 好看视频 | `window.__PRELOADED_STATE__.curVideoMeta`：`clarityUrl[]` 四档清晰度、作者在 `source_name`（不是 `author.name`）、`html5_playurl` 是百家号页面不是视频 |
+| 最右 / 皮皮虾 / 皮皮搞笑 | 页面 `window.__INITIAL_STATE__`，结构不稳定，用递归 `deepFindUrl` / `deepFindStr` 通用挖掠 |
+| 微视 | `weishi.qq.com/webshare/{id}` + `window.Vise.initState`（首页有 401 反爬，需分享页）|
+| 小红书 | `window.__INITIAL_STATE__`（PC `note.noteDetailMap` / 移动 `noteData.data`）；图取 `infoList` 里无 `WM` 的原图；视频优先 `consumer.originVideoKey` → `sns-video-bd.xhscdn.com` |
+| 豆包 | 分享页内嵌 JSON → 递归取 `vid` → `POST samantha/media/get_play_info` `{"key":vid}` → `original_media_info.main_url` |
 | TikTok | 纯 HTTP + 自管 Cookie 会话，双页面模板互为兜底；下载走服务器中转（tikwm 直链） |
 | X（推特） | fxtwitter / syndication 双源纯 HTTP；挂代理直连 CDN，失败自动回退服务器中转；外链卡片深挖 |
 | YouTube | 服务器 yt-dlp 中转（需用户登录 Cookie + node 解 n-challenge）；播放直连优先、403 回退 `/api/yt/stream` 流式中转；下载走服务器中转（已缓存视频吃缓存） |
@@ -87,6 +101,96 @@
 | JSON 解析 | 自实现轻量 `JP` 解析器，避免引入第三方依赖 |
 | 播放器 | `VideoView` + 反射调用 `getMediaPlayer()` 拿底层实例做倍速控制 |
 | 手势 | `GestureDetector` 处理单击/双击，`OnTouchListener` + `Handler` 处理长按连续 seek |
+
+## 新增平台详解（v1.3.7.7）
+
+本轮新增平台**全部为本地直连解析**，不依赖服务器、不依赖第三方付费 API。
+
+### 小红书
+
+- 数据在页面 `window.__INITIAL_STATE__`，但**现在强制登录**：
+  - `www.xiaohongshu.com/explore/{id}` → `note.noteDetailMap` 是 `{}`（空）
+  - `www.xiaohongshu.com/discovery/item/{id}` → `noteData.data` 也是 `{}`
+- ⚠️ 风控时会 **302 到 `/404/sec_xxx`，`error_code=300031`**（当前笔记暂时无法浏览）。
+  这不是笔记删除，是 IP/访问频率被拦。机房 IP 几乎必中。
+- 已实现：`__INITIAL_STATE__` 解析（兼容 PC `noteDetailMap` / 移动 `noteData.data` 两种结构）、
+  `undefined` / `new Map()` / `new Set()` / `new Date()` 转换、图片 `infoList` 取无 `WM` 原图、
+  视频 `consumer.originVideoKey` → `sns-video-bd.xhscdn.com/{key}`。
+- 已提供精确错误提示：`300031` 风控、`/404` 已删、`/login` 需 Cookie。
+
+### 豆包
+
+- 分享页：`/thread/{id}`（对话）、`/video-sharing`（视频）、`/music-sharing`（音乐）。
+- 视频取流：从页面 JSON 递归找 `vid` → `POST https://www.doubao.com/samantha/media/get_play_info` →
+  body `{"key": vid}`，带 `aid=497858&device_platform=web&samantha_web=1` 等 query → `data.original_media_info.main_url`。
+- 这条比原项目的 FPLAY 解密路径（`alice/resource/get_video_model`）简单得多，优先用它；FPLAY 暂未实现。
+- 页面 JSON 拿不到时，会从所有 `{` 里尝试找最大合法 JSON 作主数据（`tryParseObject` 手写括号匹配）。
+
+### 微信视频号
+
+- **元数据**：本地 POST `channels.weixin.qq.com/finder-preview/api/feed/get_feed_info`，匿名体格为
+  `{"baseReq":{"generalToken":""},"shortUri":"xxx"}`。实测 **250ms** 返回（旧 WebView 方案要 12 秒）。
+- ⚠️ **该接口正常响应码是 `201 Created`，不是 200**，必须用 `code >= 200 && code < 300` 判定。
+- **视频流**：匿名只能拿到元数据 + 封面。需在设置里登录**腾讯元宝**，
+  用 `hy_user` / `hy_token` 打 `yuanbao.tencent.com/api/weixin/get_parse_result` 换 `generalToken` + `eid`，
+  再用带 token 的 `get_feed_info` 拿 `feedInfo.videoUrl`。
+- ⚠️ 元宝登录页会给**未登录访客也下发** `hy_user`/`hy_token`，所以「Cookie 存在」≠「已登录」。
+  必须由用户点「我已登录完成」手动确认。
+
+### 微信公众号
+
+- 文章为 SSR 直出，直接从 HTML 抽变量，免 Cookie。
+- 字段格式有坑：`var msg_title = '...'.html(false)`、`var nickname = htmlDecode("...")`、
+  `var ct = "1790833583"`、`var create_time = "1790833583" * 1`——需要多正则依次尝试 + 去外壳。
+- **正文图无损原图**：`data-src` 里的尺寸段 `/640` `/300` `/200` `/6` 全改成 `/0`。
+- **内嵌视频**：`mpvideo.qpic.cn` 同一 `file_id` 有 `.f10002` / `.f10004` / `.f10102` / `.f10104` 四个码率，
+  **数字越大越高**（f10104 最高）。不能用 `{[^{}]*?url:...}` 匹配块（外层有嵌套会失败），
+  直接全局抓直链按 `file_id` 分组取最大最稳。
+- **内嵌音频**：`<mpvoice voice_encode_fileid="...">` → `res.wx.qq.com/voice/getvoice?mediaid={id}`。
+
+### 微博
+
+- **Visitor 访客会话**：`genvisitor?cb=parser_callback` 拿 `data.tid` → `visitor?a=incarnate&t={tid}` 换 `SUB`/`SUBP`。
+  ⚠️ 拿 `sub` 当 `t` 参数会返 `retcode 50111257 tid不合法`。
+- **视频专页**：`POST weibo.com/tv/api/component`，body `data={"Component_Play_Playinfo":{"oid":"{media_id}"}}`。
+  ⚠️ **必须带 `PAGE-REFERER: /tv/show/1034:{id}` 头**，不带就 HTTP 200 但 body 空。
+- 一次拿到 **超清 2K / 高清 1080P / 高清 720P / 标清 480P** 四档，自动取最高。
+  注意 `urls` 是**纯字符串映射**（不是对象），且 `stream_url` 字段是 `null`。
+- 图床去水印：`mw690` / `mw2000` / `large` / `woriginal` / `bmiddle` / `thumbnail` / `orj360` / `orj480` → `osj1080`。
+- 实况：`pics[i].type == "livephoto"` 时取 `pics[i].videoSrc`。
+
+### 今日头条 / 西瓜视频
+
+- 链路：`m.toutiao.com/article/{id}/` 的 `script#RENDER_DATA`（**URL 编码**的 JSON）
+  → `articleInfo.playAuthTokenV2`（base64）→ 解出 `GetPlayInfoToken`
+  → `GET vod.bytedanceapi.com/?{token}` → `Result.Data.PlayInfoList`（每项含 MainPlayUrl / Bitrate / Width / Height / Duration）。
+- ⚠️ `/group/{id}/` 会 **301** 跳 `/article/{id}/`。
+- ⚠️ `/video/` `/w/` `/i{id}/` `/item/` 对文章类内容全是 **404**，而 404 页**也有 RENDER_DATA**（`type:"404"`），不早退就会把错误页当内容解析。
+- ⚠️ `playAuthTokenV2` **所有文章都有该字段**，图文类是空串，视频类才 1072 字符。
+- ⚠️ `Duration` 单位是**毫秒**。
+- **西瓜视频已纯 SPA**（`www.ixigua.com` 页面里没有任何数据），
+  但同一个 ID 在 `m.toutiao.com/article/{id}/` 有完整 `RENDER_DATA`，所以直接复用头条链路。
+
+### AcFun
+
+- 页面：`m.acfun.cn/v/?ac={id}`（PC 版会 302，统一走移动版）。
+- `window.videoInfo` 拿标题 / 封面 / 时长 / `ac` 号；
+  `var playInfo` 拿 `streams[]`，每档带 `qualityLabel` / `width` / `height` / `cdnUrls[0].url`。
+- ⚠️ 老接口 `/rest/pc-direct/play/playInfo` **已全部 404**，不要再试。
+- ⚠️ 手机端直连只拿 215 字节（反爬），需要完整浏览器头（Sec-Fetch-* / Accept-Language / Upgrade-Insecure-Requests）+ gzip 解压。
+
+### 好看视频
+
+- `window.__PRELOADED_STATE__.curVideoMeta`：`clarityUrl[]` 四档（标清 / 高清 / 超清 / 蓝光 1080P）。
+- ⚠️ **作者在 `source_name`，不是 `author.name`**。
+- ⚠️ `html5_playurl` 是**百家号页面地址**，不是视频地址，不能当直链用。
+
+### 最右 / 皮皮虾 / 皮皮搞笑 / 微视
+
+- 统一套路：页面 `window.__INITIAL_STATE__`（微视是 `window.Vise.initState`）→ JSON 解析 → 递归挖掠。
+- 这四个平台**页面结构不稳定**，用 `deepFindUrl()` / `deepFindStr()` 递归查找比写死路径健壮得多。
+- 微视首页 `isee.weishi.qq.com` 有 **401 反爬**，需走 `weishi.qq.com/webshare/{id}` 分享页。
+- ⚠️ 这四个平台反爬较严，部分链接可能解析失败，属预期内。
 
 ## 服务器依赖（哪些功能必须服务器）
 
@@ -110,7 +214,8 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 | **自更新加速** | version.json + APK 下发走内置服务器优先 | 自动回退 Gitee / GitHub 直连检查 |
 
 **服务器到期后**（当前 2027-04-20）：
-- 抖音 / 快手解析、下载完全不受影响
+- **新增多平台解析（微博 / 公众号 / 头条 / 西瓜 / AcFun / 好看 / 微信视频号元数据）完全不受影响**：
+  这些平台全部是本地 HTTP 直连解析，不走服务器、不用第三方 API\n- 抖音 / 快手解析、下载完全不受影响
 - **抖音主页全量翻页自 v1.3.7.2 起不受影响**（本地 WebView + 签名翻页，Cookie 只存本机）
 - **抖音实况图自 v1.3.7.1 起也不受影响**（凭据 App 内自取 + 本地签名，服务器只兜底）
 - **B站解析、播放、下载不受影响**（本地直连 API + CDN 直连，不依赖服务器）
