@@ -292,24 +292,60 @@ public class PlayerActivity extends Activity {
         return String.format("%02d:%02d", s2 / 60, s2 % 60);
     }
 
-    void autoHide(){ h.removeCallbacks(hideR); h.postDelayed(hideR, 4000); }
-    Runnable hideR = new Runnable(){ public void run(){ hideControls(); } };
+    /** 4 秒无操作自动隐藏控制栏 */
+    static final int CTRL_HIDE_MS = 4000;
+    /** 计时器代次：每次 show 自增，旧定时器自动作废 */
+    int ctrlGen = 0;
+
+    void autoHide(){
+        final int myGen = ++ctrlGen;
+        h.postDelayed(new Runnable(){ public void run(){
+            if(myGen != ctrlGen) return;       // 期间又操作过，重新计时
+            hideControls();
+        }}, CTRL_HIDE_MS);
+    }
 
     void showControls(){
         controlsVisible = true;
-        topBar.setVisibility(View.VISIBLE);
-        bottomBar.setVisibility(View.VISIBLE);
-        topBar.animate().alpha(1f).setDuration(160).start();
-        bottomBar.animate().alpha(1f).setDuration(160).start();
+        try{
+            topBar.setAlpha(1f);
+            bottomBar.setAlpha(1f);
+            topBar.setVisibility(View.VISIBLE);
+            bottomBar.setVisibility(View.VISIBLE);
+        }catch(Throwable t){}
         autoHide();
     }
+
     void hideControls(){
-        if(!controlsVisible) return;
+        // 以实际可见性为真相，不信布尔变量
+        boolean vis = false;
+        try{
+            vis = topBar.getVisibility() == View.VISIBLE
+               || bottomBar.getVisibility() == View.VISIBLE;
+        }catch(Throwable t){}
+        if(!vis){
+            controlsVisible = false;
+            return;
+        }
         controlsVisible = false;
-        topBar.animate().alpha(0f).setDuration(220).withEndAction(new Runnable(){ public void run(){ topBar.setVisibility(View.GONE); }}).start();
-        bottomBar.animate().alpha(0f).setDuration(220).withEndAction(new Runnable(){ public void run(){ bottomBar.setVisibility(View.GONE); }}).start();
+        ctrlGen++;                 // 让在途定时器作废
+        // 直接隐藏，不依赖动画回调
+        try{
+            topBar.setAlpha(1f);
+            bottomBar.setAlpha(1f);
+            topBar.setVisibility(View.GONE);
+            bottomBar.setVisibility(View.GONE);
+        }catch(Throwable t){}
     }
-    void toggleControls(){ if(controlsVisible) hideControls(); else showControls(); }
+
+    void toggleControls(){
+        boolean vis = false;
+        try{
+            vis = topBar.getVisibility() == View.VISIBLE
+               || bottomBar.getVisibility() == View.VISIBLE;
+        }catch(Throwable t){}
+        if(vis) hideControls(); else showControls();
+    }
 
     void showHint(String t, long ms){
         hint.setText(t);
