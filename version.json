@@ -1,14 +1,14 @@
 {
-  "tag": "v1.3.7.6",
-  "name": "v1.3.7.6",
-  "body": "## v1.3.7.6 修复直链画质：复制到浏览器下载也能拿到 4K\n\n### 优化\n- 解析结果新增【原画直链】，放在最前面，复制第一条就是最高画质\n- 【视频直链】标注实际画质，不再让人误以为能下 4K\n- 原画直链旁附说明：改成 ratio=1080p 即为通用 1080p 版\n\n### 修复\n- 从 App 复制直链到浏览器下载，拿到的只有 720P，不是 4K\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v1.3.7.6/DYParse-v1.3.7.6.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v1.3.7.6/DYParse-v1.3.7.6.apk",
-  "released": "2026-10-30",
+  "tag": "v2.0.0",
+  "name": "v2.0.0",
+  "body": "## v2.0.0 大版本：支持平台从 7 个扩到 20 个\n\n### 新增\n- 新增 13 个平台：小红书、微信视频号、微信公众号、微博、今日头条、西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包\n- 设置页新增「支持的平台」入口，可看完整清单与各平台能力说明\n- 小红书新增 Cookie 登录入口（App 内扫码登录 / 手动填写 / 清空）\n\n### 优化\n- 新平台全部走本地直连解析，免 Cookie、免服务器\n- 视频、图集解析完成后直接在页面上显示，不再只显示文字\n- 图片加载按站点自动匹配 Referer，解决部分图床图片加载失败\n- 设置页每项前加图标块，分类更一目了然\n\n### 修复\n- 设置里修改下载路径会闪退，无法保存目录\n- 小红书登录后 Cookie 不会自动抓取\n- 视频号登录元宝后反而解析不出来（现失败自动回退）\n\n### 说明\n- 微信视频号：可解析作者/描述/时间/统计/封面/图集，视频流受平台限制无法获取\n- 小红书：未登录会被风控拦截（error_code=300031），需在设置里登录一次\n\n### 更新覆盖\n- 所有已发布版本（1.1.0 ~ 1.3.7.6）均可收到本次更新\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.0.0/DYParse-v2.0.0.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.0.0/DYParse-v2.0.0.apk",
+  "released": "2026-11-01",
   "upgrade_notice": {
-    "title": "发现新版本",
-    "message": "v1.3.7.6 已发布：修复复制直链只有 720P 的问题，新增原画直链可直接下载 4K。",
+    "title": "发现新版本 2.0",
+    "message": "v2.0.0 已发布：支持平台从 7 个扩大到 20 个，新增小红书、微信视频号、微博、今日头条等 13 个平台。建议更新到最新版。",
     "url": "https://gitee.com/adaaixianzun/dyparse/releases",
-    "until": 1030706
+    "until": 2000000
   }
 }
