@@ -7,6 +7,103 @@
 > 旧版本 App 的更新检查走数值比较，可正常识别为更新。
 
 ---
+## v2.0.0 — 2026-11-01
+
+大版本更新：支持平台从 7 个扩到 **20 个**。
+
+### 新增平台（13 个）
+
+全部走**本地直连解析**，不依赖服务器、不依赖第三方付费 API。
+
+| 平台 | 数据来源 | 关键实现 |
+|---|---|---|
+| 小红书 | `window.__INITIAL_STATE__` | PC `note.noteDetailMap` / 移动 `noteData.data` 双结构；图片取 `infoList` 里无 `WM` 的原图；视频走 `consumer.originVideoKey` → `sns-video-bd.xhscdn.com` |
+| 微信视频号 | `finder-preview/api/feed/get_feed_info` | POST `{"baseReq":{"generalToken":""},"shortUri":"xxx"}`，**正常响应码是 201 不是 200**；实测 250ms 返回（旧 WebView 方案 12 秒） |
+| 微信公众号 | SSR 直出 HTML | `var msg_title` / `var nickname` / `var ct` 多正则；正文图 `data-src` 尺寸段改 `/0` 取无损原图；内嵌视频按 `file_id` 分组取 `.f10104` 最高码率；内嵌音频走 `res.wx.qq.com/voice/getvoice` |
+| 微博 | `weibo.com/tv/api/component` | visitor 访客走 `genvisitor` 拿 tid → `incarnate`；**必须带 `PAGE-REFERER` 头**（不带返 200 空 body）；拿 2K/1080P/720P/480P 四档；图床 `osj1080` 去水印 |
+| 今日头条 | `script#RENDER_DATA` | URL 编码 JSON → `playAuthTokenV2`（base64）→ `GetPlayInfoToken` → `vod.bytedanceapi.com` → `PlayInfoList`；`/group/` 会 301 到 `/article/` |
+| 西瓜视频 | 复用头条链路 | 已纯 SPA 无内嵌数据，同一 ID 在头条 article 页有完整 RENDER_DATA |
+| AcFun | `m.acfun.cn/v/?ac={id}` | `window.videoInfo` + `var playInfo.streams[]`；老接口 `/rest/pc-direct/play/playInfo` 已全 404；需完整浏览器头 + gzip |
+| 好看视频 | `window.__PRELOADED_STATE__.curVideoMeta` | `clarityUrl[]` 四档（标清/高清/超清/蓝光 1080P）；作者在 `source_name` 不是 `author.name` |
+| 最右 | `window.__INITIAL_STATE__` | 结构不稳，用递归 `deepFindUrl` / `deepFindStr` |
+| 皮皮虾 | `window.__INITIAL_STATE__` | 同上，兜底从 HTML 正则挖 `.mp4` |
+| 皮皮搞笑 | `window.__INITIAL_STATE__` | 同上 |
+| 微视 | `weishi.qq.com/webshare/{id}` | `window.Vise.initState`；首页 `isee.weishi.qq.com` 有 401 反爬 |
+| 豆包 | `samantha/media/get_play_info` | 分享页 JSON 递归取 `vid` → POST `{"key":vid}` → `original_media_info.main_url`，比 FPLAY 解密路径简单 |
+
+### 新增功能
+
+- **设置页「支持的平台」入口**：列出 20 个平台 + 使用说明 + 各平台局限说明，弹窗跟随主题（`dypDlg()`）
+- **小红书 Cookie 登录入口**：App 内扫码登录 / 手动填写 / 清空；照 B站 Cookie 的实现模式
+- 解析页顶部平台提示、批量解析提示同步更新为 20 个平台
+
+### 优化
+
+- **新平台媒体渲染**：新增 `o2(文字, 图片, 视频, 封面)` 入口 + `showMediaNow()`
+  - 之前只调 `o(text)` → 只有文字卡片，图片和视频不显示
+  - 新入口同时做两件事：`renderCards(text)` 出卡片 + `showMediaNow()` 直接驱动 `img` / `video` 控件
+- **图片 Referer 按站点自适应**：新增 `refererFor(url)`
+  - 原来 `httpGetBytes()` 把 Referer 硬编码成 `https://www.douyin.com/`
+  - 实测好看视频封面（`f7.baidu.com`）带 douyin Referer → **403 size=554**，不带 → 200 size=52396
+  - 现在按域名匹配（baidu/weixin/weibo/xhs/kuaishou/tiktok/acfun/doubao/douyin…），不认识的**一律不发** Referer
+- **设置页每项前加图标块**（参考 `dhvbjvvb/jicun` 的 `GlassIconChip`）
+  - 左侧 42×42、圆角 13 的图标块，半透明底（暗色 `0x2EFFFFFF` / 亮色 `0x12000000`）
+  - 标题字号 13→15、副标题 11→12，布局由竖向改为「图标 + 文字」横向
+  - 只改 `addSettingRow()` 一个函数，全部设置项自动生效
+  - 图标按标题关键字映射（代理◈ Cookie● 登录◐ 目录■ 平台▤ 日志≡ 更新↻ 关于ⓘ 反馈✉ 开关◉ 检测⚙ 批量≣ GitHub◇）
+  - **全部用基本几何字符，不用 emoji**，避免部分机型字体缺字显示成方框
+
+### 修复
+
+- **设置里修改下载路径会闪退**
+  - 崩因 1：`setView(new EditText(this){{...}})` 双大括号初始化，在 AlertDialog 里不可靠
+  - 崩因 2：`((AlertDialog)d).findViewById(android.R.id.custom)` —— `d` 是 `DialogInterface`，强转会 `ClassCastException`
+  - 修法：外部 `final EditText et` 直接引用 + 显式 `LinearLayout` 包裹 + `try/catch` 兜底 + 暗色适配
+- **小红书登录后 Cookie 不会自动抓取**
+  - 崩因：`maybeGrabXhsCookie` 被错放在 `if(biliLoginMode)` 里，小红书登录时该标志为 false，永远不执行
+  - 修法：改成独立 `if(xhsLoginMode)` 判断；另在 `onPageFinished` 加 `grabXhsCookieFromManager()` 二次兜底（小红书主 cookie 不是 HttpOnly，CookieManager 直接能读）
+- **视频号登录元宝后反而解析不出来**
+  - 根因：元宝返回「此内容暂时无法播放」时，`sphRenderJson()` 内部 `fi == null` 只打日志 `return`，
+    外层却**无条件 return**，导致根本没走后面的匿名解析。等于「配了 Cookie 反而比不配更差」
+  - 修法：`sphRenderJson()` 改签名 `void → boolean`，成功才 `return true`；
+    调用处用 `CountDownLatch` 等 UI 线程渲染结果，失败就继续走匿名回退
+  - 实测日志：`SPH_YB_RENDER_FAIL → 匿名回退` → `SPH_JSON_OK author=小蛮解说 ...`
+
+### 已知限制（如实说明）
+
+- **微信视频号视频流拿不到**
+  - 元宝通道整条链是通的：`get_parse_result` 200 → `playable_url` 正常 → `get_feed_info` 201
+  - `eid` 是 URL 编码的（`export%2FUzFf...`），已修解码
+  - `appid` / `entry_scene` 也从 `playable_url` 动态提取，和返回的 `sceneInfo` 完全一致
+  - 但微信返回 `errCode:0` + `{"errMsg":{"type":2,"title":"此内容暂时无法播放"}}`
+  - 换了 3 条不同链接结果一致，说明是**内容层不给流**，不是参数问题
+  - 参考 `MuZiJin701/wechat-channels-downloader` 的验证记录：它成功下载视频时用的是**真实 Chromium 浏览器**，纯 HTTP 走元宝通道对视频型动态无效
+  - 当前能力：元数据 + 封面 + 图集（图文动态）可用
+- **小红书未登录会被风控**：`error_code=300031`「当前笔记暂时无法浏览」，机房/陌生 IP 几乎必中，需登录一次
+- **微视 / 最右 / 皮皮虾 / 皮皮搞笑**：平台反爬较严，部分链接可能解析失败
+- **快手实况图**：平台只下发静态图 + 音轨，无动图轨（已提示「快手不下发动图轨道，只能存静态图」）
+
+### 更新覆盖范围
+
+- `upgrade_notice.until` 设为 `2000000`，覆盖所有 `versionCode < 2000000` 的版本
+分水岭不是「1.3.7」而是 **versionCode 是五位还是七位**：
+
+| 版本区间 | versionCode | 旧算法 `parseVer("v2.0.0")=20000` | 结果 |
+|---|---|---|---|
+| 1.1.0 | 10100 | 20000 > 10100 | ✅ 正常比对 |
+| 1.2.0 | 10200 | 20000 > 10200 | ✅ 正常比对 |
+| 1.3.0 ~ 1.3.5 | 10300~10305 | 20000 > 10305 | ✅ 正常比对 |
+| **1.3.6** | **10306** | 20000 > 10306 | ✅ 正常比对 |
+| **1.3.7** | **10307** | 20000 > 10307 | ✅ 正常比对 |
+| **1.3.7.1** | **103701** | 20000 < 103701 | ✅ 靠 `upgrade_notice` 兜底 |
+| **1.3.7.2** | **103702** | 20000 < 103702 | ✅ 靠 `upgrade_notice` 兜底 |
+| 1.3.7.3 ~ 1.3.7.6 | 1030703+ | `2000000 > 1030706` | ✅ 正常比对 |
+
+**结论：所有已发布版本都能收到 2.0 更新。**
+
+补充说明：把 tag 改成三位（如 `v1.3.9`）或加大主版本号（如 `v9.9.9`）都**无效**——
+旧算法基数只有 `10000`，三位版本最多算出 `90909`，永远小于七位 versionCode `103701`。
+
 ## v1.3.7.6 (2026-10-30)
 
 本次为 **直链画质修复** 小版本。用户反馈「从 App 复制直链到浏览器下载，拿到的不是 4K」。
