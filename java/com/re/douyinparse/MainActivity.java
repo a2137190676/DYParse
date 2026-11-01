@@ -96,6 +96,8 @@ public class MainActivity extends Activity {
     static final String KEY_PROXY_ON = "proxy_on";       // 内置代理（服务器中转）开关，默认关
     /** 抖音访客凭据 UIFID_TEMP：由真实浏览器通过挑战后签发，缺失时 detail 接口一律 403 */
     static final String KEY_UIFID = "dy_uifid_temp";
+    /** 视频号凭据：腾讯元宝 Cookie（hy_user + hy_token），用于换 generalToken 解析视频流 */
+    static final String KEY_YB_CK = "yb_cookie";
     /** YouTube Cookie：WebView 登录后自动抓取（含 HttpOnly），服务器 yt-dlp 带登录态解析 */
     static final String KEY_YT_COOKIE = "yt_cookie";
     /** 自建服务器地址（可配置）：用户自填值 > 内置默认 > 本地/Gitee 回退 */
@@ -144,6 +146,35 @@ public class MainActivity extends Activity {
             || (url != null && (url.contains("twimg.com") || url.contains("fxtwitter.com")));
     }
 
+    /** 视频号凭据：读取元宝 Cookie（只存本机，不上传） */
+    String ybCookie(){
+        try{ return getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_YB_CK, ""); }
+        catch(Throwable t){ return ""; }
+    }
+    void ybCookieSave(String v){
+        try{ getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_YB_CK, v == null ? "" : v.trim()).apply(); }
+        catch(Throwable t){}
+    }
+    String ybCkLabel(){
+        String c = ybCookie();
+        if(c.length() == 0) return "可选 · 不配置也能解析视频号（拿到元数据+封面）";
+        if(c.contains("hy_user") && c.contains("hy_token")) return "已保存 · 可选增强，不影响基本解析";
+        return "格式不对 · 需含 hy_user 与 hy_token";
+    }
+
+    /** 微信视频号分享链接：weixin.qq.com/sph/xxx */
+    static boolean isSphUrl(String u){
+        if(u == null) return false;
+        String s = u.toLowerCase(java.util.Locale.US);
+        return s.contains("weixin.qq.com/sph/")
+            || s.contains("channels.weixin.qq.com/finder-preview");
+    }
+
+    /** 微博：weibo.com / m.weibo.cn / video.weibo.com / t.cn / sinaimg.cn */
+    static boolean isWeiboUrlSt(String u){
+        return WeiboParser.isWeiboUrl(u);
+    }
+
     /** 是否为海外平台链接（TikTok/X/YouTube/IG + CDN） */
     static boolean isOverseasUrl(String url){
         return isTikTokUrl(url) || isXDomain(url) || YtParser.isYtUrl(url)
@@ -176,6 +207,18 @@ public class MainActivity extends Activity {
                 || u.contains("bilivideo.com")) return true;
         // Instagram
         if(InsParser.isInsUrl(u)) return true;
+        // 轻量平台合集（微视/AcFun/最右/皮皮虾/皮皮搞笑/好看/西瓜）
+        if(MiscParser.isMiscUrl(u)) return true;
+        // 今日头条（含 ixigua / toutiaocdn）
+        if(ToutiaoParser.isToutiaoUrl(u)) return true;
+        // 公众号（mp.weixin.qq.com/s…）
+        if(WxMpParser.isWxMpUrl(u)) return true;
+        // 豆包（doubao.com 分享页）
+        if(DoubaoParser.isDoubaoUrl(u)) return true;
+        // 小红书（含 xhslink 短链）
+        if(XhsParser.isXhsUrl(u)) return true;
+        // 微博（含 video.weibo.com / m.weibo.cn / t.cn / sinaimg）
+        if(WeiboParser.isWeiboUrl(u)) return true;
         return false;
     }
 
@@ -187,6 +230,8 @@ public class MainActivity extends Activity {
     volatile boolean biliLoginMode = false;
     /** 抖音登录/探测模式（WebView 打开抖音 → 抓 UIFID_TEMP） */
     volatile boolean dyLoginMode = false;
+    /** 元宝（视频号凭据）登录模式：抓到 hy_user+hy_token 自动退出 */
+    volatile boolean ybLoginMode = false;
     /** 临时探测开关（非 null 时记录抖音请求头 Cookie） */
     String dyProbe = null;
     String dyCookieLast = "";   // 最近一次抓到的抖音完整 Cookie
@@ -1773,6 +1818,19 @@ public class MainActivity extends Activity {
             public android.webkit.WebResourceResponse shouldInterceptRequest(WebView v, android.webkit.WebResourceRequest req){
                 try{
                     final String u = req.getUrl().toString();
+                    // 微信视频号：dump 所有 qq.com 请求，找数据接口
+                    if(u != null && u.contains("qq.com")){
+                        Log.i("DYP", "SPH_REQ " + u);
+                    }
+                    // 视频号视频/封面直链：截到就存（封面是 jpg，视频需要登录态才有）
+                    if(u != null && u.contains("finder.video.qq.com")){
+                        Log.i("DYP", "SPH_VIDEO_URL " + u);
+                        if(sphCoverUrl == null || sphCoverUrl.length() == 0) sphCoverUrl = u;
+                    }
+                    // 视频号数据接口：只记录，绝不自造响应（会破坏页面渲染）
+                    if(u != null && u.contains("/finder-preview/api/feed/get_feed_info")){
+                        Log.i("DYP", "SPH_FEED_REQ " + u);
+                    }
                     // 抖音登录/探测模式：从请求头抓完整 Cookie（含 HttpOnly 的 UIFID_TEMP）
                     if(dyLoginMode && u != null && u.contains("douyin.com")){
                         try{
@@ -1807,6 +1865,10 @@ public class MainActivity extends Activity {
                     // B站 登录模式：抓请求头里的完整 Cookie（SESSDATA 是 HttpOnly）
                     if(biliLoginMode && u != null){
                         try{ maybeGrabBiliCookie(u, req.getRequestHeaders()); }catch(Throwable t2){}
+                    }
+                    // 小红书登录模式：独立判断，不能放在 biliLoginMode 里
+                    if(xhsLoginMode && u != null){
+                        try{ maybeGrabXhsCookie(u, req.getRequestHeaders()); }catch(Throwable t3){}
                     }
                     // 调试：记录所有 XHR/fetch 请求，用于发现合集接口
                     String ac = req.getRequestHeaders() != null ? req.getRequestHeaders().get("X-Requested-With") : null;
@@ -1979,6 +2041,18 @@ if(isProfileList && !profileFetching){
             public void onPageFinished(WebView v,String u){
                 pageHits++;
                 Log.i("DYP","onPageFinished#"+pageHits+" "+u);
+                // 小红书登录模式：每页加载完都从 CookieManager 抓一次兜底
+                if(xhsLoginMode && u != null && u.indexOf("xiaohongshu.com") >= 0){
+                    h.postDelayed(new Runnable(){ public void run(){
+                        try{ grabXhsCookieFromManager(); }catch(Throwable t){}
+                    }}, 800);
+                }
+                // 元宝登录模式：页面加载完刷新一下「完成登录」按钮的可用态
+                if(ybLoginMode && u != null && u.indexOf("yuanbao.tencent.com") >= 0){
+                    h.postDelayed(new Runnable(){ public void run(){
+                        try{ ybLoginBarRefresh(); }catch(Throwable t){}
+                    }}, 1200);
+                }
                 // 抖音主页登录模式：每页加载完就尝试把登录 Cookie 落到本地；抓到就自动退出回解析页
                 if(dyProfileLoginMode){
                     if(u != null && u.indexOf("douyin.com") >= 0){
@@ -2761,7 +2835,10 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
         box.setPadding(dp(16), dp(10), dp(16), dp(4));
 
         TextView tip = new TextView(this);
-        tip.setText("一行一个链接，支持抖音 / 快手 / TikTok / X / YouTube / B站 / Instagram。\n"
+        tip.setText("一行一个链接，支持：\n"
+                  + "抖音 / 快手 / TikTok / X / YouTube / B站 / 小红书 / Instagram\n"
+                  + "微信视频号 / 微信公众号 / 微博 / 今日头条 / 西瓜视频\n"
+                  + "AcFun / 好看视频 / 最右 / 皮皮虾 / 皮皮搞笑 / 微视 / 豆包\n"
                   + "留空的行会被忽略，重复链接自动去重。");
         tip.setTextSize(12);
         tip.setTextColor(curDark ? 0xFF9BA1AE : 0xFF6B6F7A);
@@ -2824,6 +2901,8 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
 
         addSettingRow("批量解析", "一次粘贴多条链接，一行一个", new View.OnClickListener(){
             public void onClick(View v){ showBatchInputDialog(); }});
+        addSettingRow("支持的平台", PLATFORM_LIST.length + " 个平台 · 点看完整清单", new View.OnClickListener(){
+            public void onClick(View v){ showPlatforms(); }});
         addSettingRow("更新日志", "每个版本改了什么", new View.OnClickListener(){
             public void onClick(View v){ showChangelog(); }});
         addSettingRow("关于", "版本信息与免责声明", new View.OnClickListener(){
@@ -2935,8 +3014,12 @@ LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), ne
             public void onClick(View v){ showInsLoginDialog(); }});
 addSettingRow("B站 Cookie", curBiliCkLabel(), new View.OnClickListener(){
              public void onClick(View v){ showBiliLoginMenu(); }});
+        addSettingRow("小红书 Cookie", curXhsCkLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showXhsLoginMenu(); }});
          addSettingRow("抖音访客凭据", curDyUifidLabel(), new View.OnClickListener(){
              public void onClick(View v){ showDyUifidMenu(); }});
+        addSettingRow("视频号凭据（元宝）", ybCkLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showYbMenu(); }});
         addSettingRow("抖音主页登录", dyProfileCookiesLikelyLoggedIn()
                 ? "已登录 · 主页可解析全部作品"
                 : "未登录 · 主页最多 21 条，登录后拿全部", new View.OnClickListener(){
@@ -3654,25 +3737,37 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
     /** 下载目录设置弹窗（独立对话框，直接输入路径） */
     void showDlDirDialog(final String cat, final String key, final String def){
         curDark = isDarkMode();
+        // 用外部 final 引用拿输入框，不靠 ((AlertDialog)d).findViewById()
+        final EditText et = new EditText(this);
+        et.setText(getSharedPreferences(SP, MODE_PRIVATE).getString(key, ""));
+        et.setHint(def);
+        et.setSingleLine(true);
+        et.setTextSize(13);
+        et.setTextColor(curDark ? 0xFFE6E8EC : 0xFF23262E);
+        et.setHintTextColor(curDark ? 0xFF7A8194 : 0xFF9AA0AC);
+        int pad = dp(16);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setPadding(pad, dp(8), pad, dp(4));
+        wrap.addView(et, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         dypDlg()
             .setTitle("设置「" + cat + "」目录")
             .setMessage("输入完整路径：\n\n默认：/storage/emulated/0/" + def + "\n\n"
                 + "留空则恢复默认。\n"
                 + "修改后立即生效，已下载的文件不会自动迁移。")
-            .setView(new android.widget.EditText(this){{
-                setText(getSharedPreferences(SP, MODE_PRIVATE).getString(key, ""));
-                setHint(def);
-                setSingleLine(true);
-            }})
+            .setView(wrap)
             .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int w){
-                    android.widget.EditText et = (android.widget.EditText) ((android.app.AlertDialog)d).findViewById(android.R.id.custom);
-                    if(et == null) return;
-                    String v = et.getText().toString().trim();
-                    if(v.length() == 0) v = "";
-                    getSharedPreferences(SP, MODE_PRIVATE).edit().putString(key, v).apply();
-                    buildSettingsPage();
-                    Toast.makeText(MainActivity.this, "已设置" + cat + "目录", Toast.LENGTH_SHORT).show();
+                    try{
+                        String v = et.getText() == null ? "" : et.getText().toString().trim();
+                        getSharedPreferences(SP, MODE_PRIVATE).edit().putString(key, v).apply();
+                        buildSettingsPage();
+                        Toast.makeText(MainActivity.this,
+                            v.length() == 0 ? ("已恢复" + cat + "默认目录")
+                                            : ("已设置" + cat + "目录：" + v),
+                            Toast.LENGTH_SHORT).show();
+                    }catch(Throwable t){ Log.i("DYP", "DLDIR_SAVE_ERR " + t); }
                 }
             })
             .setNegativeButton("取消", null)
@@ -3697,27 +3792,236 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
     }
 
     /** 设置页行 */
+    /** 平台清单：一行一个平台 */
+    static final String[] PLATFORM_LIST = new String[]{
+        "抖音", "快手", "TikTok", "X（推特）", "YouTube", "Instagram",
+        "B站", "小红书", "微信视频号", "微信公众号", "微博",
+        "今日头条", "西瓜视频", "AcFun", "好看视频",
+        "最右", "皮皮虾", "皮皮搞笑", "微视", "豆包"
+    };
+
+    /** 平台清单弹窗（跟随主题） */
+    void showPlatforms(){
+        StringBuilder sb = new StringBuilder();
+        sb.append("已支持 ").append(PLATFORM_LIST.length).append(" 个平台：\n\n");
+        for(int i = 0; i < PLATFORM_LIST.length; i++){
+            sb.append(i + 1).append(". ").append(PLATFORM_LIST[i]).append("\n");
+        }
+        sb.append("\n【使用说明】\n");
+        sb.append("· 单条链接：直接粘到解析框，点解析即可\n");
+        sb.append("· 多条链接：设置 → 批量解析，一行一个\n");
+        sb.append("· 不少平台完全本地解析，不需要服务器\n\n");
+        sb.append("【局限说明】\n");
+        sb.append("· 小红书：平台已强制登录且严防风控，\n");
+        sb.append("  未登录多数笔记会返回 300031（当前笔记暂时无法浏览）\n");
+        sb.append("· 微信视频号：平台限制，纯 HTTP 拿不到视频流\n");
+        sb.append("  （含登录元宝），只能拿到元数据+封面+图文\n");
+        sb.append("· 快手实况图：平台只下发静态图+音轨，\n");
+        sb.append("  无法获取动图轨\n");
+        sb.append("· X / YouTube / Instagram：部分地区\n");
+        sb.append("  需要代理才能直连\n");
+        sb.append("· 微视 / 最右 / 皮皮虾 / 皮皮搞笑：\n");
+        sb.append("  平台反爬较严，部分链接可能解析失败\n");
+        final TextView tv = new TextView(this);
+        tv.setText(sb.toString());
+        tv.setTextSize(13);
+        tv.setTextColor(curDark ? 0xFFE6E8EC : 0xFF23262E);
+        tv.setLineSpacing(dp(3), 1f);
+        tv.setTextIsSelectable(true);
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        sv.addView(tv);
+        int pad = dp(16);
+        sv.setPadding(pad, dp(8), pad, dp(8));
+        dypDlg().setTitle("支持的平台")
+            .setView(sv)
+            .setPositiveButton("关闭", null)
+            .show();
+    }
+
+    /** 设置页：小红书 Cookie 状态标签 */
+    String curXhsCkLabel(){
+        int n = CookieStore.count(this, CookieStore.PLATFORM_XHS);
+        if(n <= 0) return "未填写 · 未登录会被风控（300031）";
+        return "已保存 " + n + " 项" + (CookieStore.xhsReady(this) ? "（含 web_session）" : "（缺 web_session）");
+    }
+
+    /** 小红书 Cookie 入口：App 内登录 / 手动填写 / 清空 */
+    void showXhsLoginMenu(){
+        curDark = isDarkMode();
+        int n = CookieStore.count(this, CookieStore.PLATFORM_XHS);
+        String[] items = {
+            "App 内登录（自动抓 Cookie）",
+            "手动填写 Cookie",
+            n > 0 ? ("清空 Cookie（当前 " + n + " 项）") : "清空 Cookie（无）"
+        };
+        dypDlg()
+            .setTitle("小红书 Cookie")
+            .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    if(w == 0) startXhsLogin();
+                    else if(w == 1) showCookieDialog(CookieStore.PLATFORM_XHS, "小红书");
+                    else {
+                        CookieStore.clear(MainActivity.this, CookieStore.PLATFORM_XHS);
+                        showHintToast("小红书 Cookie 已清空");
+                        buildSettingsPage();
+                    }
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /** 小红书登录模式标志 */
+    volatile boolean xhsLoginMode = false;
+
+    /** App 内登录小红书：WebView 打开登录页，从请求头抓 Cookie */
+    void startXhsLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = false;
+        biliLoginMode = false;
+        dyLoginMode = false;
+        xhsLoginMode = true;
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.setAlpha(1f);
+        // 桌面 UA：移动 UA 下小红书会直接弹「打开App」，根本不给登录框
+        try{ web.getSettings().setUserAgentString(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"); }catch(Throwable t){}
+        // /login 和 /explore 只给「打开App」提示，只有 /new/login 有真正的扫码登录入口
+        web.loadUrl("https://www.xiaohongshu.com/new/login");
+        s("小红书登录页已打开，请手动完成登录");
+        showHintToast("登录完成后会自动保存，然后点右上角「完成」");
+    }
+
+    /** 从 WebView 请求头抓小红书 Cookie */
+    /** 从 CookieManager 直接读小红书 Cookie（不依赖请求头） */
+    void grabXhsCookieFromManager(){
+        try{
+            if(!xhsLoginMode) return;
+            String ck = CookieManager.getInstance().getCookie("https://www.xiaohongshu.com/");
+            if(ck == null || ck.length() < 10){
+                Log.i("DYP", "XHS_CK_MGR empty");
+                return;
+            }
+            boolean hasSession = ck.contains("web_session=");
+            boolean hasA1 = ck.contains("a1=");
+            Log.i("DYP", "XHS_CK_MGR len=" + ck.length()
+                + " session=" + hasSession + " a1=" + hasA1);
+            if(!hasSession && !hasA1) return;
+            int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_XHS, ck);
+            Log.i("DYP", "XHS_CK_SAVED items=" + n);
+            h.post(new Runnable(){ public void run(){
+                s("小红书 Cookie 已保存（" + n + " 项）");
+                buildSettingsPage();
+            }});
+        }catch(Throwable t){ Log.i("DYP", "XHS_CK_MGR_ERR " + t); }
+    }
+
+    void maybeGrabXhsCookie(String url, java.util.Map<String,String> headers){
+        if(!xhsLoginMode) return;
+        try{
+            if(url == null || headers == null) return;
+            String u = url.toLowerCase();
+            if(!(u.contains("xiaohongshu.com") || u.contains("xhscdn.com"))) return;
+            String ck = headers.get("Cookie");
+            if(ck == null || ck.length() == 0) return;
+            String cm = null;
+            try{ cm = CookieManager.getInstance().getCookie("https://www.xiaohongshu.com/"); }catch(Throwable t){}
+            String full = ck;
+            if(cm != null && cm.length() > 0){
+                String remain = cm;
+                for(String kv : ck.split(";")){
+                    int e = kv.indexOf('=');
+                    if(e > 0){
+                        String k = kv.substring(0, e).trim();
+                        if(!remain.contains(k + "=")) remain = remain + "; " + kv;
+                    }
+                }
+                full = remain;
+            }
+            if(full.length() < 20) return;
+            int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_XHS, full);
+            Log.i("DYP", "XHS_CK_GRAB len=" + full.length() + " saved=" + n);
+            h.post(new Runnable(){ public void run(){
+                s("小红书 Cookie 已保存（" + n + " 项）");
+            }});
+        }catch(Throwable t){ Log.i("DYP", "XHS_CK_GRAB_ERR " + t); }
+    }
+
+    /** 设置项图标映射：按标题关键字匹配，未命中给默认圆点 */
+String settingIcon(String title){
+        if(title == null || title.length() == 0) return "·";
+        // 顺序：越具体越靠前
+        if(title.contains("批量")) return "≣";
+        if(title.contains("GitHub") || title.contains("访问方式")) return "◇";
+        if(title.contains("服务器地址")) return "◈";
+        if(title.contains("代理")) return "◈";
+        if(title.contains("Cookie")) return "●";
+        if(title.contains("登录") || title.contains("凭据")) return "◐";
+        if(title.contains("目录")) return "■";
+        if(title.contains("平台")) return "▤";
+        if(title.contains("日志")) return "≡";
+        if(title.contains("检查更新")) return "↻";
+        if(title.contains("更新")) return "↺";
+        if(title.contains("版本")) return "Ⅲ";
+        if(title.contains("关于") || title.contains("协议")) return "ⓘ";
+        if(title.contains("反馈")) return "✉";
+        if(title.contains("开关") || title.contains("自动")) return "◉";
+        if(title.contains("检测") || title.contains("修复")) return "⚙";
+        return "·";
+    }
+
     LinearLayout addSettingRow(String title, String sub, View.OnClickListener l){
+        // 外层：横向 [图标块 42x42] [标题/副标题 竖向]
         LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(dp(12), dp(10), dp(12), dp(10));
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(11), dp(12), dp(11));
         row.setBackground(makeRoundRect(curDark ? 0xFF24272F : 0xFFFFFFFF,
                 curDark ? 0xFF333842 : 0xFFE1E4E9, 12));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.bottomMargin = dp(8);
         row.setLayoutParams(lp);
+
+        // 左：图标块（42x42，圆角 13，半透明底，参考 jicun GlassIconChip）
+        TextView chip = new TextView(this);
+        chip.setText(settingIcon(title));
+        chip.setTextSize(16);
+        chip.setGravity(android.view.Gravity.CENTER);
+        chip.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+        chip.setBackground(makeRoundRect(curDark ? 0x2EFFFFFF : 0x12000000, 0, 13));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(dp(42), dp(42));
+        clp.rightMargin = dp(12);
+        chip.setLayoutParams(clp);
+        row.addView(chip);
+
+        // 右：标题 + 副标题
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams colp = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        col.setLayoutParams(colp);
+
         TextView t = new TextView(this);
         t.setText(title);
-        t.setTextSize(13);
+        t.setTextSize(15);
         t.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
         TextView s2 = new TextView(this);
         s2.setText(sub);
-        s2.setTextSize(11);
+        s2.setTextSize(12);
         s2.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
-        s2.setPadding(0, dp(2), 0, 0);
-        row.addView(t);
-        row.addView(s2);
+        s2.setPadding(0, dp(3), 0, 0);
+        col.addView(t);
+        col.addView(s2);
+        row.addView(col);
+
         row.setOnClickListener(l);
         settingsWrap.addView(row);
         return row;
@@ -3913,6 +4217,70 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
     }
 void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText(t); }}); appLog("UI", t); }
     void o(final String t){ h.post(new Runnable(){ public void run(){ curResult = t; renderCards(t); }}); }
+    /** 新平台统一入口：显示文字卡片 + 同时把图片/视频交给控件 */
+    void o2(final String text, final String imgs, final String play, final String cover){
+        h.post(new Runnable(){ public void run(){
+            try{
+                curResult = text;
+                renderCards(text);
+                Log.i("DYP", "O2_CARDS textLen=" + (text == null ? -1 : text.length()));
+                if(cover != null && cover.length() > 0) curCover = cover;
+                if(play != null && play.length() > 0) curPlay = play;
+                if(imgs != null && imgs.length() > 0) curImgs = imgs;
+                showMediaNow();
+            }catch(Throwable t){
+                Log.i("DYP", "O2_ERR " + t);
+            }
+        }});
+    }
+
+    /** 根据 curImgs / curPlay / curCover 直接切换图片或播放器 */
+    void showMediaNow(){
+        try{
+            boolean hasImgs = false;
+            if(curImgs != null && curImgs.length() > 0){
+                parseImgs();
+                hasImgs = imgUrls.size() > 0;
+            }
+            Log.i("DYP", "SHOW_MEDIA imgs=" + imgUrls.size()
+                + " play=" + (curPlay == null ? -1 : curPlay.length())
+                + " cover=" + (curCover == null ? -1 : curCover.length()));
+            if(hasImgs){
+                actions.setVisibility(View.VISIBLE);
+                video.setVisibility(View.GONE);
+                img.setVisibility(View.VISIBLE);
+                videoBox.setVisibility(View.GONE);
+                try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
+                miniProxyKey = null;
+                imgIdx = 0; imgZoomed = false;
+                curShowImg = imgUrls.get(0);
+                loadImage(curShowImg, img);
+                applyLiveBadge(0);
+                Toast.makeText(MainActivity.this, imgTipText(), Toast.LENGTH_SHORT).show();
+                maybeAutoAction();
+            } else if(curPlay != null && curPlay.length() > 0){
+                actions.setVisibility(View.VISIBLE);
+                imgUrls.clear(); dynUrls.clear(); imgZoomed = false;
+                try{ ((TextView)findViewById(R.id.liveBadge)).setVisibility(View.GONE); }catch(Throwable t){}
+                if(autoPlayOn()){
+                    img.setVisibility(View.GONE);
+                    doPlay();
+                } else {
+                    video.setVisibility(View.GONE);
+                    if(curCover != null && curCover.length() > 0){
+                        img.setVisibility(View.VISIBLE);
+                        loadImage(curCover, img);
+                        Log.i("DYP", "SHOW_MEDIA 显示封面预览");
+                    } else {
+                        img.setVisibility(View.GONE);
+                    }
+                }
+                maybeAutoAction();
+            }
+        }catch(Throwable t){
+            Log.i("DYP", "SHOW_MEDIA_ERR " + t);
+        }
+    }
 
     // ===== 下载/转码进度 =====
     /** 显示进度条，pct 为 0~1 */
@@ -6340,32 +6708,21 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
           + "使用者应自行承担使用风险，包括但不限于违反平台服务条款、侵犯内容版权等。"
           + "因使用本软件产生的一切后果由使用者自负，作者不承担任何责任。\n\n"
           + "【技术说明】\n"
-          + "仅解析公开分享页面，不存储任何用户数据，不使用、不上传任何账号信息。\n\n"
-+ "【为什么用服务器】\n"
-           + "抖音实况照片解析需要访客凭据（UIFID_TEMP），普通用户拿不到。"
-           + "服务器内置凭据池代为签名，让你开箱即用、解析更快更稳。\n"
-           + "用服务器：实况照片免填凭据、秒解析、抗风控更强。\n"
-           + "不用服务器：可以在 App 内一键从本机浏览器抓取凭据（设置 → 抖音访客凭据 → 从浏览器抓取），"
-           + "失效后重抓一次即可；服务器不可达时 App 自动回退本地解析。\n"
-           + "服务器有效期至：2027-04-20（到期后自动降级，不影响使用）\n\n"
+          + "仅解析公开分享页面，不存储任何用户数据，不使用、不上传任何账号信息。\n"
+          + "所有解析功能在无服务器时也可用；服务器仅作为加速层，"
+          + "不可达时自动回退本地解析，不影响使用。\n\n"
           + "【问题反馈】\n"
           + "QQ：" + APP_QQ + "\n"
           + "反馈群：" + APP_QQ_GROUP + "\n\n"
-+ "【开源地址】\n"
-           + "Gitee：" + "https://gitee.com/" + GITEE_OWNER + "/" + GITEE_REPO + "\n"
-           + "GitHub：" + "https://github.com/" + GH_OWNER + "/" + GH_REPO + "\n\n"
-           + "【更新】\n"
-           + "新版本同步发布在 Gitee 与 GitHub Releases。\n"
-           + "当前更新源：" + platformName() + "（可在设置里切换），点下方「检查更新」即可。";
-
+          + "【更新】\n"
+          + "新版本同步发布在 Gitee 与 GitHub Releases。\n"
+          + "当前更新源：" + platformName() + "（可在设置里切换），点下方「检查更新」即可。";
         int bgDlg   = curDark ? 0xFF191B21 : 0xFFFFFFFF;
         int textDlg = curDark ? 0xFFF2F3F5 : 0xFF1A1A1F;
-
         LinearLayout wrap = new LinearLayout(this);
         wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.setBackgroundColor(bgDlg);
         wrap.setPadding(dp(20), dp(16), dp(20), dp(4));
-
         TextView tv = new TextView(this);
         tv.setText(txt);
         tv.setTextSize(13);
@@ -6373,10 +6730,80 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         tv.setLineSpacing(dp(5), 1f);
         tv.setTextIsSelectable(true);
         wrap.addView(tv);
-
+        // ===== 开源地址独立区块：每条地址配「复制」「浏览器打开」 =====
+        String[] names = {"Gitee", "GitHub"};
+        String[] urls  = {
+            "https://gitee.com/" + GITEE_OWNER + "/" + GITEE_REPO,
+            "https://github.com/" + GH_OWNER + "/" + GH_REPO
+        };
+        for(int i = 0; i < names.length; i++){
+            final String nm = names[i];
+            final String u  = urls[i];
+            TextView label = new TextView(this);
+            label.setText("【开源地址 · " + nm + "】");
+            label.setTextSize(13);
+            label.setTextColor(textDlg);
+            label.setPadding(0, dp(10), 0, dp(2));
+            wrap.addView(label);
+            TextView urlTv = new TextView(this);
+            urlTv.setText(u);
+            urlTv.setTextSize(12);
+            urlTv.setTextColor(curDark ? 0xFF8FB8E8 : 0xFF2E6DA4);
+            urlTv.setTextIsSelectable(true);
+            wrap.addView(urlTv);
+            LinearLayout btnRow = new LinearLayout(this);
+            btnRow.setOrientation(LinearLayout.HORIZONTAL);
+            btnRow.setPadding(0, dp(4), 0, dp(2));
+            TextView btnCopy = new TextView(this);
+            btnCopy.setText("复制地址");
+            btnCopy.setTextSize(12);
+            btnCopy.setTextColor(curDark ? 0xFF8FB8E8 : 0xFF2E6DA4);
+            btnCopy.setPadding(dp(12), dp(6), dp(12), dp(6));
+            btnCopy.setBackgroundResource(R.drawable.pl_btn);
+            btnCopy.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    try{
+                        android.content.ClipboardManager cm =
+                            (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                        cm.setText(u);
+                        Toast.makeText(MainActivity.this, "已复制 " + nm + " 地址", Toast.LENGTH_SHORT).show();
+                    }catch(Throwable t){}
+                }
+            });
+            btnRow.addView(btnCopy);
+            TextView btnOpen = new TextView(this);
+            btnOpen.setText("浏览器打开");
+            btnOpen.setTextSize(12);
+            btnOpen.setTextColor(curDark ? 0xFF8FB8E8 : 0xFF2E6DA4);
+            LinearLayout.LayoutParams lpOpen = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lpOpen.leftMargin = dp(10);
+            btnOpen.setLayoutParams(lpOpen);
+            btnOpen.setPadding(dp(12), dp(6), dp(12), dp(6));
+            btnOpen.setBackgroundResource(R.drawable.pl_btn);
+            btnOpen.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    try{
+                        startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse(u)));
+                    }catch(Throwable t){
+                        Toast.makeText(MainActivity.this, "打开失败：" + t, Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
+            btnRow.addView(btnOpen);
+            wrap.addView(btnRow);
+        }
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        sv.addView(wrap, new android.widget.FrameLayout.LayoutParams(
+            android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT));
+        int maxH = (int)(getResources().getDisplayMetrics().heightPixels * 0.62f);
+        sv.setLayoutParams(new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, maxH));
         android.app.AlertDialog dlg = dypDlg()
             .setTitle("关于")
-            .setView(wrap)
+            .setView(sv)
             .setPositiveButton("关闭", null)
             .create();
         dlg.show();
@@ -6448,7 +6875,26 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v1.3.7.6】修复直链画质：复制到浏览器下载也能拿到 4K\n"
+            "【v2.0.0】大版本：支持平台从 7 个扩到 20 个\n"
+             + "新增\n"
+             + "· 新增 13 个平台：小红书、微信视频号、微信公众号、微博、今日头条\n"
+             + "· 西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包\n"
+             + "· 设置页新增「支持的平台」入口，可看完整清单与能力说明\n"
+             + "· 小红书新增 Cookie 登录入口\n"
+             + "优化\n"
+             + "· 新平台全部本地直连，免 Cookie、免服务器\n"
+             + "· 视频、图集解析完直接在页面显示，不再只显示文字\n"
+             + "· 图片加载按站点自动匹配 Referer，解决部分图床加载失败\n"
+             + "· 设置页每项前加图标块，分类更一目了然\n"
+             + "修复\n"
+             + "· 设置里修改下载路径会闪退，无法保存目录\n"
+             + "· 小红书登录后 Cookie 不会自动抓取\n"
+             + "· 视频号登录元宝后反而解析不出（现已失败自动回退）\n"
+             + "说明\n"
+             + "· 微信视频号：可解析作者/描述/时间/统计/封面/图集，视频流受平台限制\n"
+             + "· 小红书：未登录会被风控拦截，需在设置里登录一次\n"
+             + "\n"
+             + "【v1.3.7.6】修复直链画质：复制到浏览器下载也能拿到 4K\n"
              + "优化\n"
              + "· 解析结果新增【原画直链】，放最前面，复制第一条就是最高画质\n"
              + "· 【视频直链】标注实际画质，不再让人误以为能下 4K\n"
@@ -6461,7 +6907,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "v1.3.7.4：批量解析重构，静默执行、结果进列表、退出重进可恢复\n"
              + "· 后台保活设置、更新源切换、GitHub 镜像加速\n"
              + "v1.3.7.3：修复下载中断、优化封面预览、适配 Android 7~17\n"
-             + "v1.3.7.2：修复实况图解析、优化访客凭据获取\n";
+             + "v1.3.7.2：修复实况图解析、优化访客凭据获取\n"
+            ;
     }
     static String changelogOld(){
         return
@@ -7041,39 +7488,19 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
      */
     void showUifidWhyDialog(){
         String txt =
-            "【结论】\n"
-          + "App 内抓不到，不是没做好，是抖音的风控设计就不允许。\n"
-          + "普通用户只能从真实浏览器里手动取。\n\n"
-          + "【实测证据】\n"
-          + "· 打开 douyin.com 首页 / 作品页（未登录）\n"
-          + "　　Set-Cookie 只下发 __ac_nonce（挑战第一步）\n"
-          + "· 直接请求 detail 接口（未登录、无签名）\n"
-          + "　　HTTP 403，且 Set-Cookie 为空——服务端什么都不给\n"
-          + "· 直接 HTTP 请求抖音时，返回体里写着：\n"
-          + "　　「您正在尝试访问的网站存在安全风险」\n\n"
-          + "【为什么不是「必须登录」】\n"
-          + "登录不是硬性前提。真正卡住的是接口级签名：\n"
-          + "detail 接口每次请求都要带一个由页面 JS 现场算出来的 a_bogus 参数，\n"
-          + "它依赖设备指纹（canvas / WebGL / 字体 / 时区）、\n"
-          + "鼠标轨迹等行为数据。App 里没有这些，算不出来。\n\n"
-          + "【那 UIFID_TEMP 什么时候才会给】\n"
-          + "它由抖音在「真实浏览器 + 完整挑战通过」的场景下通过 Set-Cookie 下发。\n"
-          + "我们试过三种方式：加载首页、加载作品页、在页面里用 XHR 打 detail 接口，\n"
-          + "三种都只拿到 ttwid / __ac_signature，没有 UIFID_TEMP。\n\n"
-          + "【能用的办法】\n"
-          + "1. 电脑 Chrome：打开 www.douyin.com，F12 → Application → Cookies\n"
-          + "　 → 找到 UIFID_TEMP，复制值（约 160 字符）\n"
-          + "2. 手机 Chrome：打开 www.douyin.com，用 Cookie 查看类插件导出\n"
-          + "3. 复制后回到本页，粘贴到输入框保存\n\n"
-          + "【有效期】\n"
-          + "不固定，取决于抖音策略，通常能用较长时间。\n"
-          + "失效时解析会报 403 Uifid Not Found，重新抓一次即可。\n\n"
+            "【现在还需要手动抓吗】\n"
+          + "默认不需要。首次解析实况照片时，App 会在后台自动获取访客凭据"
+          + "（约 2~4 秒），拿到后自动保存，之后直接用。\n\n"
+          + "【什么时候手动】\n"
+          + "自动获取失败、或凭据失效（解析报 403 Uifid Not Found）时，"
+          + "可以用本页的「从浏览器抓取」重试，或从电脑浏览器手动复制粘贴。\n\n"
           + "【不填会怎样】\n"
           + "照常能用：视频、图集、BGM 都正常。\n"
           + "只有「实况照片」的动轨拿不到，会退化成静态图。\n\n"
-          + "【用服务器时】\n"
-          + "服务器内置凭据池会代你签名，这种情况下可以不填。";
-        showLongTextDialog("为什么 App 内抓不到", txt, null, null);
+          + "【凭据是什么】\n"
+          + "UIFID_TEMP 是抖音给访客发的临时身份标识，"
+          + "实况照片的动图轨接口要求它。只存在本机，不上传。";
+        showLongTextDialog("访客凭据说明", txt, null, null);
     }
 
     /** 服务器地址弹窗：只含服务器地址（其他设置项都在设置页独立入口） */
@@ -7258,6 +7685,17 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 
 
     class Bridge {
+        @JavascriptInterface
+        public void onSphTap(final String n){
+            Log.i("DYP", "SPH_TAP done=" + n);
+        }
+        @JavascriptInterface
+        public void onSphProbe(final String json){
+            Log.i("DYP", "SPH_PROBE " + (json == null ? "null" : json.substring(0, Math.min(600, json.length()))));
+            h.post(new Runnable(){ public void run(){
+                try{ sphRender(json); }catch(Throwable t){ Log.i("DYP", "SPH_RENDER_ERR " + t); }
+            }});
+        }
         @JavascriptInterface
         public void onYtData(final String data){
             h.post(new Runnable(){ public void run(){
@@ -8689,6 +9127,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     return;
                 }
                 if(isImg){
+                    Log.i("DYP", "RENDER_IMG_BRANCH curImgsLen=" + curImgs.length()
+                        + " imgUrlsBefore=" + imgUrls.size());
                     actions.setVisibility(View.VISIBLE);
                     video.setVisibility(View.GONE);
                     img.setVisibility(View.VISIBLE);
@@ -8697,10 +9137,14 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
                     miniProxyKey = null;
                     parseImgs(); imgIdx=0; imgZoomed=false;
+                    Log.i("DYP", "RENDER_IMG_PARSED imgUrls=" + imgUrls.size()
+                        + " curShowImg=" + (curShowImg == null ? "" : curShowImg.substring(0, Math.min(60, curShowImg.length()))));
                     if(imgUrls.size()>0){ curShowImg=imgUrls.get(0); loadImage(curShowImg, img); applyLiveBadge(0); }
                     Toast.makeText(MainActivity.this, imgTipText(), Toast.LENGTH_SHORT).show();
                     maybeAutoAction();   // 图集渲染完成后再判断（此时 imgUrls 已是本条数据）
                 } else {
+                    Log.i("DYP", "RENDER_VIDEO_BRANCH curPlayLen=" + (curPlay == null ? -1 : curPlay.length())
+                        + " coverLen=" + (curCover == null ? -1 : curCover.length()));
                     actions.setVisibility(View.VISIBLE);
                     // 切到视频时清掉图集状态
                     imgUrls.clear(); dynUrls.clear(); curImgs=""; imgZoomed=false;
@@ -9538,6 +9982,12 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
          // ===== 平台前置校验 =====
          // 用户贴了不支持的网址（例如 GitHub 仓库）时，别丢进解析链路，
          // 否则会拿到 HTML 再当 JSON 解析，报 "Unexpected token 'B', Blocked by..." 这种莫名其妙的错。
+         // 微信视频号：走 WebView（页面数据接口需要 JS 运行时）
+         if(isSphUrl(url)){
+             Log.i("DYP", "SPH_PARSE " + url);
+             startSphParse(url);
+             return;
+         }
          if(!isSupportedParseUrl(url)){
              Log.i("DYP", "PARSE_UNSUPPORTED " + url);
              showUnsupportedUrlDialog(url);
@@ -9785,6 +10235,707 @@ webDone=false;
         }
         s((isSeason ? "B站合集 " : "B站分P ") + n + (isSeason ? " 集" : " 个") + "已列到「列表」页");
     }
+    // ================= 微信视频号 =================
+    /** 视频号解析中：防止重复触发 */
+    boolean sphParsing = false;
+
+    /** 视频号解析入口：WebView 加载 finder-preview 页面 */
+    void startSphParse(final String url){
+        if(sphParsing){ s("正在解析视频号..."); return; }
+        sphParsing = true;
+        sphCoverUrl = "";
+        s("解析视频号...");
+        curUrl = url;
+        o("");
+        webDone = false;
+        // 本地 POST 直连 get_feed_info（借鉴 ucmao/media-parser），不用 WebView
+        new Thread(new Runnable(){ public void run(){
+            try{
+                // 提取 shortUri：sph/xxx 或 ?id=xxx
+                String su = "";
+                java.util.regex.Matcher mm = java.util.regex.Pattern
+                    .compile("(?:^|/)sph/([A-Za-z0-9]+)").matcher(url);
+                if(mm.find()) su = mm.group(1);
+                if(su.length() == 0){
+                    java.util.regex.Matcher m2 = java.util.regex.Pattern
+                        .compile("[?&]id=([A-Za-z0-9]+)").matcher(url);
+                    if(m2.find()) su = m2.group(1);
+                }
+                if(su.length() == 0){
+                    h.post(new Runnable(){ public void run(){
+                        sphParsing = false;
+                        s("无法识别视频号链接");
+                    }});
+                    return;
+                }
+                Log.i("DYP", "SPH_DIRECT shortUri=" + su);
+                // ===== 元宝通道（借鉴 ucmao/media-parser _parse_with_yuanbao）=====
+                // 有 Cookie 时：元宝 get_parse_result 换 token+eid → get_feed_info 带 token 拿 videoUrl
+                String ckYb = ybCookie();
+                if(ckYb.length() > 0 && ckYb.contains("hy_user")){
+                    try{
+                        java.net.URL ybUrl = new java.net.URL("https://yuanbao.tencent.com/api/weixin/get_parse_result");
+                        java.net.HttpURLConnection yc = (java.net.HttpURLConnection) ybUrl.openConnection();
+                        yc.setRequestMethod("POST");
+                        yc.setConnectTimeout(8000);
+                        yc.setReadTimeout(15000);
+                        yc.setDoOutput(true);
+                        yc.setRequestProperty("Content-Type", "application/json");
+                        yc.setRequestProperty("Accept", "application/json, text/plain, */*");
+                        yc.setRequestProperty("Origin", "https://yuanbao.tencent.com");
+                        yc.setRequestProperty("Referer", "https://yuanbao.tencent.com/chat");
+                        yc.setRequestProperty("x-source", "web");
+                        yc.setRequestProperty("Cookie", ckYb);
+                        yc.setRequestProperty("User-Agent",
+                            "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                        String ybBody = "{\"type\":\"video_channel_url\",\"url\":\"" + url + "\",\"scene\":1}";
+                        java.io.OutputStream yos = yc.getOutputStream();
+                        yos.write(ybBody.getBytes("UTF-8"));
+                        yos.close();
+                        int ybCode = yc.getResponseCode();
+                        Log.i("DYP", "SPH_YB_CODE " + ybCode);
+                        if(ybCode == 200 || ybCode == 201){
+                            StringBuilder ysb = new StringBuilder();
+                            java.io.BufferedReader ybr = new java.io.BufferedReader(
+                                new java.io.InputStreamReader(yc.getInputStream(), "UTF-8"));
+                            String yl;
+                            while((yl = ybr.readLine()) != null) ysb.append(yl);
+                            ybr.close();
+                            String ybJson = ysb.toString();
+                            Map ybM = (Map)new JP(ybJson).parse();
+                            Map ybData = (Map)get(ybM, "data");
+                            String playable = ybData != null ? gs(get(ybData, "playable_url")) : "";
+                            Log.i("DYP", "SPH_YB_PLAYABLE_FULL " + playable);
+                            Log.i("DYP", "SPH_YB_PLAYABLE len=" + playable.length());
+                            if(playable.length() > 0){
+                                // playable_url 里提取 token 与 eid
+                                String tok = "", eid = "";
+                                java.util.regex.Matcher tm = java.util.regex.Pattern
+                                    .compile("token=([^&]+)").matcher(playable);
+                                if(tm.find()) tok = tm.group(1);
+                                java.util.regex.Matcher em = java.util.regex.Pattern
+                                    .compile("eid=([^&]+)").matcher(playable);
+                                if(em.find()){
+                                    eid = em.group(1);
+                                    try{ eid = java.net.URLDecoder.decode(eid, "UTF-8"); }catch(Throwable t){}
+                                    Log.i("DYP", "SPH_EID_DEC " + eid);
+                                }
+                                if(tok.length() > 0 && eid.length() > 0){
+                                    // 用元宝 token 打 get_feed_info（POST + exportId）
+                                    // 从 playable_url 里取 appid / entry_scene，跟它保持一致
+                                    String ybAppid = "0", ybEntryScene = "0", ybEntryCard = "48";
+                                    try{
+                                        java.util.regex.Matcher am = java.util.regex.Pattern
+                                            .compile("appid=(\\d+)").matcher(playable);
+                                        if(am.find()) ybAppid = am.group(1);
+                                        java.util.regex.Matcher esm = java.util.regex.Pattern
+                                            .compile("entry_scene=(\\d+)").matcher(playable);
+                                        if(esm.find()) ybEntryScene = esm.group(1);
+                                        java.util.regex.Matcher ecm = java.util.regex.Pattern
+                                            .compile("entry_card_type=(\\d+)").matcher(playable);
+                                        if(ecm.find()) ybEntryCard = ecm.group(1);
+                                    }catch(Throwable t){}
+                                    Log.i("DYP", "SPH_YB_SCENE appid=" + ybAppid
+                                        + " entryScene=" + ybEntryScene + " card=" + ybEntryCard);
+                                    final String feedJson = sphFeedInfoWithToken(su, tok, eid,
+                                        ybAppid, ybEntryScene, ybEntryCard);
+                                    if(feedJson != null && feedJson.length() > 0){
+                                        Log.i("DYP", "SPH_YB_FEED len=" + feedJson.length());
+                                        // 先试着渲染；失败（如「此内容暂时无法播放」）就继续走匿名回退
+                                        boolean[] ybOk = new boolean[]{ false };
+                                        final java.util.concurrent.CountDownLatch latch =
+                                            new java.util.concurrent.CountDownLatch(1);
+                                        h.post(new Runnable(){ public void run(){
+                                            try{ ybOk[0] = sphRenderJson(feedJson); }
+                                            catch(Throwable t){ Log.i("DYP", "SPH_JSON_ERR " + t); }
+                                            latch.countDown();
+                                        }});
+                                        try{ latch.await(3, java.util.concurrent.TimeUnit.SECONDS); }catch(Throwable t){}
+                                        if(ybOk[0]){
+                                            Log.i("DYP", "SPH_YB_RENDERED ok");
+                                            sphParsing = false;
+                                            return;
+                                        }
+                                        Log.i("DYP", "SPH_YB_RENDER_FAIL → 匿名回退");
+                                    }
+                                } else {
+                                    Log.i("DYP", "SPH_YB_NO_TOKEN");
+                                }
+                            }
+                        }
+                        Log.i("DYP", "SPH_YB_FALLBACK 匿名回退");
+                    }catch(Throwable yt){
+                        Log.i("DYP", "SPH_YB_ERR " + yt + " → 匿名回退");
+                    }
+                }
+                // ===== 匿名模式（无 Cookie 或元宝失败）=====
+                String pageUrl = "https://channels.weixin.qq.com/finder-preview/pages/sph?id=" + su;
+                String rid = String.format("%08x", new java.security.SecureRandom().nextInt(0xFFFFFF + 1));
+                String apiUrl = "https://channels.weixin.qq.com/finder-preview/api/feed/get_feed_info"
+                    + "?_rid=" + rid
+                    + "&_pageUrl=" + java.net.URLEncoder.encode(pageUrl, "UTF-8");
+                String body = "{\"baseReq\":{\"generalToken\":\"\"},\"shortUri\":\"" + su + "\"}";
+                java.net.HttpURLConnection uc = (java.net.HttpURLConnection) new java.net.URL(apiUrl).openConnection();
+                uc.setRequestMethod("POST");
+                uc.setConnectTimeout(8000);
+                uc.setReadTimeout(12000);
+                uc.setDoOutput(true);
+                uc.setRequestProperty("Content-Type", "application/json");
+                uc.setRequestProperty("Accept", "application/json, text/plain, */*");
+                uc.setRequestProperty("Origin", "https://channels.weixin.qq.com");
+                uc.setRequestProperty("Referer", pageUrl);
+                uc.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                java.io.OutputStream os = uc.getOutputStream();
+                os.write(body.getBytes("UTF-8"));
+                os.close();
+                int code = uc.getResponseCode();
+                Log.i("DYP", "SPH_DIRECT_CODE " + code);
+                // 微信这个接口正常响应就是 201 Created + JSON body
+                if(code < 200 || code >= 300){
+                    h.post(new Runnable(){ public void run(){
+                        sphParsing = false;
+                        s("视频号接口 " + code);
+                    }});
+                    return;
+                }
+                StringBuilder sb = new StringBuilder();
+                java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(uc.getInputStream(), "UTF-8"));
+                String line;
+                while((line = br.readLine()) != null) sb.append(line);
+                br.close();
+                final String json = sb.toString();
+                Log.i("DYP", "SPH_DIRECT_BODY len=" + json.length());
+                h.post(new Runnable(){ public void run(){
+                    try{ sphRenderJson(json); }catch(Throwable t){ Log.i("DYP", "SPH_JSON_ERR " + t); }
+                    sphParsing = false;
+                }});
+            }catch(final Throwable t){
+                Log.i("DYP", "SPH_DIRECT_ERR " + t);
+                h.post(new Runnable(){ public void run(){
+                    sphParsing = false;
+                    s("视频号解析失败 " + t);
+                }});
+            }
+        }}).start();
+    }
+
+    /** 用 WebView 给的请求头自己拉一次，返回 body 字符串 */
+    static String sphFetchWithHeaders(String url, java.util.Map<String,String> hdrs){
+        java.net.HttpURLConnection uc = null;
+        try{
+            uc = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            uc.setRequestMethod("GET");
+            uc.setInstanceFollowRedirects(true);
+            uc.setConnectTimeout(8000);
+            uc.setReadTimeout(12000);
+            if(hdrs != null){
+                for(java.util.Map.Entry<String,String> e : hdrs.entrySet()){
+                    String k = e.getKey();
+                    if(k == null) continue;
+                    if(k.equalsIgnoreCase("Host") || k.equalsIgnoreCase("Content-Length")
+                        || k.equalsIgnoreCase("Connection") || k.equalsIgnoreCase("Accept-Encoding")) continue;
+                    try{ uc.setRequestProperty(k, e.getValue()); }catch(Throwable t){}
+                }
+            }
+            uc.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+            int code = uc.getResponseCode();
+            Log.i("DYP", "SPH_FEED_CODE " + code);
+            if(code != 200) return null;
+            StringBuilder sb = new StringBuilder();
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(uc.getInputStream(), "UTF-8"));
+            String line;
+            while((line = br.readLine()) != null) sb.append(line);
+            br.close();
+            return sb.toString();
+        }catch(Throwable t){
+            Log.i("DYP", "SPH_FEED_ERR " + t);
+            return null;
+        }finally{
+            try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
+        }
+    }
+
+    /** 视频号解析结果渲染：bodyText 拆字段 + 封面直链 + 提示 */
+    void sphRender(String json){
+        try{
+            Map m = (Map)new JP(json).parse();
+            String bodyText = gs(get(m, "bodyText"));
+            String title = gs(get(m, "title"));
+            if(bodyText == null || bodyText.length() == 0){
+                Log.i("DYP", "SPH_RENDER empty body");
+                sphParsing = false;
+                s("视频号页面未返回内容，请稍后重试");
+                return;
+            }
+            // bodyText 形如：视频号\n驻马店市\n2026最新惊悚美剧...\n2026年10月18日\n夏风观影\n10万+\n5.9万\n5.2万\n1287\n可前往微信观看此内容
+            String[] lines = bodyText.split("\\n");
+            java.util.List<String> ls = new java.util.ArrayList<String>();
+            for(String ln : lines){
+                if(ln != null && ln.trim().length() > 0) ls.add(ln.trim());
+            }
+            String desc = "", author = "", date = "", loc = "", stats = "";
+            for(int i = 0; i < ls.size(); i++){
+                String ln = ls.get(i);
+                if(ln.equals("视频号") || ln.contains("可前往微信")) continue;
+                if(ln.matches("^\\d{4}年\\d{1,2}月\\d{1,2}日$")){ date = ln; continue; }
+                if(ln.equals("取消") || ln.equals("前往微信")) continue;
+                if(i == 1 && !ln.matches("^\\d+$")) { loc = ln; continue; }
+                if(ln.matches("^\\d+(\\.\\d+)?[万+]*$")){ stats += ln + " "; continue; }
+                if(author.length() == 0 && i > 1 && !ln.matches("^\\d+.*$") && desc.length() > 0 && date.length() > 0){ author = ln; continue; }
+                if(desc.length() == 0) desc = ln;
+            }
+            // 顺序兜底：date 后面第一个就是作者
+            if(author.length() == 0){
+                for(int i = 0; i < ls.size(); i++){
+                    if(ls.get(i).matches("^\\d{4}年\\d{1,2}月\\d{1,2}日$") && i + 1 < ls.size()){
+                        author = ls.get(i + 1);
+                        break;
+                    }
+                }
+            }
+            curId = "sph";
+            curDesc = desc;
+            // 统计数字：一般顺序 赞 转发 评论 收藏
+            String statLine = "";
+            if(stats.length() > 0) statLine = "赞 " + stats;
+            StringBuilder b = new StringBuilder();
+            b.append("【平台】微信视频号\n");
+            b.append("【描述】").append(desc).append("\n");
+            if(loc.length() > 0) b.append("【地点】").append(loc).append("\n");
+            b.append("【作者】").append(author).append("\n");
+            if(date.length() > 0) b.append("【发布时间】").append(date).append("\n");
+            if(stats.length() > 0){ String st = stats.trim().replaceAll("\\s+", " / "); b.append("【数据】").append(st).append("\n"); }
+            b.append("\n【封面直链】").append(sphCoverUrl == null ? "" : sphCoverUrl).append("\n");
+            b.append("\n【说明】微信未对第三方开放视频号视频流。\n");
+            b.append("视频号链接只能在微信内观看；本条封面图可长按复制直链下载。\n");
+            String r = b.toString();
+            Log.i("DYP", "SPH_RESULT\n" + r);
+            webDone = true;
+            o(r);
+            s("完成(视频号) · 详情见文本");
+            // 收 WebView
+            try{
+                web.loadUrl("about:blank");
+                pageParse.setVisibility(View.VISIBLE);
+                web.setVisibility(View.GONE);
+                web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+            }catch(Throwable t){}
+            sphParsing = false;
+        }catch(Throwable t){
+            Log.i("DYP", "SPH_RENDER_ERR2 " + t);
+            sphParsing = false;
+            s("视频号解析失败 " + t);
+        }
+    }
+
+    /** 用元宝换来的 token/eid 打 get_feed_info（借鉴 media-parser _feed_info） */
+    static String sphFeedInfoWithToken(String su, String token, String eid){
+        return sphFeedInfoWithToken(su, token, eid, "0", "0", "48");
+    }
+
+    static String sphFeedInfoWithToken(String su, String token, String eid,
+                                       String appid, String entryScene, String entryCardType){
+        java.net.HttpURLConnection uc = null;
+        try{
+            String feedPage = "https://channels.weixin.qq.com/finder-preview/pages/feed";
+            String referer = feedPage + "?entry_card_type=" + entryCardType
+                + "&comment_scene=39&appid=" + appid + "&token="
+                + java.net.URLEncoder.encode(token, "UTF-8")
+                + "&entry_scene=" + entryScene + "&eid=" + java.net.URLEncoder.encode(eid, "UTF-8");
+            String rid = String.format("%08x", new java.security.SecureRandom().nextInt(0xFFFFFF + 1));
+            String apiUrl = "https://channels.weixin.qq.com/finder-preview/api/feed/get_feed_info"
+                + "?_rid=" + rid
+                + "&_pageUrl=" + java.net.URLEncoder.encode(feedPage, "UTF-8");
+            String body = "{\"baseReq\":{\"generalToken\":\"" + token + "\"},\"exportId\":\"" + eid + "\"}";
+            uc = (java.net.HttpURLConnection) new java.net.URL(apiUrl).openConnection();
+            uc.setRequestMethod("POST");
+            uc.setConnectTimeout(8000);
+            uc.setReadTimeout(15000);
+            uc.setDoOutput(true);
+            uc.setRequestProperty("Content-Type", "application/json");
+            uc.setRequestProperty("Accept", "application/json, text/plain, */*");
+            uc.setRequestProperty("Origin", "https://channels.weixin.qq.com");
+            uc.setRequestProperty("Referer", referer);
+            uc.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+            java.io.OutputStream os = uc.getOutputStream();
+            os.write(body.getBytes("UTF-8"));
+            os.close();
+            int code = uc.getResponseCode();
+            Log.i("DYP", "SPH_TOKEN_FEED_CODE " + code);
+            if(code < 200 || code >= 300) return null;
+            StringBuilder sb = new StringBuilder();
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(uc.getInputStream(), "UTF-8"));
+            String line;
+            while((line = br.readLine()) != null) sb.append(line);
+            br.close();
+            String ret = sb.toString();
+            if(ret.length() < 500) Log.i("DYP", "SPH_TOKEN_FEED_BODY " + ret);
+            return ret;
+        }catch(Throwable t){
+            Log.i("DYP", "SPH_TOKEN_FEED_ERR " + t);
+            return null;
+        }finally{
+            try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
+        }
+    }
+
+    /** 视频号凭据菜单：登录元宝 / 粘贴 Cookie / 清空 */
+    void showYbMenu(){
+        String c = ybCookie();
+        String msg = "这是【可选】增强项，不配置也能正常解析视频号（元数据、作者、封面、图文）。\n\n"
+            + "【实测说明】微信视频号目前对纯 HTTP 请求一律返回「此内容暂时无法播放」，"
+            + "配置元宝 Cookie 后也拿不到视频流，这是平台限制，不是参数问题。"
+            + "能稳定拿到的只有元数据、封面与图文（图集）。\n\n"
+            + "【登录元宝】在应用内登录 yuanbao.tencent.com，登录成功后自动抓取 Cookie 并返回。\n"
+            + "【粘贴 Cookie】电脑浏览器登录元宝后，F12 → Application → Cookies 复制 hy_user 与 hy_token。\n\n"
+            + "Cookie 只保存在本机，不上传服务器。\n"
+            + (c.length() > 0 ? "当前：已配置" : "当前：未配置");
+        dypDlg().setTitle("视频号凭据（元宝）")
+            .setMessage(msg)
+            .setPositiveButton("登录元宝", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ startYbLogin(); }
+            })
+            .setNeutralButton("粘贴 Cookie", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ ybPasteDialog(); }
+            })
+            .setNegativeButton("关闭", null)
+            .create().show();
+    }
+
+    /** 粘贴元宝 Cookie */
+    void ybPasteDialog(){
+        final android.widget.EditText et = new android.widget.EditText(this);
+        et.setHint("hy_user=xxx; hy_token=xxx");
+        String cur = ybCookie();
+        if(cur.length() > 0) et.setText(cur);
+        et.setTextSize(13);
+        dypDlg().setTitle("粘贴元宝 Cookie")
+            .setMessage("格式：hy_user=xxx; hy_token=xxx")
+            .setView(et)
+            .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    String v = et.getText().toString().trim();
+                    if(v.length() == 0 || !v.contains("hy_user") || !v.contains("hy_token")){
+                        showHintToast("需包含 hy_user 与 hy_token");
+                        return;
+                    }
+                    ybCookieSave(v);
+                    showHintToast("已保存");
+                    buildSettingsPage();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 清空元宝 Cookie */
+    void ybClear(){
+        ybCookieSave("");
+        showHintToast("已清空");
+        buildSettingsPage();
+    }
+
+    /** WebView 登录腾讯元宝：抓到 hy_user + hy_token 自动退出 */
+    void startYbLogin(){
+        switchTab(0);
+        ybLoginMode = true;
+        try{
+            setupWebView();
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        try{
+            web.getSettings().setUserAgentString(
+                "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+        }catch(Throwable t){}
+        web.loadUrl("https://yuanbao.tencent.com/");
+        s("请登录元宝，登录后点下方「我已登录完成」");
+        ybLoginBarShow();
+    }
+
+    /** 元宝登录页的悬浮操作条：我已登录完成 / 取消 */
+    void ybLoginBarShow(){
+        try{
+            android.view.ViewGroup vg = (android.view.ViewGroup) web.getParent();
+            if(vg == null) return;
+            // 已有就不重复加
+            for(int i = 0; i < vg.getChildCount(); i++){
+                android.view.View c = vg.getChildAt(i);
+                if(c instanceof LinearLayout && c.getTag() != null && "ybbar".equals(c.getTag())) return;
+            }
+            LinearLayout bar = new LinearLayout(this);
+            bar.setTag("ybbar");
+            bar.setOrientation(LinearLayout.HORIZONTAL);
+            bar.setGravity(android.view.Gravity.CENTER);
+            bar.setBackgroundColor(curDark ? 0xE6222230 : 0xE6F4F5F7);
+            bar.setPadding(dp(12), dp(10), dp(12), dp(10));
+            TextView lbl = new TextView(this);
+            lbl.setText("登录元宝后点这里 →");
+            lbl.setTextSize(13);
+            lbl.setTextColor(curDark ? 0xFFF2F3F5 : 0xFF1A1A1F);
+            lbl.setPadding(0, 0, dp(10), 0);
+            bar.addView(lbl);
+            TextView btnDone = new TextView(this);
+            btnDone.setText("我已登录完成");
+            btnDone.setTextSize(13);
+            btnDone.setTextColor(0xFFFFFFFF);
+            btnDone.setPadding(dp(14), dp(8), dp(14), dp(8));
+            btnDone.setBackgroundResource(R.drawable.pl_btn);
+            btnDone.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    boolean ok = ybFinishIfLoggedIn();
+                    if(!ok){
+                        showHintToast("还没抓到 hy_user/hy_token，请先在页面上完成登录");
+                    }
+                }
+            });
+            bar.addView(btnDone);
+            TextView btnCancel = new TextView(this);
+            btnCancel.setText("取消");
+            btnCancel.setTextSize(13);
+            btnCancel.setTextColor(curDark ? 0xFF9AA4B2 : 0xFF5A6572);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.leftMargin = dp(10);
+            btnCancel.setLayoutParams(lp);
+            btnCancel.setPadding(dp(10), dp(8), dp(10), dp(8));
+            btnCancel.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    ybLoginBarHide();
+                    ybLoginMode = false;
+                    try{
+                        pageParse.setVisibility(View.VISIBLE);
+                        web.setVisibility(View.GONE);
+                        web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+                    }catch(Throwable t){}
+                }
+            });
+            bar.addView(btnCancel);
+            android.widget.FrameLayout.LayoutParams flp = new android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                android.view.Gravity.BOTTOM);
+            vg.addView(bar, flp);
+        }catch(Throwable t){ Log.i("DYP", "YB_BAR_ERR " + t); }
+    }
+    void ybLoginBarHide(){
+        try{
+            android.view.ViewGroup vg = (android.view.ViewGroup) web.getParent();
+            if(vg == null) return;
+            for(int i = vg.getChildCount() - 1; i >= 0; i--){
+                android.view.View c = vg.getChildAt(i);
+                if(c instanceof LinearLayout && c.getTag() != null && "ybbar".equals(c.getTag())){
+                    vg.removeView(c);
+                }
+            }
+        }catch(Throwable t){}
+    }
+    void ybLoginBarRefresh(){ }
+
+    /** 元宝登录完成后：从 CookieManager 抓 hy_user/hy_token，存上并收 WebView */
+    boolean ybFinishIfLoggedIn(){
+        try{
+            String ck = android.webkit.CookieManager.getInstance().getCookie("https://yuanbao.tencent.com/");
+            if(ck == null) return false;
+            if(!ck.contains("hy_user") || !ck.contains("hy_token")) return false;
+            String hu = "", ht = "";
+            java.util.regex.Matcher m1 = java.util.regex.Pattern
+                .compile("hy_user=([^;]+)").matcher(ck);
+            if(m1.find()) hu = m1.group(1);
+            java.util.regex.Matcher m2 = java.util.regex.Pattern
+                .compile("hy_token=([^;]+)").matcher(ck);
+            if(m2.find()) ht = m2.group(1);
+            if(hu.length() == 0 || ht.length() == 0) return false;
+            ybCookieSave("hy_user=" + hu + "; hy_token=" + ht);
+            ybLoginMode = false;
+            Log.i("DYP", "YB_LOGIN_OK hy_user=" + hu.length() + " hy_token=" + ht.length());
+            s("元宝登录成功，已保存凭据");
+            // 与抖音/YouTube 登录一致的收尾：退出登录页、回解析页
+            try{
+                web.loadUrl("about:blank");
+                pageParse.setVisibility(View.VISIBLE);
+                web.setVisibility(View.GONE);
+                web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+            }catch(Throwable t2){}
+            buildSettingsPage();
+            return true;
+        }catch(Throwable t){
+            Log.i("DYP", "YB_LOGIN_ERR " + t);
+            return false;
+        }
+    }
+
+    /** 解析 get_feed_info JSON 并渲染（匿名模式拿元数据，元宝模式有视频流） */
+    boolean sphRenderJson(String json){
+        try{
+            Map root = (Map)new JP(json).parse();
+            Object ecO = get(root, "errCode");
+            long ec = parseLong(ecO, -1);
+            if(ec != 0 && ecO != null){
+                s("视频号接口返回 " + gs(get(root, "errMsg")));
+                Log.i("DYP", "SPH_JSON errCode=" + ec);
+                return false;
+            }
+            Map data = (Map)get(root, "data");
+            if(data == null){ s("视频号接口无数据"); return false; }
+            Map ai = (Map)get(data, "authorInfo");
+            Map fi = (Map)get(data, "feedInfo");
+            if(fi == null){ s("视频号接口无 feedInfo"); return false; }
+            String author = ai != null ? gs(get(ai, "nickname")) : "";
+            String avatar = ai != null ? gs(get(ai, "headImgUrl")) : "";
+            String desc = gs(get(fi, "description"));
+            String cover = gs(get(fi, "coverUrl"));
+            String loc = "";
+            Map ji = (Map)get(fi, "jumpInfo");
+            if(ji != null) loc = gs(get(ji, "wording"));
+            String likeS = gs(get(fi, "likeCountFmt"));
+            String fwdS = gs(get(fi, "forwardCountFmt"));
+            String cmtS = gs(get(fi, "commentCountFmt"));
+            String favS = gs(get(fi, "favCountFmt"));
+            long ctime = parseLong(get(fi, "createtime"), 0);
+            // 视频直链（元宝模式才有）
+            String videoUrl = gs(get(fi, "videoUrl"));
+            if(videoUrl.length() == 0){
+                Map h264 = (Map)get(fi, "h264VideoInfo");
+                if(h264 != null) videoUrl = gs(get(h264, "videoUrl"));
+            }
+            if(videoUrl.length() == 0){
+                Map h265 = (Map)get(fi, "h265VideoInfo");
+                if(h265 != null) videoUrl = gs(get(h265, "videoUrl"));
+            }
+            // 图集（mediaType=2）
+            java.util.List<String> imgs = new java.util.ArrayList<String>();
+            Object picO = get(fi, "picInfo");
+            if(picO instanceof java.util.List){
+                for(Object po : (java.util.List)picO){
+                    if(po instanceof Map){
+                        String pu = gs(get((Map)po, "url"));
+                        if(pu.length() > 0) imgs.add(pu);
+                    }
+                }
+            }
+            // BGM
+            String bgm = "";
+            Map bg = (Map)get(fi, "bgmInfo");
+            if(bg != null) bgm = gs(get(bg, "bgmUrl"));
+            Log.i("DYP", "SPH_JSON_OK author=" + author + " vlen=" + videoUrl.length()
+                + " imgs=" + imgs.size() + " bgm=" + (bgm.length() > 0 ? "1" : "0")
+                + " desc=" + desc.substring(0, Math.min(30, desc.length())));
+            // ===== 渲染 =====
+            curId = "sph";
+            curDesc = desc;
+            curCover = cover;
+            curPlay = videoUrl;      // 元宝模式下是视频直链；匿名为空
+            curImgs = "";
+            for(int i2 = 0; i2 < imgs.size(); i2++){
+                if(i2 > 0) curImgs += "|";
+                curImgs += imgs.get(i2);
+            }
+            curMusic = "";
+            curBgm = bgm;
+            StringBuilder b = new StringBuilder();
+            b.append("【平台】微信视频号\n");
+            b.append("【描述】").append(desc).append("\n");
+            if(loc.length() > 0) b.append("【地点】").append(loc).append("\n");
+            b.append("【作者】").append(author).append("\n");
+            if(ctime > 0) b.append("【发布时间】").append(fmtTime(String.valueOf(ctime))).append("\n");
+            if(likeS.length() > 0){
+                b.append("【数据】赞 ").append(likeS)
+                 .append(" 转发 ").append(fwdS)
+                 .append(" 评论 ").append(cmtS)
+                 .append(" 收藏 ").append(favS).append("\n");
+            }
+            if(avatar.length() > 0) b.append("【头像】").append(avatar).append("\n");
+            if(cover.length() > 0) b.append("【封面】").append(cover).append("\n");
+            if(videoUrl.length() > 0){
+                b.append("【视频直链】").append(videoUrl).append("\n");
+            } else if(imgs.size() > 0){
+                b.append("\n【图集】共 ").append(imgs.size()).append(" 张：\n");
+                for(int i2 = 0; i2 < imgs.size(); i2++) b.append(imgs.get(i2)).append("\n");
+            } else {
+                b.append("\n【说明】视频流需登录态。设置 → 视频号凭据 可配置腾讯元宝 Cookie 后解析视频。\n");
+            }
+            if(bgm.length() > 0) b.append("【背景音乐】").append(bgm).append("\n");
+            String r = b.toString();
+            Log.i("DYP", "SPH_RESULT2\n" + r);
+            webDone = true;
+            o(r);
+            s("完成(视频号)");
+            final String videoUrlF = videoUrl;
+            if(videoUrl.length() > 0 || imgs.size() > 0){
+                h.post(new Runnable(){ public void run(){
+                    actions.setVisibility(View.VISIBLE);
+                    if(videoUrlF.length() > 0){
+                        videoBox.setVisibility(View.VISIBLE);
+                    } else {
+                        parseImgs();
+                        img.setVisibility(View.VISIBLE);
+                    }
+                }});
+            }
+        }catch(Throwable t){
+            Log.i("DYP", "SPH_RENDER_JSON_ERR " + t);
+            s("视频号结果解析失败 " + t);
+            return false;
+
+        }
+        return true;
+    }
+
+    /** 视频号封面直链（shouldInterceptRequest 里截到的 finder.video.qq.com jpg） */
+    String sphCoverUrl = "";
+
+    /** 处理 get_feed_info 返回的 JSON */
+    void sphHandleFeed(String body){
+        try{
+            Map m = (Map)new JP(body).parse();
+            Log.i("DYP", "SPH_FEED_KEYS " + (m == null ? "null" : m.keySet().toString()));
+        }catch(Throwable t){
+            Log.i("DYP", "SPH_FEED_PARSE_ERR " + t);
+        }
+    }
+
+    /** 探测：看页面里有什么数据可用 */
+    void sphProbe(){
+        // 先自动触发播放：页面只请求封面，真视频要点播放才拉
+        try{
+            String tapJs =
+                "(function(){var n=0;"
+                + "try{var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){try{vs[i].play();n++;}catch(e){}}}catch(e){}"
+                + "try{var els=document.querySelectorAll('[class*=play],[class*=Play],[class*=cover],[class*=Cover]');"
+                + "for(var i=0;i<els.length&&i<5;i++){try{els[i].click();n++;}catch(e){}}}catch(e){}"
+                + "try{var body=document.body;if(body){var ev=document.createEvent('MouseEvents');ev.initEvent('click',true,true);body.dispatchEvent(ev);}}catch(e){}"
+                + "DyBridge.onSphTap(''+n);"
+                + "})()";
+            web.evaluateJavascript(tapJs, null);
+            Log.i("DYP", "SPH_TAP_SENT");
+        }catch(Throwable t){ Log.i("DYP", "SPH_TAP_ERR " + t); }
+        try{
+            String js =
+                "(function(){var out={};"
+                + "try{out.title=document.title;}catch(e){}"
+                + "try{out.globals=Object.keys(window).filter(function(k){return k.indexOf('__')>=0||k.indexOf('finder')>=0||k.indexOf('INITIAL')>=0||k.indexOf('STATE')>=0;}).join(',');}catch(e){}"
+                + "try{out.bodyLen=(document.body?document.body.innerHTML.length:0);}catch(e){}"
+                + "try{out.scripts='';var ss=document.querySelectorAll('script');for(var i=0;i<Math.min(ss.length,8);i++){var t=ss[i].textContent||'';out.scripts+=('['+i+']'+t.length+' ');}}catch(e){}"
+                + "try{out.videos=document.querySelectorAll('video').length;}catch(e){}"
+                + "try{var v=document.querySelector('video');if(v){out.vsrc=(v.src||'').substring(0,120);out.vcur=(v.currentSrc||'').substring(0,120);}}catch(e){}"
+                + "try{out.bodyText=(document.body?document.body.innerText.substring(0,300):'');}catch(e){}"
+                + "DyBridge.onSphProbe(JSON.stringify(out));"
+                + "})()";
+            web.evaluateJavascript(js, null);
+            Log.i("DYP", "SPH_PROBE_SENT");
+        }catch(Throwable t){ Log.i("DYP", "SPH_PROBE_ERR " + t); }
+    }
+
     void loadForParse(final String url){
         curUrl = url;
         // 新解析开始：复位各平台「已回退」标志，否则第二次解析不会触发回退
@@ -9794,7 +10945,161 @@ webDone=false;
         // 新解析开始时退出主页收集模式（防残留）
         if(profileMode && !isProfileUrl(url)) stopProfileMode();
         o("");
-        // B 站：本地直连 API（免服务器）；space 主页走 profile 路径
+        // 轻量平台（微视/AcFun/最右/皮皮虾/皮皮搞笑/好看/西瓜）：页面内嵌 JSON 本地逆向
+        if(MiscParser.isMiscUrl(url)){
+            s("解析中...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final MiscParser.Item it = MiscParser.resolve(url);
+                Log.i("DYP", "MISC_DONE plat=" + it.platform + " err=" + it.err
+                    + " ok=" + it.ok + " v=" + it.hasVideo() + " gears=" + it.gears.size());
+                h.post(new Runnable(){ public void run(){
+                    if(it.ok){
+                        webDone = true;
+                        String r = MiscParser.toText(it);
+                        String[] md = MiscParser.toMedia(it);
+                        Log.i("DYP", "MISC_RESULT_BEGIN\n" + r + "\nMISC_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(" + it.platform + ")");
+                    } else {
+                        s(it.platform + "解析失败：" + (it.err.length() > 0 ? it.err : "无内容"));
+                        showHintToast(it.platform + "解析失败，可能需要登录或链接已失效");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 今日头条：移动端 SSR RENDER_DATA + 字节 VOD（免 Cookie/免服务器）
+        if(ToutiaoParser.isToutiaoUrl(url)){
+            s("解析今日头条...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final ToutiaoParser.TtItem it = ToutiaoParser.resolve(url);
+                Log.i("DYP", "TT_DONE err=" + it.err + " ok=" + it.ok
+                    + " v=" + it.hasVideo() + " gears=" + it.gears.size()
+                    + " imgs=" + it.images.size());
+                h.post(new Runnable(){ public void run(){
+                    if(it.ok){
+                        webDone = true;
+                        String r = ToutiaoParser.toText(it);
+                        String[] md = ToutiaoParser.toMedia(it);
+                        Log.i("DYP", "TT_RESULT_BEGIN\n" + r + "\nTT_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(头条)" + (it.hasVideo() ? " 视频" : "")
+                            + (it.images.size() > 0 ? " " + it.images.size() + " 张图" : ""));
+                    } else {
+                        s("头条解析失败：" + (it.err.length() > 0 ? it.err : "无内容"));
+                        showHintToast("头条解析失败，请确认链接可打开");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 公众号：SSR 页面直接抽变量（免 Cookie/免服务器），借鉴 media-parser 的 wechat_mp 方案
+        if(WxMpParser.isWxMpUrl(url)){
+            s("解析公众号文章...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final WxMpParser.MpArticle a = WxMpParser.resolve(url);
+                Log.i("DYP", "WXMP_BEGIN err=" + a.err + " ok=" + a.ok
+                    + " imgs=" + a.images.size() + " vids=" + a.videos.size()
+                    + " audio=" + a.hasAudio() + " title=" + a.title);
+                h.post(new Runnable(){ public void run(){
+                    if(a.ok){
+                        webDone = true;
+                        String r = WxMpParser.toText(a);
+                        String[] md = WxMpParser.toMedia(a);
+                        Log.i("DYP", "WXMP_RESULT_BEGIN\n" + r + "\nWXMP_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(公众号)" + (a.hasVideo() ? " 视频" : "")
+                            + (a.images.size() > 0 ? " " + a.images.size() + " 张图" : "")
+                            + (a.hasAudio() ? " 嵌入音频" : ""));
+                    } else {
+                        s("公众号解析失败：" + (a.err.length() > 0 ? a.err : "无内容"));
+                        showHintToast("公众号解析失败，可能触发风控或文章已删");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 豆包：分享页 JSON + get_play_info（本地）
+        if(DoubaoParser.isDoubaoUrl(url)){
+            s("解析豆包...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final DoubaoParser.DbItem it = DoubaoParser.resolve(url);
+                Log.i("DYP", "DB_DONE err=" + it.err + " ok=" + it.ok
+                    + " v=" + it.hasVideo() + " imgs=" + it.images.size());
+                h.post(new Runnable(){ public void run(){
+                    if(it.ok){
+                        webDone = true;
+                        String r = DoubaoParser.toText(it);
+                        String[] md = DoubaoParser.toMedia(it);
+                        Log.i("DYP", "DB_RESULT_BEGIN\n" + r + "\nDB_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(豆包)" + (it.hasVideo() ? " 视频" : "")
+                            + (it.images.size() > 0 ? " " + it.images.size() + " 张图" : ""));
+                    } else {
+                        s("豆包解析失败：" + (it.err.length() > 0 ? it.err : "无内容"));
+                        showHintToast("豆包解析失败，可能需要登录或分享页已失效");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 小红书：__INITIAL_STATE__ 本地逆向（PC/移动双结构）
+        if(XhsParser.isXhsUrl(url)){
+            s("解析小红书...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final XhsParser.XhsNote n = XhsParser.resolve(url,
+                    CookieStore.xhsCookieString(MainActivity.this));
+                Log.i("DYP", "XHS_DONE err=" + n.err + " ok=" + n.ok
+                    + " v=" + n.hasVideo() + " imgs=" + n.images.size());
+                h.post(new Runnable(){ public void run(){
+                    if(n.ok){
+                        webDone = true;
+                        String r = XhsParser.toText(n);
+                        String[] md = XhsParser.toMedia(n);
+                        Log.i("DYP", "XHS_RESULT_BEGIN\n" + r + "\nXHS_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(小红书)" + (n.hasVideo() ? " 视频" : "")
+                            + (n.images.size() > 0 ? " " + n.images.size() + " 张图" : ""));
+                    } else {
+                        s("小红书解析失败：" + (n.err.length() > 0 ? n.err : "无内容"));
+                        showHintToast("小红书解析失败，可能需要 Cookie 或笔记已删");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 微博：本地直连（visitor 访客匿名），借鉴 media-parser 的 weibo 方案
+        if(WeiboParser.isWeiboUrl(url)){
+            s("解析微博...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final WeiboParser.WbVideo v = WeiboParser.resolve(url);
+                Log.i("DYP", "WB_RESULT err=" + v.err + " ok=" + v.ok
+                    + " v=" + v.hasVideo() + " imgs=" + v.images.size()
+                    + " live=" + v.livePhotos.size() + " gears=" + v.gears.size());
+                h.post(new Runnable(){ public void run(){
+                    if(v.ok){
+                        webDone = true;
+                        String r = WeiboParser.toText(v);
+                        String[] md = WeiboParser.toMedia(v);
+                        Log.i("DYP", "WB_RESULT_BEGIN\n" + r + "\nWB_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(微博)" + (v.hasVideo() ? " 视频" : "")
+                            + (v.hasImages() ? " " + v.images.size() + " 张图" : ""));
+                    } else {
+                        s("微博解析失败：" + (v.err.length() > 0 ? v.err : "无媒体"));
+                        showHintToast("微博解析失败，可能该博文无媒体内容");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+                // B 站：本地直连 API（免服务器）；space 主页走 profile 路径
         if(BiliParser.isBiliUrl(url) && extractBiliMid(url).length() == 0
                 && !url.toLowerCase().contains("space.bilibili.com")){
             s("解析 B 站...");
@@ -10892,6 +12197,60 @@ webDone=false;
         }
     }
     static String firstOf(String[] a){ for(String s:a){ if(s!=null && s.length()>0) return s; } return ""; }
+    /** 按域名选 Referer；返回空字符串表示不发 Referer。
+     *  实测：baidu 图床（f7.baidu.com / vd3.bdstatic.com）带 douyin Referer 会 403，
+     *  无 Referer 或 baidu 系 Referer 才 200；微博图床反而需要 weibo 系。*/
+    String refererFor(String url){
+        if(url == null) return "";
+        String u = url.toLowerCase();
+        // 字节系
+        if(u.contains("byteimg.com") || u.contains("toutiaoimg.com") || u.contains("toutiaovod.com")
+                || u.contains("bdstatic.com") || u.contains("baidu.com") || u.contains("haokan")){
+            return "https://haokan.baidu.com/";
+        }
+        // 微信系
+        if(u.contains("qpic.cn") || u.contains("mmbiz") || u.contains("weixin")
+                || u.contains("wx.qq.com") || u.contains("finder.video.qq.com")){
+            return "https://mp.weixin.qq.com/";
+        }
+        // 微博（sinaimg 有盗链，但 weibo 系 Referer 能过）
+        if(u.contains("sinaimg.cn") || u.contains("weibocdn.com") || u.contains("weibo.com")){
+            return "https://weibo.com/";
+        }
+        // 小红书
+        if(u.contains("xhscdn.com") || u.contains("xiaohongshu.com")){
+            return "https://www.xiaohongshu.com/";
+        }
+        // 快手
+        if(u.contains("kwaicdn.com") || u.contains("yximgs.com") || u.contains("kuaishou.com")
+                || u.contains("gifshow.com")){
+            return "https://www.kuaishou.com/";
+        }
+        // TikTok
+        if(u.contains("tiktok") || u.contains("tiktokcdn") || u.contains("ibytedtos")){
+            return "https://www.tiktok.com/";
+        }
+        // AcFun
+        if(u.contains("acfun.cn")) return "https://www.acfun.cn/";
+        // 豆包
+        if(u.contains("doubao.com")) return "https://www.doubao.com/";
+        // 腾讯视频 / 微视
+        if(u.contains("weishi.qq.com") || u.contains("video.qq.com")) return "https://weishi.qq.com/";
+        // X / 推特
+        if(u.contains("twimg.com") || u.contains("video.twimg.com")) return "https://x.com/";
+        // YouTube
+        if(u.contains("googlevideo.com") || u.contains("ytimg.com")) return "https://www.youtube.com/";
+        // Instagram
+        if(u.contains("cdninstagram.com") || u.contains("fbcdn.net")) return "https://www.instagram.com/";
+        // 抖音（放最后，避免误伤其他字节系域名）
+        if(u.contains("douyin.com") || u.contains("douyinpic.com") || u.contains("douyinvod.com")
+                || u.contains("iesdouyin.com") || u.contains("amemv.com") || u.contains("snssdk.com")){
+            return "https://www.douyin.com/";
+        }
+        // 其他一律不发 Referer（宁可空着，也不要带错的被 403）
+        return "";
+    }
+
     byte[] httpGetBytes(String url){
         return httpGetBytes(url, null);
     }
@@ -10913,11 +12272,9 @@ webDone=false;
                 c = openConnRetry(url);
                 c.setInstanceFollowRedirects(true);
                 c.setRequestProperty("User-Agent","Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
-                // Referer 按站点自适应：抖音/TikTok/快手 CDN 都校验来源
-                String ref = "https://www.douyin.com/";
-                if(url.indexOf("tiktok") >= 0 || url.indexOf("tiktokcdn") >= 0) ref = "https://www.tiktok.com/";
-                else if(KsParser.isKsUrl(url)) ref = "https://www.kuaishou.com/";
-                c.setRequestProperty("Referer", ref);
+                // Referer 按站点自适应：有些 CDN 反而是“不认识的 Referer 就 403”
+                String ref = refererFor(url);
+                if(ref.length() > 0) c.setRequestProperty("Referer", ref);
                 c.setConnectTimeout(15000); c.setReadTimeout(20000);
             }
             in=c.getInputStream();
