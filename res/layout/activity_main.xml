@@ -75,7 +75,7 @@
 
             <TextView
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:text="支持 抖音 · 快手 · TikTok · X · YouTube · B站 · Instagram"
+                android:text="支持 20 个平台：抖音·快手·TikTok·X·YouTube·B站·小红书·Instagram·微信视频号·公众号·微博·头条·西瓜·AcFun·好看·最右·皮皮虾·皮皮搞笑·微视·豆包"
                 android:textColor="@color/text_hint" android:textSize="11sp"
                 android:paddingLeft="4dp" android:paddingBottom="8dp"/>
 
