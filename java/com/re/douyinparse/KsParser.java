@@ -323,6 +323,15 @@ public class KsParser {
             // 兜底：某些版本 photo 里没有 manifest，用 caption 反查
             photo = findPhotoLoose(root);
         }
+        try{
+            StringBuilder kb = new StringBuilder();
+            for(Object k : photo.keySet()){
+                Object val = photo.get(k);
+                String vs = (val == null ? "null" : String.valueOf(val));
+                kb.append(k).append('=').append(vs.length() > 60 ? "LONG(" + vs.length() + ")" : vs).append(" | ");
+            }
+            Log.i(TAG, "KS_KEYS " + kb);
+        }catch(Throwable t){}
         if(photo == null){ return; }
 
         v.photoId   = s(photo.get("photoId"));
