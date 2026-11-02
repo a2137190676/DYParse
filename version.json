@@ -1,10 +1,10 @@
 {
-  "tag": "v2.0.0",
-  "name": "v2.0.0",
-  "body": "## v2.0.0 大版本：支持平台从 7 个扩到 20 个\n\n### 新增\n- 新增 13 个平台：小红书、微信视频号、微信公众号、微博、今日头条、西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包\n- 设置页新增「支持的平台」入口，可看完整清单与各平台能力说明\n- 小红书新增 Cookie 登录入口（App 内扫码登录 / 手动填写 / 清空）\n\n### 优化\n- 新平台全部走本地直连解析，免 Cookie、免服务器\n- 视频、图集解析完成后直接在页面上显示，不再只显示文字\n- 图片加载按站点自动匹配 Referer，解决部分图床图片加载失败\n- 设置页每项前加图标块，分类更一目了然\n\n### 修复\n- 设置里修改下载路径会闪退，无法保存目录\n- 小红书登录后 Cookie 不会自动抓取\n- 视频号登录元宝后反而解析不出来（现失败自动回退）\n\n### 说明\n- 微信视频号：可解析作者/描述/时间/统计/封面/图集，视频流受平台限制无法获取\n- 小红书：未登录会被风控拦截（error_code=300031），需在设置里登录一次\n\n### 更新覆盖\n- 所有已发布版本（1.1.0 ~ 1.3.7.6）均可收到本次更新\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.0.0/DYParse-v2.0.0.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.0.0/DYParse-v2.0.0.apk",
-  "released": "2026-11-01",
+  "tag": "v2.0.1",
+  "name": "v2.0.1",
+  "body": "## v2.0.1\n\n### 新增\n- 磁力 / BT 种子下载：支持 magnet 链接与 .torrent，全部本机完成\n- 磁力文件选择：按类型分类、可搜索、可单独勾选\n- 磁力边下边播 + 自动保留种子文件\n- 下载列表「继续」按钮：退出软件后未下完的任务可手动继续（断点续传）\n- 「清空已完成」按钮：只保留没下完的\n- 各平台独立下载目录（22 个平台可各自设路径）\n- 单文件分片多线程下载（可调 1~16 段）\n- 同时下载数可调（1~16 个）\n- 主题三态：自动 / 亮色 / 暗色\n- 列表缩略图 + 全平台封面补齐\n- 下载进度条：百分比 / 已下载量 / 速度 / 连接数\n- X（推特）主页解析\n- TikTok 主页解析\n\n### 优化\n- 磁力下载速度大幅提升（修复上传限速错误、补齐 tracker、重启续传自动重连）\n- 磁力进度条不再抖动\n- 下载任务持久化：中途退出不丢任务，失败的可继续\n\n### 修复\n- 磁力进度卡住不动 / 进度条乱跳\n- 磁力链接报「网页无法打开」\n- 重开软件恢复的不是原任务且下载失败\n- 批量下载时磁力条目被当普通视频下载\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.0.1/DYParse-v2.0.1.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.0.1/DYParse-v2.0.1.apk",
+  "released": "2026-11-02",
   "upgrade_notice": {
     "title": "发现新版本 2.0",
     "message": "v2.0.0 已发布：支持平台从 7 个扩大到 20 个，新增小红书、微信视频号、微博、今日头条等 13 个平台。建议更新到最新版。",
