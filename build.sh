@@ -255,8 +255,13 @@ dex     = os.path.join(build, 'dex', 'classes.dex')
 so_root = os.path.join(build, 'so')
 dst_apk = os.path.join(build, 'app-unsigned.apk')
 
-# 必须 STORED 的：native so、classes.dex、resources.arsc
+# 必须 STORED 的：classes.dex、resources.arsc
+# 例外：libtorrent4j 的 so 体积巨大（4 架构共 64MB 未压缩），
+#       压缩后约 23MB，能省 40MB。它不依赖 mmap 直接加载（manifest 未设
+#       extractNativeLibs=false），压缩后系统会解压到 nativeLibraryDir 再 dlopen，功能正常。
 def must_store(name):
+    if name.startswith('lib/') and name.endswith('libtorrent4j.so'):
+        return False
     return (name.startswith('lib/') and name.endswith('.so')) \
         or name == 'classes.dex' or name == 'resources.arsc'
 
@@ -300,10 +305,12 @@ zout.close()
 print('       entries: %d res + 1 dex + %d so -> %s (%d bytes)'
       % (written, so_count, dst_apk, os.path.getsize(dst_apk)))
 
-# 自检：确认 so 是 STORED
+# 自检：确认 so 是 STORED（libtorrent4j.so 例外，它压缩后能省 40MB）
 z = zipfile.ZipFile(dst_apk)
 bad = [i.filename for i in z.infolist()
-       if i.filename.endswith('.so') and i.compress_type != zipfile.ZIP_STORED]
+       if i.filename.endswith('.so')
+       and not i.filename.endswith('libtorrent4j.so')
+       and i.compress_type != zipfile.ZIP_STORED]
 z.close()
 if bad:
     print('[ERR] 以下 so 未按 STORED 写入：' + ', '.join(bad))
