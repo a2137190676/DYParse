@@ -101,6 +101,66 @@ public class BiliParser {
     }
 
     /** 抽 aid（av 号或 BV 号） */
+    /**
+     * 展开 b23.tv 短链 → 真实 www.bilibili.com/video/BVxxx 地址。
+     *
+     * 为什么必须做：extractAid 只认 av/BV，遇到 b23.tv/xxxxx 这种纯短链
+     * 直接返回空串，批量解析就报「链接里没找到 av 号 / BV 号」。
+     *
+     * 做法：跟随一次 301/302 拿 Location。B 站短链固定跳一次就到位。
+     * 失败返回原 URL（让上层用原逻辑兜底）。
+     */
+    static String expandShort(String url){
+        if(url == null) return "";
+        String u = url.trim();
+        boolean isShort = u.contains("b23.tv") || u.contains("bili2233.cn");
+        if(!isShort) return u;
+        try{
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                    new java.net.URL(u).openConnection();
+            c.setInstanceFollowRedirects(false);     // 自己读 Location，才能拿到真实地址
+            c.setRequestProperty("User-Agent", UA);
+            c.setRequestProperty("Referer", REF);
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(10000);
+            int code = c.getResponseCode();
+            String loc = c.getHeaderField("Location");
+            try{ c.disconnect(); }catch(Throwable t){}
+            Log.i(TAG, "BILI_SHORT code=" + code + " loc="
+                    + (loc == null ? "null" : loc.substring(0, Math.min(90, loc.length()))));
+            if(loc != null && loc.length() > 0 && extractAid(loc).length() > 0){
+                return loc;
+            }
+            // 有的跳转给的是相对地址或需要再跟一次
+            if(loc != null && loc.length() > 0){
+                if(loc.startsWith("/")) loc = "https://www.bilibili.com" + loc;
+                if(extractAid(loc).length() == 0){
+                    try{
+                        java.net.HttpURLConnection c2 = (java.net.HttpURLConnection)
+                                new java.net.URL(loc).openConnection();
+                        c2.setInstanceFollowRedirects(false);
+                        c2.setRequestProperty("User-Agent", UA);
+                        c2.setConnectTimeout(10000);
+                        c2.setReadTimeout(10000);
+                        c2.getResponseCode();
+                        String loc2 = c2.getHeaderField("Location");
+                        try{ c2.disconnect(); }catch(Throwable t){}
+                        if(loc2 != null && loc2.length() > 0){
+                            if(loc2.startsWith("/")) loc2 = "https://www.bilibili.com" + loc2;
+                            Log.i(TAG, "BILI_SHORT2 loc="
+                                    + loc2.substring(0, Math.min(90, loc2.length())));
+                            return loc2;
+                        }
+                    }catch(Throwable t2){ Log.i(TAG, "BILI_SHORT2_ERR " + t2); }
+                }
+                return loc;
+            }
+        }catch(Throwable t){
+            Log.i(TAG, "BILI_SHORT_ERR " + t);
+        }
+        return u;
+    }
+
     public static String extractAid(String url){
         if(url == null) return "";
         Matcher m = Pattern.compile("av(\\d{6,20})", Pattern.CASE_INSENSITIVE).matcher(url);
@@ -119,7 +179,7 @@ public class BiliParser {
     public static void attach(Context c){ appCtx = c; }
 
     static String httpGet(String url) throws Exception{
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection(java.net.Proxy.NO_PROXY);
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestProperty("User-Agent", UA);
         c.setRequestProperty("Referer", REF);
         String ck = biliCookie();
@@ -143,7 +203,13 @@ public class BiliParser {
     public static BiliVideo resolve(Context ctx, String url, int wantP){
         appCtx = ctx;   // 让 biliCookie() 能读到本地登录 Cookie
         BiliVideo v = new BiliVideo();
-        String aid = extractAid(url);
+        // 先展开短链（b23.tv 之类），否则 extractAid 拿不到 av/BV
+        String real = expandShort(url);
+        if(!real.equals(url)){
+            Log.i(TAG, "BILI_EXPANDED " + real.substring(0, Math.min(90, real.length())));
+        }
+        String aid = extractAid(real);
+        if(aid.length() == 0) aid = extractAid(url);   // 展开失败再试原串
         if(aid.length() == 0){ v.err = "链接里没找到 av 号 / BV 号"; return v; }
         boolean isBv = aid.toUpperCase().startsWith("BV");
         try{
@@ -326,7 +392,7 @@ public class BiliParser {
 
     /** 不带 Cookie 的裸 GET（专门用于取 buvid3，避免递归） */
     static String httpGetRaw(String url) throws Exception{
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection(java.net.Proxy.NO_PROXY);
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestProperty("User-Agent", UA);
         c.setConnectTimeout(10000);
         c.setReadTimeout(12000);
