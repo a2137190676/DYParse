@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.util.Log;
 /**
  * 下载前台服务：切后台也继续下，通知栏显示实时进度。
  * 下载队列仍由 MainActivity 的 downloadQueue 驱动（避免大改），
@@ -28,10 +29,17 @@ public class DownloadService extends Service {
     static volatile boolean lastRunning = false;
     /** 通知栏刷新节流：避免每个字节 chunk 都 push 一次 */
     long lastNotifyAt = 0;
+    /** 是否已经进入前台（防止重复 startForegroundService 触发 5 秒超时崩溃） */
+    static volatile boolean foregroundStarted = false;
 
     @Override public void onCreate(){
         super.onCreate();
         inst = this;
+        // 双保险：onCreate 就进前台，不等 onStartCommand 派发（主线程忙时会被延迟）
+        try{
+            startForeground(NOTIFY_ID, buildNotification(lastTitle, lastText, lastPct, true));
+            foregroundStarted = true;
+        }catch(Throwable te){ Log.i("DYP", "DLS_FG_CREATE_ERR " + te); }
         try{
             NotificationChannel ch = new NotificationChannel(CHANNEL_ID,
                     "下载", NotificationManager.IMPORTANCE_LOW);
@@ -50,13 +58,17 @@ public class DownloadService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId){
-        startForeground(NOTIFY_ID, buildNotification(lastTitle, lastText, lastPct, true));
+        try{
+            startForeground(NOTIFY_ID, buildNotification(lastTitle, lastText, lastPct, true));
+            foregroundStarted = true;
+        }catch(Throwable te){ Log.i("DYP", "DLS_FG_CMD_ERR " + te); }
         // START_STICKY：被系统杀掉后系统会尝试重建，配合 .part 断点续传能接着下
         return START_STICKY;
     }
 
     @Override public void onDestroy(){
         if(inst == this) inst = null;
+        foregroundStarted = false;
         try{
             if(wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         }catch(Throwable t){}
@@ -82,6 +94,9 @@ public class DownloadService extends Service {
     /** 下载开始：标记运行中并拉起前台服务 */
     static void markStart(Context c){
         lastRunning = true;
+        // 服务已在前台：绝不重复 startForegroundService。
+        // 重复拉起会重置系统 5 秒计时，主线程忙时必然超时崩溃。
+        if(foregroundStarted && inst != null) return;
         try{
             Intent it = new Intent(c, DownloadService.class);
             if(android.os.Build.VERSION.SDK_INT >= 26) c.startForegroundService(it);
