@@ -131,9 +131,33 @@ public class ScopedStore {
         try{
             if(dir == null) return false;
             if(!dir.exists() && !dir.mkdirs()) return false;
-            File probe = new File(dir, ".dyp_probe_" + System.currentTimeMillis());
-            boolean ok = probe.createNewFile();
-            if(ok) probe.delete();
+            // 【并发安全】探测文件名必须唯一。
+            //
+            // 原来是 ".dyp_probe_" + currentTimeMillis()，毫秒精度。
+            // 批量下载在 dlConcurrency=8 下一启动就并发调这里，
+            // 同一毫秒内会生成完全相同的探测名：
+            //   第 1 条 createNewFile() → true，随后 delete()
+            //   第 2~8 条撞上已存在的同名文件 → createNewFile() 返回 false
+            // → 误判「目录不可写」，文件被搬去私有目录再经 MediaStore
+            //   落到 Download/DYParse/视频 根目录，用户就找不到文件。
+            //
+            // 实测：4 条并发里恰好 1 条落错目录，其余 3 条正常。
+            String rnd = Long.toHexString(Double.doubleToLongBits(Math.random()));
+            File probe = new File(dir, ".dyp_probe_" + System.currentTimeMillis() + "_" + rnd);
+            boolean ok;
+            try{
+                ok = probe.createNewFile();
+            }catch(Throwable t){
+                return false;
+            }
+            if(!ok){
+                // createNewFile 返回 false 有两种可能：
+                //   a) 文件已存在（并发撞名）—— 目录其实是可写的
+                //   b) 目录真的不可写
+                // 用 exists() 区分：存在就说明我们（或别的线程）能在这里建文件。
+                ok = probe.exists();
+            }
+            try{ if(probe.exists()) probe.delete(); }catch(Throwable t){}
             return ok;
         }catch(Throwable t){
             return false;
