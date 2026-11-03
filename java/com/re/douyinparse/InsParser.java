@@ -149,7 +149,7 @@ public class InsParser {
             String body = null;
             int http = 0;
             try{
-                HttpURLConnection c = (HttpURLConnection) new URL(infoUrl).openConnection(java.net.Proxy.NO_PROXY);
+                HttpURLConnection c = (HttpURLConnection) new URL(infoUrl).openConnection();
                 c.setConnectTimeout(8000);
                 c.setReadTimeout(10000);
                 c.setRequestProperty("User-Agent",
@@ -225,7 +225,7 @@ public class InsParser {
         };
         for(String p : paths){
             try{
-                HttpURLConnection c = (HttpURLConnection) new URL(p).openConnection(java.net.Proxy.NO_PROXY);
+                HttpURLConnection c = (HttpURLConnection) new URL(p).openConnection();
                 c.setConnectTimeout(10000);
                 c.setReadTimeout(12000);
                 c.setInstanceFollowRedirects(true);
