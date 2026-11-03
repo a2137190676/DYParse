@@ -237,7 +237,17 @@ public class DyDetail {
 
     /** 完整签名 query */
     public static String buildSignedQuery(String awemeId, String cookie){
-        String uifid = cookieValue(cookie, "UIFID_TEMP");
+        return buildSignedQuery(awemeId, cookie, "");
+    }
+
+    /**
+     * @param uifidOverride 调用方已知的 uifid（如 App 的 dyCurUifid() 结果）。
+     *        非空时优先用它 —— 因为 CookieStore 本地文件里可能没有 UIFID_TEMP，
+     *        只从 cookie 抠会得到空串，请求就被 Argus 拒成 403 Uifid Not Found。
+     */
+    public static String buildSignedQuery(String awemeId, String cookie, String uifidOverride){
+        String uifid = (uifidOverride == null) ? "" : uifidOverride.trim();
+        if(uifid.length() == 0) uifid = cookieValue(cookie, "UIFID_TEMP");
         if(uifid.length() == 0) uifid = cookieValue(cookie, "UIFID");
         if(uifid.length() == 0) uifid = cookieValue(cookie, "uifid");
         String msToken = cookieValue(cookie, "msToken");
@@ -312,11 +322,16 @@ public class DyDetail {
 
     /** 取 detail JSON，带重试（风控是概率性的） */
     public static Result fetch(String awemeId, String cookie, int maxTries){
+        return fetch(awemeId, cookie, maxTries, "");
+    }
+
+    /** 带显式 uifid 的 detail（批量下载用：本地 Cookie 里没有 UIFID_TEMP，必须外部补） */
+    public static Result fetch(String awemeId, String cookie, int maxTries, String uifid){
         Result r = new Result();
         for(int i = 0; i < maxTries; i++){
             r.tries = i + 1;
             try{
-                r.signedQuery = buildSignedQuery(awemeId, cookie);
+                r.signedQuery = buildSignedQuery(awemeId, cookie, uifid);
                 URL u = new URL(API + "?" + r.signedQuery);
                 HttpURLConnection c = (HttpURLConnection) u.openConnection();
                 c.setRequestMethod("GET");
@@ -324,10 +339,14 @@ public class DyDetail {
                 c.setRequestProperty("Accept", "application/json, text/plain, */*");
                 c.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
                 c.setRequestProperty("Referer", "https://www.douyin.com/note/" + awemeId);
-                String uifid = cookieValue(cookie, "UIFID_TEMP");
-                if(uifid.length() == 0) uifid = cookieValue(cookie, "UIFID");
-                if(uifid.length() == 0) uifid = cookieValue(cookie, "uifid");
-                if(uifid.length() > 0) c.setRequestProperty("uifid", uifid);
+                // 请求头里的 uifid 也要用同一个来源：
+                // 参数传了就用参数（App 的 dyCurUifid 结果），没传才从 cookie 抠。
+                // 否则签名用参数、请求头用 cookie，两处不一致，Argus 一样拒。
+                String uiHdr = (uifid == null) ? "" : uifid.trim();
+                if(uiHdr.length() == 0) uiHdr = cookieValue(cookie, "UIFID_TEMP");
+                if(uiHdr.length() == 0) uiHdr = cookieValue(cookie, "UIFID");
+                if(uiHdr.length() == 0) uiHdr = cookieValue(cookie, "uifid");
+                if(uiHdr.length() > 0) c.setRequestProperty("uifid", uiHdr);
                 String ck = cookie;
                 if(cookieValue(ck, "ttwid").length() == 0){
                     String tw = registerTtwid();
