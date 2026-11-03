@@ -38,6 +38,9 @@ import java.util.Map;
 public class TtParser {
 
     static final String TAG = "DYP";
+    // 实测：iPhone Safari UA 抓 www.tiktok.com 会被返回精简页（TT_HTTP 空页面），
+    // Android Chrome UA 才能拿到完整的 api-data（含 imagePost 全部 32 张）。
+    // 真正的关键不在这里，而在 normalize() 有没有把 /photo/ 保住 —— 见该方法注释。
     static final String MUA = "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
     static final String REFERER = "https://www.tiktok.com/";
 
@@ -58,6 +61,11 @@ public class TtParser {
         public long diggCount = 0, commentCount = 0, shareCount = 0, playCount = 0;
         public String pageUrl = "";
         public String template = "";      // reflow / apidata，调试用
+        // 实况图：与 images 一一对应的动轨地址（空串 = 该张不是动轨）。
+        // TikTok 网页端 api-data 只给静态图，动轨要靠 photomode 视频模板或移动端 API，
+        // 这里留出结构，拿到就填，拿不到保持空（下载时按非实况处理）。
+        public final java.util.List<String> liveUrls = new java.util.ArrayList<String>();
+        public boolean isLive = false;
         public String err = "";
         public final List<String> images = new ArrayList<String>();
 
@@ -175,13 +183,18 @@ public class TtParser {
         if(real == null || real.length() == 0) real = url;
         String id = extractItemId(real);
         if(id.length() == 0) return real;
-        // 优先保留真实用户名，拿不到就用 @i 占位
+        // 【关键】TikTok 图集/实况图的作品路径是 /photo/{id}，不是 /video/{id}。
+        // 原来这里无条件拼 /video/，把 photo 作品改成了 video 路径，
+        // 服务端按 video 渲染 → 拿不到 imagePost → 「图集只剩 1 张 / 实况动轨消失」。
+        boolean isPhoto = real.indexOf("/photo/") > 0;
+        String kind = isPhoto ? "photo" : "video";
         int at = real.indexOf("/@");
-        int vid = real.indexOf("/video/");
+        int vid = real.indexOf("/" + kind + "/");
         if(at >= 0 && vid > at){
-            return "https://www.tiktok.com" + real.substring(at, vid + "/video/".length() + id.length());
+            String user = real.substring(at, vid);
+            return "https://www.tiktok.com" + user + "/" + kind + "/" + id;
         }
-        return "https://www.tiktok.com/@i/video/" + id;
+        return "https://www.tiktok.com/@i/" + kind + "/" + id;
     }
 
     /** 从任意 TikTok 链接里抠作品ID */
@@ -232,13 +245,24 @@ public class TtParser {
     /** 打开连接：一律直连（用户自己的网络/代理/TUN 自然生效，App 不套 Proxy） */
     static HttpURLConnection open(Context ctx, String url, Session s, Boolean useProxy) throws Exception{
         URL u = new URL(url);
-        HttpURLConnection c = (HttpURLConnection) u.openConnection(java.net.Proxy.NO_PROXY);
+        HttpURLConnection c = (HttpURLConnection) u.openConnection();
         c.setRequestProperty("User-Agent", MUA);
         c.setRequestProperty("Referer", s != null ? s.referer : REFERER);
         String ck = s != null ? s.cookieHeader() : "";
+        if(ck.length() == 0){
+            // 兜底：Session 是新建的（CookieStore 空）时，从系统 CookieManager 取 WebView 的 cookie。
+            // TikTok CDN 对无 Cookie 的请求一律 403，播放器能播是因为它拿到了 cookie。
+            try{
+                String web = android.webkit.CookieManager.getInstance().getCookie("https://www.tiktok.com/");
+                if(web != null && web.length() > 0) ck = web;
+            }catch(Throwable t){}
+        }
         if(ck.length() > 0) c.setRequestProperty("Cookie", ck);
-        c.setConnectTimeout(15000);
-        c.setReadTimeout(25000);
+        // 实测：走代理时 TikTok 短链跳转经常要 12 秒以上，
+        // 原来 25 秒读超时在链路抖动时会直接 SocketTimeoutException，
+        // 短链展不开 → 「拿不到作品ID」。放宽到 40 秒。
+        c.setConnectTimeout(20000);
+        c.setReadTimeout(40000);
         return c;
     }
 
@@ -290,28 +314,71 @@ public class TtParser {
     // ================= 页面解析 =================
 
     /** 依次尝试两种模板 */
+    static int ttDumpLeft = 3;
     static boolean tryParse(String html, TtVideo v){
+        // 诊断：把页面落盘，确认 photo 作品的 imagePost 在哪个模板里
+        try{
+            if(html != null && html.length() > 1000 && ttDumpLeft > 0){
+                ttDumpLeft--;
+                java.io.File f = new java.io.File("/sdcard/Download/DYParse/tt_dump_"
+                        + System.currentTimeMillis() + ".html");
+                if(f.getParentFile() != null) f.getParentFile().mkdirs();
+                java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
+                fo.write(html.getBytes("UTF-8"));
+                fo.close();
+                Log.i(TAG, "TT_DUMP " + f.getAbsolutePath() + " len=" + html.length()
+                        + " hasImagePost=" + html.contains("imagePost")
+                        + " hasImageURL=" + html.contains("imageURL")
+                        + " hasUniversal=" + html.contains("__UNIVERSAL_DATA_FOR_REHYDRATION__")
+                        + " hasApiData=" + html.contains("id=\"api-data\""));
+            }
+        }catch(Throwable t){ Log.i(TAG, "TT_DUMP_ERR " + t); }
+
         // 模板 A：__UNIVERSAL_DATA_FOR_REHYDRATION__（新页）
         String json = extractScriptById(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__");
+        boolean aOk = false;
         if(json != null && json.length() > 100){
-            if(parseUniversal(json, v)){ v.template = "reflow"; return true; }
+            if(parseUniversal(json, v)){ v.template = "reflow"; aOk = true; }
         }
         // 模板 B：id="api-data"（老页 / @i 占位页）
-        json = extractScriptById(html, "api-data");
-        if(json != null && json.length() > 100){
-            if(parseApiData(json, v)){ v.template = "apidata"; return true; }
+        // 注意：photo / 实况图作品的 imagePost 只在完整页里，
+        // api-data 是精简页，itemStruct 里没有 imagePost。
+        // 所以如果 reflow 已经拿到了图片，就别再让 apidata 覆盖。
+        if(aOk && v.images.size() > 0) return true;
+        String json2 = extractScriptById(html, "api-data");
+        if(json2 != null && json2.length() > 100){
+            TtVideo tmp = new TtVideo();
+            if(parseApiData(json2, tmp)){
+                // 精简页只补齐缺失字段，不用它覆盖已有的图片/视频
+                if(v.id.length() == 0) v.id = tmp.id;
+                if(v.desc.length() == 0) v.desc = tmp.desc;
+                if(v.author.length() == 0) v.author = tmp.author;
+                if(v.cover.length() == 0) v.cover = tmp.cover;
+                if(v.playUrl.length() == 0) v.playUrl = tmp.playUrl;
+                if(v.downloadUrl.length() == 0) v.downloadUrl = tmp.downloadUrl;
+                if(v.musicUrl.length() == 0){
+                    v.musicUrl = tmp.musicUrl;
+                    v.musicTitle = tmp.musicTitle;
+                    v.musicAuthor = tmp.musicAuthor;
+                }
+                if(v.images.isEmpty() && !tmp.images.isEmpty()){
+                    v.images.addAll(tmp.images);
+                }
+                if(v.template.length() == 0) v.template = "apidata";
+                return true;
+            }
         }
+        if(aOk) return true;
         // 模板 C：直接找 RENDER_DATA（更老的兜底）
-        json = extractScriptById(html, "RENDER_DATA");
-        if(json != null && json.length() > 100){
+        String json3 = extractScriptById(html, "RENDER_DATA");
+        if(json3 != null && json3.length() > 100){
             try{
-                String dec = java.net.URLDecoder.decode(json, "UTF-8");
+                String dec = java.net.URLDecoder.decode(json3, "UTF-8");
                 if(parseUniversal(dec, v)){ v.template = "render"; return true; }
             }catch(Throwable t){}
         }
         return false;
     }
-
     /** 抠 <script id="xxx" ...>body</script> */
     static String extractScriptById(String html, String id){
         try{
@@ -341,8 +408,26 @@ public class TtParser {
             Object vd = null;
             if(scope instanceof Map){
                 Map sm = (Map) scope;
-                // 新旧两种 key 都试
-                vd = sm.get("webapp.video-detail");
+                // 模糊匹配所有 video.detail / photo.detail 变体。
+                // 服务器端 tt_module._dig_scope() 就是这么写的：
+                //   keys = [k for k in scope.keys() if "video.detail" in k or "photo.detail" in k]
+                // 本地原来只写死两个精确 key（webapp.video-detail / webapp.reflow.video.detail），
+                // 一旦 TikTok 换成 webapp.photo-detail 或别的前缀就直接 miss，
+                // 只能退到 api-data 精简页 —— 那份没有 live 动轨，图集也只剩壳。
+                for(Object ko : sm.keySet()){
+                    String k = String.valueOf(ko);
+                    if(k.indexOf("video.detail") < 0 && k.indexOf("photo.detail") < 0) continue;
+                    Object cand = sm.get(ko);
+                    if(cand == null) continue;
+                    Object cii = (cand instanceof Map) ? ((Map) cand).get("itemInfo") : null;
+                    Object cit = (cii instanceof Map) ? ((Map) cii).get("itemStruct") : null;
+                    if(cit instanceof Map && s(((Map) cit).get("id")).length() > 0){
+                        vd = cand;
+                        Log.i(TAG, "TT_SCOPE_HIT " + k);
+                        break;
+                    }
+                }
+                if(vd == null) vd = sm.get("webapp.video-detail");
                 if(vd == null) vd = sm.get("webapp.reflow.video.detail");
             }
             if(vd == null) vd = findKey(root, "videoDetail");
@@ -436,23 +521,89 @@ public class TtParser {
             Object imgs = ((Map) imgPost).get("images");
             if(imgs instanceof List){
                 for(Object o : (List) imgs){
+                    String liveU = "";
                     if(o instanceof Map){
                         Object urls = ((Map) o).get("imageURL");
                         if(urls instanceof Map){
-                            String u = s(((Map) urls).get("urlList"));
-                            if(u.length() == 0){
-                                Object ul = ((Map) urls).get("urlList");
-                                if(ul instanceof List && !((List) ul).isEmpty()) u = s(((List) ul).get(0));
+                            // imageURL.urlList 是**数组**（多个 CDN 候选）。
+                            // 原来写成 s(urlList)，s() 是 o.toString()，
+                            // List 会变成 "[url1, url2, ...]" 这种字符串，
+                            // 既不是空串、也不以 http 开头 → 全被丢掉 → imgs=0。
+                            // 正确做法：按 List 取第一个元素。
+                            Object ul = ((Map) urls).get("urlList");
+                            String u = "";
+                            if(ul instanceof List && !((List) ul).isEmpty()){
+                                u = s(((List) ul).get(0));
+                            }else{
+                                u = s(ul);
                             }
                             if(u.startsWith("http")) v.images.add(u);
                         }
+                        // 实况图动轨：TikTok 在单张图里额外给 video / playAddr。
+                        // 各版本字段名不一样，这里全试一遍。
+                        liveU = liveOfImage((Map) o);
                     }
+                    // liveUrls 必须与 images 一一对应（含空串），下载时才不会错位
+                    v.liveUrls.add(liveU);
+                    if(liveU.length() > 0) v.isLive = true;
                 }
             }
         }
 
         Log.i(TAG, "TT_FILL id=" + v.id + " video=" + (v.hasVideo() ? "1" : "0")
                 + " imgs=" + v.images.size() + " music=" + (v.musicUrl.length() > 0 ? "1" : "0"));
+    }
+
+    /** 从单张 image 里抠实况动轨地址；没有返回 ""。 */
+    static String liveOfImage(Map im){
+        try{
+            // 形态一：images[i].video = { playAddr: {urlList:[...]}, duration:... }
+            Object vv = im.get("video");
+            String u = pickPlayUrl(vv);
+            if(u.length() > 0) return u;
+            // 形态二：images[i].playAddr / play_addr 直接挂
+            u = pickPlayUrl(im.get("playAddr"));
+            if(u.length() > 0) return u;
+            u = pickPlayUrl(im.get("play_addr"));
+            if(u.length() > 0) return u;
+            // 形态三：images[i].dynamicUrl / dynamic_url
+            u = s(im.get("dynamicUrl"));
+            if(u.length() > 0 && u.startsWith("http")) return u;
+            u = s(im.get("dynamic_url"));
+            if(u.length() > 0 && u.startsWith("http")) return u;
+        }catch(Throwable t){}
+        return "";
+    }
+
+    /** 从 {urlList:[...]} / 字符串 / url 字段里取一个可播放地址 */
+    static String pickPlayUrl(Object o){
+        try{
+            if(o == null) return "";
+            if(o instanceof String){
+                String u = (String) o;
+                return u.startsWith("http") ? u : "";
+            }
+            if(o instanceof Map){
+                Map m = (Map) o;
+                Object ul = m.get("urlList");
+                if(ul == null) ul = m.get("url_list");
+                if(ul instanceof List){
+                    for(Object x : (List) ul){
+                        String u = s(x);
+                        if(u.startsWith("http")) return u;
+                    }
+                }
+                if(ul instanceof String){
+                    String u = (String) ul;
+                    if(u.startsWith("http")) return u;
+                }
+                String u = s(m.get("url"));
+                if(u.startsWith("http")) return u;
+                u = s(m.get("playAddr"));
+                if(u.startsWith("http")) return u;
+            }
+        }catch(Throwable t){}
+        return "";
     }
 
     /** 从 bitrateInfo 里挑最好的：优先 h265，其次码率最高的 */
@@ -574,6 +725,10 @@ public class TtParser {
             c.setRequestProperty("Sec-Fetch-Dest", "video");
             c.setRequestProperty("Sec-Fetch-Mode", "no-cors");
             c.setRequestProperty("Sec-Fetch-Site", "same-site");
+            // TikTok CDN 对「无 Range 的整段 GET」很敏感，经常直接 403；
+            // 而播放器（ExoPlayer）天然会带 Range 头，所以「能播不能下」。
+            // 这里补一个 bytes=0- 让请求形态和播放器一致。
+            c.setRequestProperty("Range", "bytes=0-");
             if(s != null) c.setRequestProperty("Referer", s.referer);
             int code = c.getResponseCode();
             Log.i(TAG, "TT_DL " + code + " " + trim(url));
