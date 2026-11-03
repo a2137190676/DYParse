@@ -8,6 +8,67 @@
 
 ---
 
+## v2.1.0 — 2026-11-03
+本轮重点是**磁力下载转正**、**TikTok / X 主页解析重做**，以及一串「列表 / 批量下载」相关 bug。
+
+### 新增
+- **磁力下载正式纳入平台清单**：解析页顶部平台数从 20 扩到 22，新增「腾讯视频」「磁力下载」
+  - `magnet:` 链接与 `.torrent` 直链走 `BtDownloader`（libtorrent4j），全部本机完成、不经服务器
+  - 各平台独立下载目录中「磁力」单独一项
+- **解析页平台文案改为动态生成**：`tvPlatBar` 直接读 `PLATFORM_LIST.length`，以后加平台不用再回来改布局
+  （之前 xml 里写死「支持 20 个平台」，加了平台数就对不上，且末尾漏了腾讯视频与磁力）
+- **TikTok 主页解析落地**：`startProfileWebView` 路径新增 `startGenericProfileScroll()`
+  - 每 1.6 秒滚到底，连续 12 次高度不变即停，最多 120 轮
+  - 页面自己发请求加载更多，`PROFILE_HOOK_JS` 旁路拦截后交给 `parseTtProfileJson`
+  - 实测账号 34 条作品全部收齐（此前只拿首屏）
+- **X 主页解析新增网页数据源**：`ProfileParser.resolveXProfileWeb()`
+  - 直连 `https://x.com/<name>`，桌面 UA + 反转义 RSC 数据流
+  - 正则抽 `full_text` / `id_str` / `video.twimg.com/.../{w}x{h}/...mp4` / `ext_tw_video_thumb`
+  - 按 mediaId 归组取最大宽度，实测 4 条
+  - 形成「syndication → x.com 网页 → WebView」三级降级
+
+### 优化
+- **TikTok 批量下载改走本地直连**：`stepBatchProfileDl` 新增平台分派
+  - TikTok 走 `TtParser.resolve`（`tpl=apidata` 实测可用），服务器 `/api/tt` 只在本地失败时兜底
+  - 服务器侧实测连 TikTok 单作品页 60 秒超时（`000`），之前把服务器放前面，每条白等 25 秒
+- **服务器不可达时自动回退本地**，功能不中断
+- **主页列表 id 校验收紧**：`collectTtItems` 从「≥8 位」改为「15~25 位且全数字」
+  - 此前把 `userId=32164118` 误当作品，列表里出现「TikTok 32164118」这种无封面无直链的垃圾条目
+- **列表「解析看详情」改回渲染**：不再直接入队下载，而是构造 `XParser.XVideo` 后
+  `switchTab(0)` + `render()`，回到解析页显示封面、播放器、下载按钮
+- **`platForItem` 优先用 `it.plat`**：列表条目 url 可能是占位链接，`platOf` 认不出会退回「其他」
+- **`parseTtProfileJson` / `parseXProfileJson` 补填 `pi.plat`**
+
+### 修复
+- **列表里的记录删不掉，删完再点一次又刷新出来**
+  - `clearAllList()` 原来只清 `profileCollected/profileSeen/batchCollected/mixItems`
+  - 漏了 `itemsFromProfile` / `itemsFromBatch` / `itemsFromSingle` / `itemsFromMix` 四个数据池
+  - 也没删 `list_pools.tsv`，切子页签又渲染回来、重启又恢复
+  - 现在四个池全清 + `profileMode=false` + 删文件后 `saveListPoolsNow()` 重写空文件
+- **实况图下载路径缺少平台目录**
+  - `runOneTask` 的 MediaStore 兜底分支 `String relSub = task.cat;` 丢了平台名
+  - 导致落到 `Download/动图/` 而不是 `Download/DYParse/TikTok/动图/`
+  - 改为 `platSub + "/" + task.cat`，合集分支同步改为 `plat/cat/mixDir`
+- **TikTok 主页批量下载提示「成功入队 0/3 条」**
+  - 原来没做平台判断，TikTok 作品 id 去请求抖音 `DyDetail.fetch()`，必然失败
+  - 15 秒超时后还会 `loadForParse` 开整页，34 条要几十分钟
+  - 现在按 `platForItem(it)` 分派：TikTok 走 `TtParser`，X 走列表已有 `video.twimg.com` 直链
+- **主页列表点「批量下载」提示列表是空的**
+  - `startBatchDlFromList` 锁死读 `batchCollected`，但主页结果存在 `itemsFromProfile`
+  - 改为按当前子页签选池：批量解析→`batchCollected`，单条→`itemsFromSingle`，
+    主页→`itemsFromProfile`，合集→`mixItems`
+- **列表单条解析报「所有数据源都没拿到媒体」**
+  - `parseProfileItem` 未使用列表已有直链，直接 `loadForParse` 重新联网
+  - X 单推文源（`syndication` 429 / `fxtwitter` 无时间线）拿不到，报此错
+  - 现在命中 `it.directUrl` 时直接构造结果渲染
+
+### 说明
+- 磁力下载为 P2P 分享，请只下载自己有权限获取的内容
+- TikTok / X 主页解析均为本地直连，不依赖服务器
+- 服务器侧 `/api/tt` 在单作品页上不可用（服务器出口被 TikTok CDN 拒绝），已在代码注释中记录
+
+---
+
 ## v2.0.1 — 2026-11-02
 本轮重点是**磁力（BT）下载全链路修复**与**下载列表手动续传体系**。
 
