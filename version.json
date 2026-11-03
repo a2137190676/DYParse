@@ -1,14 +1,14 @@
 {
-  "tag": "v2.0.1",
-  "name": "v2.0.1",
-  "body": "## v2.0.1\n\n### 新增\n- 磁力 / BT 种子下载：支持 magnet 链接与 .torrent，全部本机完成\n- 磁力文件选择：按类型分类、可搜索、可单独勾选\n- 磁力边下边播 + 自动保留种子文件\n- 下载列表「继续」按钮：退出软件后未下完的任务可手动继续（断点续传）\n- 「清空已完成」按钮：只保留没下完的\n- 各平台独立下载目录（22 个平台可各自设路径）\n- 单文件分片多线程下载（可调 1~16 段）\n- 同时下载数可调（1~16 个）\n- 主题三态：自动 / 亮色 / 暗色\n- 列表缩略图 + 全平台封面补齐\n- 下载进度条：百分比 / 已下载量 / 速度 / 连接数\n- X（推特）主页解析\n- TikTok 主页解析\n\n### 优化\n- 磁力下载速度大幅提升（修复上传限速错误、补齐 tracker、重启续传自动重连）\n- 磁力进度条不再抖动\n- 下载任务持久化：中途退出不丢任务，失败的可继续\n\n### 修复\n- 磁力进度卡住不动 / 进度条乱跳\n- 磁力链接报「网页无法打开」\n- 重开软件恢复的不是原任务且下载失败\n- 批量下载时磁力条目被当普通视频下载\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.0.1/DYParse-v2.0.1.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.0.1/DYParse-v2.0.1.apk",
-  "released": "2026-11-02",
+  "tag": "v2.1.0",
+  "name": "v2.1.0",
+  "body": "## v2.1.0\n\n### 新增\n- 支持磁力链接（magnet）与 .torrent 文件直接下载，带进度与节点信息\n- 解析页顶部支持平台数更新为 22 个，新增腾讯视频、磁力下载\n- TikTok 主页解析：直接抓主页作品列表，视频与图集都能收\n- TikTok 主页自动滚动加载，能翻出全部作品而非首屏\n- X（推特）主页解析：新增网页数据源，游客态即可拿到时间线\n- 设置页「支持的平台」清单同步更新\n\n### 优化\n- TikTok 批量下载改走本地直连，不再逐条空等服务器超时\n- 服务器不可达时自动回退本地，功能不中断\n- 主页列表作品 id 校验收紧，不再混入作者 id 之类的无效条目\n- 列表「解析看详情」改为回到解析页渲染，不再直接进下载\n- 列表「批量下载」按当前子页选数据（批量 / 单条 / 主页 / 合集）\n\n### 修复\n- 列表里的记录删不掉，删完再点一次又刷新出来\n- 实况图下载路径缺少平台目录，落到「动图」而不是「TikTok/动图」\n- TikTok 主页批量下载提示「成功入队 0/3 条」\n- 主页列表点「批量下载」提示列表是空的\n- 列表单条解析报「所有数据源都没拿到媒体」（改走列表已有直链）\n\n### 说明\n- 磁力下载为 P2P 分享，请只下载自己有权限获取的内容\n- TikTok / X 主页解析均为本地直连，不依赖服务器\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.0/DYParse-v2.1.0.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.0/DYParse-v2.1.0.apk",
+  "released": "2026-11-03",
   "upgrade_notice": {
-    "title": "发现新版本 2.0",
-    "message": "v2.0.0 已发布：支持平台从 7 个扩大到 20 个，新增小红书、微信视频号、微博、今日头条等 13 个平台。建议更新到最新版。",
+    "title": "发现新版本 2.1",
+    "message": "v2.1.0 已发布：新增磁力链接下载，TikTok / X 主页解析重做，并修复列表删不掉、批量下载入队失败等多个问题。建议更新到最新版。",
     "url": "https://gitee.com/adaaixianzun/dyparse/releases",
-    "until": 2000000
+    "until": 2010000
   }
 }
