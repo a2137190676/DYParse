@@ -50,6 +50,8 @@ public class CookieStore {
     public static final String PLATFORM_DY = "douyin";
     /** 小红书 Cookie（web_session 是登录依据，本地保存不上传） */
     public static final String PLATFORM_XHS = "xiaohongshu";
+    /** X（Twitter）登录 Cookie（敏感账号主页需登录态，本地保存不上传） */
+    public static final String PLATFORM_X = "twitter";
     /** 汽水音乐 Cookie（留位，以后可能用得上） */
     public static final String PLATFORM_QS = "qishui";
 
