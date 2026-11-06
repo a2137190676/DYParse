@@ -37,7 +37,7 @@
             android:text="暗" android:textColor="@color/text_sub" android:textSize="14sp"/>
     </LinearLayout>
 
-    <!-- 四页签：解析 / 列表 / 历史 / 设置 -->
+    <!-- 五页签：解析 / 列表 / 下载 / 历史 / 设置 -->
     <LinearLayout
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:orientation="horizontal"
@@ -53,6 +53,10 @@
             android:layout_width="0dp" android:layout_height="38dp" android:layout_weight="1"
             android:layout_marginLeft="6dp" android:background="@drawable/tab_idle" android:gravity="center"
             android:text="列表" android:textColor="@color/text_hint" android:textSize="13sp"/>
+        <TextView android:id="@+id/tabDownload"
+            android:layout_width="0dp" android:layout_height="38dp" android:layout_weight="1"
+            android:layout_marginLeft="6dp" android:background="@drawable/tab_idle" android:gravity="center"
+            android:text="下载" android:textColor="@color/text_hint" android:textSize="13sp"/>
         <TextView android:id="@+id/tabHistory"
             android:layout_width="0dp" android:layout_height="38dp" android:layout_weight="1"
             android:layout_marginLeft="6dp" android:background="@drawable/tab_idle" android:gravity="center"
@@ -73,9 +77,9 @@
             android:orientation="vertical"
             android:paddingLeft="18dp" android:paddingRight="18dp">
 
-            <TextView
+            <TextView android:id="@+id/tvPlatBar"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:text="支持 20 个平台：抖音·快手·TikTok·X·YouTube·B站·小红书·Instagram·微信视频号·公众号·微博·头条·西瓜·AcFun·好看·最右·皮皮虾·皮皮搞笑·微视·豆包"
+                android:text="支持 22 个平台：抖音·快手·TikTok·X·YouTube·B站·小红书·Instagram·微信视频号·公众号·微博·头条·西瓜·AcFun·好看·最右·皮皮虾·皮皮搞笑·微视·豆包·腾讯视频·磁力下载"
                 android:textColor="@color/text_hint" android:textSize="11sp"
                 android:paddingLeft="4dp" android:paddingBottom="8dp"/>
 
@@ -136,6 +140,7 @@
                 android:layout_marginTop="8dp" android:max="1000"
                 android:progress="0" android:progressDrawable="@drawable/progress_h"
                 android:progressTint="@color/brand"/>
+
         </LinearLayout>
 
         <LinearLayout android:id="@+id/parseNavRow"
@@ -301,13 +306,57 @@
             android:paddingLeft="18dp" android:paddingRight="18dp"
             android:paddingTop="6dp" android:paddingBottom="6dp"/>
 
-        <TextView android:id="@+id/btnDlAll"
-            android:layout_width="match_parent" android:layout_height="40dp"
+        <!-- 列表页子页签：批量解析 / 主页解析 / 批量下载 -->
+        <LinearLayout
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal"
             android:layout_marginLeft="18dp" android:layout_marginRight="18dp"
-            android:layout_marginBottom="8dp"
-            android:background="@drawable/btn_primary" android:gravity="center"
-            android:text="全部下载" android:textColor="#FFFFFF"
-            android:textSize="13sp" android:textStyle="bold" android:visibility="gone"/>
+            android:layout_marginBottom="8dp">
+            <TextView android:id="@+id/subTabBatchParse"
+                android:layout_width="0dp" android:layout_height="34dp"
+                android:layout_weight="1" android:layout_marginRight="5dp"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="批量解析" android:textColor="@color/text_sub"
+                android:textSize="12sp"/>
+            <TextView android:id="@+id/subTabBatchDl"
+                android:layout_width="0dp" android:layout_height="34dp"
+                android:layout_weight="1" android:layout_marginRight="5dp"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="视频/图文解析" android:textColor="@color/text_sub"
+                android:textSize="12sp"/>
+            <TextView android:id="@+id/subTabProfileParse"
+                android:layout_width="0dp" android:layout_height="34dp"
+                android:layout_weight="1" android:layout_marginRight="5dp"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="主页解析" android:textColor="@color/text_sub"
+                android:textSize="12sp"/>
+            <TextView android:id="@+id/subTabMixParse"
+                android:layout_width="0dp" android:layout_height="34dp"
+                android:layout_weight="1"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="合集" android:textColor="@color/text_sub"
+                android:textSize="12sp"/>
+        </LinearLayout>
+
+        <!-- 下载操作排：全部下载 + 批量下载（只在「批量下载」子页签显示） -->
+        <LinearLayout
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginLeft="18dp" android:layout_marginRight="18dp"
+            android:layout_marginBottom="8dp">
+            <TextView android:id="@+id/btnDlAll"
+                android:layout_width="0dp" android:layout_height="40dp"
+                android:layout_weight="1" android:layout_marginRight="6dp"
+                android:background="@drawable/btn_primary" android:gravity="center"
+                android:text="全部下载" android:textColor="#FFFFFF"
+                android:textSize="13sp" android:textStyle="bold" android:visibility="gone"/>
+            <TextView android:id="@+id/btnBatchDl"
+                android:layout_width="0dp" android:layout_height="40dp"
+                android:layout_weight="1"
+                android:background="@drawable/btn_primary" android:gravity="center"
+                android:text="批量下载" android:textColor="#FFFFFF"
+                android:textSize="13sp" android:textStyle="bold"/>
+        </LinearLayout>
 
         <TextView android:id="@+id/btnClearList"
             android:layout_width="match_parent" android:layout_height="38dp"
@@ -316,6 +365,7 @@
             android:background="@drawable/input_bg" android:gravity="center"
             android:text="清空列表" android:textColor="@color/text_sub"
             android:textSize="13sp" android:visibility="gone"/>
+
 
 
         <ScrollView android:id="@+id/listScroll"
@@ -331,7 +381,69 @@
         </ScrollView>
     </LinearLayout>
 
-    <!-- 页签 3：历史页 -->
+    <!-- 页签 3：下载页（并发任务实时列表） -->
+    <LinearLayout android:id="@+id/pageDownload"
+        android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:orientation="vertical" android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical"
+            android:paddingLeft="18dp" android:paddingRight="18dp"
+            android:paddingTop="6dp" android:paddingBottom="6dp">
+
+            <TextView android:id="@+id/dlHead"
+                android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="暂无下载任务"
+                android:textColor="@color/text_hint" android:textSize="12sp"/>
+            <TextView android:id="@+id/dlCount"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="" android:textColor="@color/brand"
+                android:textSize="12sp" android:textStyle="bold"/>
+        </LinearLayout>
+
+        <ProgressBar android:id="@+id/dlTotalBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent" android:layout_height="5dp"
+            android:layout_marginLeft="18dp" android:layout_marginRight="18dp"
+            android:layout_marginBottom="8dp" android:max="1000"
+            android:progress="0" android:progressDrawable="@drawable/progress_h"
+            android:progressTint="@color/brand"/>
+
+        <LinearLayout
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginLeft="18dp" android:layout_marginRight="18dp"
+            android:layout_marginBottom="8dp">
+
+            <TextView android:id="@+id/btnDlCancel"
+                android:layout_width="0dp" android:layout_height="38dp"
+                android:layout_weight="1"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="取消全部下载" android:textColor="@color/text_sub"
+                android:textSize="13sp" android:visibility="gone"/>
+
+            <TextView android:id="@+id/btnDlClear"
+                android:layout_width="0dp" android:layout_height="38dp"
+                android:layout_weight="1"
+                android:layout_marginLeft="6dp"
+                android:background="@drawable/input_bg" android:gravity="center"
+                android:text="清空已完成" android:textColor="@color/text_sub"
+                android:textSize="13sp"/>
+        </LinearLayout>
+
+        <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="1" android:scrollbars="none"
+            android:overScrollMode="never">
+            <LinearLayout android:id="@+id/dlTaskList"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingLeft="18dp" android:paddingRight="18dp"
+                android:paddingBottom="18dp"/>
+        </ScrollView>
+    </LinearLayout>
+    <!-- 页签 4：历史页 -->
     <ScrollView android:id="@+id/pageHistory"
         android:layout_width="match_parent" android:layout_height="0dp"
         android:layout_weight="1" android:visibility="gone"
@@ -352,7 +464,7 @@
         </LinearLayout>
     </ScrollView>
 
-    <!-- 页签 4：设置页 -->
+    <!-- 页签 5：设置页 -->
     <ScrollView android:id="@+id/pageSettings"
         android:layout_width="match_parent" android:layout_height="0dp"
         android:layout_weight="1" android:visibility="gone"
