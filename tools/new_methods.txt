@@ -1,0 +1,462 @@
+// 损坏文件中独有（本轮新增）的方法，共 16 个
+
+// ===== platOf  (原第 120~143 行) =====
+    static String platOf(String url){
+        if(url == null) return "其他";
+        String u = url.toLowerCase();
+        if(BtDownloader.isMagnet(url) || url.indexOf(".torrent") > 0) return "磁力";
+        if(u.contains("douyin.com") || u.contains("iesdouyin.com") || u.contains("amemv.com")
+                || u.contains("snssdk.com")) return "抖音";
+        if(u.contains("kuaishou.com") || u.contains("yximgs.com") || u.contains("kwimgs.com")
+                || u.contains("gifshow.com")) return "快手";
+        if(TtParser.isTtUrl(u)) return "TikTok";
+        if(u.contains("tiktok")) return "TikTok";
+        if(isXDomain(u) || u.contains("twitter.com")) return "X";
+        if(u.contains("youtube.com") || u.contains("youtu.be") || u.contains("googlevideo")) return "YouTube";
+        if(u.contains("bilibili.com") || u.contains("b23.tv") || u.contains("bilivideo")) return "B站";
+        if(u.contains("instagram.com") || u.contains("cdninstagram.com")) return "Instagram";
+        if(u.contains("weibo.com") || u.contains("m.weibo.cn") || u.contains("sinaimg")) return "微博";
+        if(u.contains("v.qq.com") || u.contains("m.v.qq.com")) return "腾讯视频";
+        if(u.contains("weixin.qq.com") || u.contains("finder.video.qq")) return "视频号";
+        if(XhsParser.isXhsUrl(u)) return "小红书";
+        if(u.contains("toutiao.com") || u.contains("ixigua.com")) return "今日头条";
+        if(u.contains("doubao.com")) return "豆包";
+        if(u.contains("haokan.baidu.com") || u.contains("acfun.cn") || u.contains("weishi.qq.com")
+                || u.contains("pipix.com") || u.contains("zuiyou.com") || u.contains("pipigao.com")) return "其他平台";
+        return "其他";
+    }
+
+// ===== onConfigurationChanged  (原第 1711~1728 行) =====
+    public void onConfigurationChanged(android.content.res.Configuration cfg){
+        super.onConfigurationChanged(cfg);
+        try{
+            if (THEME_FOLLOW.equals(themeMode())){
+                boolean now = systemDark();
+                if (now != curDark){
+                    Log.i("DYP", "THEME_FOLLOW_CHANGED dark=" + now);
+                    curDark = now;
+                    applyTheme(curDark);
+                }
+                refreshThemeDependents();
+            } else {
+                applyTheme(curDark);
+            }
+        }catch(Throwable t){
+            Log.i("DYP", "THEME_CFG_ERR " + t);
+        }
+    }
+
+// ===== concToIndex  (原第 3913~3918 行) =====
+    static int concToIndex(int n){
+        if(n <= 8) return Math.max(0, n - 1);
+        if(n <= 10) return 8;
+        if(n <= 12) return 9;
+        return 10;
+    }
+
+// ===== showThemeDialog  (原第 3922~3942 行) =====
+    void showThemeDialog(){
+        curDark = isDarkMode();
+        String cur = themeMode();
+        final String[] keys = { THEME_FOLLOW, THEME_LIGHT, THEME_DARK };
+        String[] items = {
+            "跟随系统 · 白天浅色、晚上深色（推荐）",
+            "日间模式 · 始终浅色",
+            "夜间模式 · 始终深色"
+        };
+        int sel = THEME_DARK.equals(cur) ? 2 : (THEME_LIGHT.equals(cur) ? 1 : 0);
+        dypDlg()
+            .setTitle("主题")
+            .setSingleChoiceItems(items, sel, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    setThemeMode(keys[which]);
+                    try{ dd.dismiss(); }catch(Throwable t){}
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+// ===== showDlConcurrencyDialog  (原第 3944~3978 行) =====
+    void showDlConcurrencyDialog(){
+        final int cur = dlConcurrency();
+        final String[] items = new String[]{
+            "1 个 · 串行（最稳，旧机型推荐）",
+            "2 个 · 省流量",
+            "3 个 · 均衡（默认）",
+            "4 个 · 较快",
+            "5 个 · 快",
+            "6 个 · 很快（可能被平台限速）",
+            "7 个 · 极快（耗流量/发热）",
+            "8 个 · 上限（快，慎用）",
+            "10 个 · 激进（部分平台会拒绝）",
+            "12 个 · 更激进（耗电明显）",
+            "16 个 · 拉满（最快，老机型可能卡）"
+        };
+        dypDlg()
+            .setTitle("同时下载数")
+            .setSingleChoiceItems(items, concToIndex(cur), new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int which){
+                    // 索引 -> 实际并发数（1~8 直接对应，后面跳到 10/12/16）
+                    int n;
+                    if(which < 8) n = which + 1;
+                    else if(which == 8) n = 10;
+                    else if(which == 9) n = 12;
+                    else n = 16;
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putInt("dl_concurrency", n).apply();
+                    Log.i("DYP", "DL_CONCURRENCY set=" + n);
+                    try{ d.dismiss(); }catch(Throwable t){}
+                    buildSettingsPage();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+// ===== dlPlatSummary  (原第 3986~3995 行) =====
+    String dlPlatSummary(){
+        int custom = 0;
+        for(String p : DL_PLATS){
+            String key = "dl_dir_" + dlPlatKeyOf(p);
+            String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+            if(v != null && v.length() > 0) custom++;
+        }
+        if(custom == 0) return "全部走默认目录 · 点这里按平台修改";
+        return custom + " 个平台已自定义，" + (DL_PLATS.length - custom) + " 个走默认";
+    }
+
+// ===== showDlPlatDialog  (原第 3998~4062 行) =====
+    void showDlPlatDialog(){
+        curDark = isDarkMode();
+        String[] items = new String[DL_PLATS.length];
+        for(int i = 0; i < DL_PLATS.length; i++){
+            String p = DL_PLATS[i];
+            String key = "dl_dir_" + dlPlatKeyOf(p);
+            String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+            String def = new File(dlRootDir(), p).getAbsolutePath();
+            items[i] = p + (v.length() > 0 ? " · 已改" : "")
+                    + "\n" + (v.length() > 0 ? v : def);
+        }
+        dypDlg()
+            .setTitle("下载路径管理（每平台目录里的视频/图片/动图由程序自动再分）")
+            .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    final String plat = DL_PLATS[which];
+                    final String key = "dl_dir_" + java.net.URLEncoder.encode(plat).replaceAll("%", "_");
+                    final String def = new File(dlRootDir(), plat).getAbsolutePath();
+                    final android.widget.EditText et = new android.widget.EditText(MainActivity.this);
+                    et.setText(getSharedPreferences(SP, MODE_PRIVATE).getString(key, def));
+                    et.setText(def);
+                    et.setSingleLine(true);
+                    et.setTextSize(13);
+                    // EditText 直接塞 setView，AlertDialog 会自己包容器；
+                    // 但要给外边距，否则会贴边
+                    int pad = dp(16);
+                    et.setPadding(pad, pad / 2, pad, pad / 2);
+                    et.setBackgroundColor(curDark ? 0xFF1A1C22 : 0xFFFFFFFF);
+                    android.widget.LinearLayout wrap = new android.widget.LinearLayout(MainActivity.this);
+                    wrap.setOrientation(android.widget.LinearLayout.VERTICAL);
+                    android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
+                            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+                    int mp = dp(12);
+                    lp.leftMargin = mp; lp.rightMargin = mp; lp.topMargin = mp / 2; lp.bottomMargin = mp / 2;
+                    wrap.addView(et, lp);
+                    dypDlg()
+                        .setTitle("修改「" + plat + "」根目录")
+                        .setMessage("程序会在下面自动创建「视频 / 图片 / 动图 / 音频 / 合集」子目录。\n"
+                                + "留空 = 走默认目录：" + def)
+                        .setView(wrap)
+                        .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener(){
+                            public void onClick(android.content.DialogInterface d2, int w){
+                                String v = et.getText().toString().trim();
+                                getSharedPreferences(SP, MODE_PRIVATE).edit()
+                                    .putString(key, v).apply();
+                                Log.i("DYP", "DL_DIR_SAVE " + plat + " -> " + v);
+                                buildSettingsPage();
+                            }
+                        })
+                        .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener(){
+                            public void onClick(android.content.DialogInterface d2, int w){
+                                getSharedPreferences(SP, MODE_PRIVATE).edit()
+                                    .remove(key).apply();
+                                Log.i("DYP", "DL_DIR_RESET " + plat);
+                                buildSettingsPage();
+                            }
+                        })
+                        .setNegativeButton("取消", null)
+                        .create().show();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+// ===== dlPlatKeyOf  (原第 4065~4081 行) =====
+    static String dlPlatKeyOf(String plat){
+        if(plat == null || plat.length() == 0) return "other";
+        if("抖音".equals(plat)) return "douyin";
+        if("快手".equals(plat)) return "kuaishou";
+        if("B站".equals(plat)) return "bilibili";
+        if("微博".equals(plat)) return "weibo";
+        if("腾讯视频".equals(plat)) return "txvideo";
+        if("视频号".equals(plat)) return "weixin";
+        if("小红书".equals(plat)) return "xhs";
+        if("头条".equals(plat)) return "toutiao";
+        if("TikTok".equals(plat)) return "tiktok";
+        if("X".equals(plat)) return "x";
+        if("YouTube".equals(plat)) return "youtube";
+        if("Instagram".equals(plat)) return "instagram";
+        if("磁力".equals(plat)) return "magnet";
+        return "other";
+    }
+
+// ===== dlPlatDir  (原第 4082~4087 行) =====
+    String dlPlatDir(String plat){
+        String key = "dl_dir_" + dlPlatKeyOf(plat);
+        String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+        if(v != null && v.length() > 0) return v;
+        return new File(dlRootDir(), plat).getAbsolutePath();
+    }
+
+// ===== enqueueSingleWithAudio  (原第 4125~4137 行) =====
+    void enqueueSingleWithAudio(String url, String tag, String ext, String cat,
+                                String mixDir, String audioUrl){
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir, "", "", audioUrl);
+        t.silent = true;
+        t.plat = platOf(url);
+        downloadQueue.add(t);
+        Log.i("DYP", "DL_QUEUE_SINGLE_AUDIO + " + tag + " cat=" + cat);
+        if(!dlRunning){
+            dlRunning = true;
+            runDownloadQueue();
+        }
+        saveDlTasks();
+    }
+
+// ===== enqueueSingle  (原第 4140~4150 行) =====
+    void enqueueSingle(String url, String tag, String ext, String cat, String mixDir){
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir);
+        t.silent = true;
+        t.plat = platOf(url);
+        downloadQueue.add(t);
+        Log.i("DYP", "DL_QUEUE_SINGLE + " + tag + " cat=" + cat);
+        if(!dlRunning){
+            dlRunning = true;
+            runDownloadQueue();
+        }
+    }
+
+// ===== saveDlTasks  (原第 4206~4230 行) =====
+    void saveDlTasks(){
+        try{
+            org.json.JSONArray arr = new org.json.JSONArray();
+            java.util.List<DlTask> snap;
+            synchronized(downloadQueue){ snap = new java.util.ArrayList<DlTask>(downloadQueue); }
+            for(DlTask t : snap){
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("u", t.url == null ? "" : t.url);
+                o.put("t", t.tag == null ? "" : t.tag);
+                o.put("e", t.ext == null ? "" : t.ext);
+                o.put("c", t.cat == null ? "" : t.cat);
+                o.put("m", t.mixDir == null ? "" : t.mixDir);
+                o.put("lv", t.liveUrl == null ? "" : t.liveUrl);
+                o.put("nb", t.nameBase == null ? "" : t.nameBase);
+                o.put("au", t.audioUrl == null ? "" : t.audioUrl);
+                o.put("s", t.silent);
+                arr.put(o);
+            }
+            getSharedPreferences(SP, MODE_PRIVATE).edit()
+                .putString(KEY_DL_TASKS, arr.toString()).apply();
+            Log.i("DYP", "DL_TASKS_SAVED n=" + arr.length());
+        }catch(Throwable e){
+            Log.i("DYP", "DL_TASKS_SAVE_ERR " + e);
+        }
+    }
+
+// ===== clearDlTasks  (原第 4256~4262 行) =====
+    void clearDlTasks(){
+        try{
+            getSharedPreferences(SP, MODE_PRIVATE).edit()
+                .remove(KEY_DL_TASKS).apply();
+            Log.i("DYP", "DL_TASKS_CLEARED");
+        }catch(Throwable e){}
+    }
+
+// ===== restoreDlTasks  (原第 4265~4286 行) =====
+    void restoreDlTasks(){
+        try{
+            java.util.List<DlTask> saved = loadDlTasks();
+            if(saved.isEmpty()) return;
+            // 过滤掉已经有成品文件的（防重复）
+            java.util.List<DlTask> todo = new java.util.ArrayList<DlTask>();
+            for(DlTask t : saved){
+                todo.add(t);
+            }
+            if(todo.isEmpty()){ clearDlTasks(); return; }
+            synchronized(downloadQueue){ downloadQueue.addAll(todo); }
+            Log.i("DYP", "DL_TASKS_RESTORE n=" + todo.size());
+            s("发现 " + todo.size() + " 个未完成的下载，继续下载…");
+            showHintToast("继续上次 " + todo.size() + " 个下载任务");
+            if(!dlRunning){
+                dlRunning = true;
+                runDownloadQueue();
+            }
+        }catch(Throwable e){
+            Log.i("DYP", "DL_TASKS_RESTORE_ERR " + e);
+        }
+    }
+
+// ===== dlConcurrency  (原第 4299~4304 行) =====
+    int dlConcurrency(){
+        int n = getSharedPreferences(SP, MODE_PRIVATE).getInt("dl_concurrency", 3);
+        if(n < 1) n = 1;
+        if(n > DL_CONC_MAX) n = DL_CONC_MAX;
+        return n;
+    }
+
+// ===== runOneTask  (原第 4459~4600 行) =====
+    boolean runOneTask(DlTask task, int idx, int total, String[] lastCatDir,
+                       java.util.concurrent.atomic.AtomicInteger doneCount,
+                       java.util.concurrent.atomic.AtomicInteger running){
+        String name;
+        if(task.nameBase.length() > 0){
+            name = task.nameBase + "." + task.ext;
+        } else {
+            String pfx;
+            if(TtParser.isTtUrl(task.url)) pfx = "tt_";
+            else if(KsParser.isKsUrl(task.url)) pfx = "ks_";
+            else if(isXDomain(task.url) || isXDomain(curUrl)) pfx = "x_";
+            else if(YtParser.isYtUrl(task.url) || YtParser.isYtUrl(curUrl)) pfx = "yt_";
+            else if(BiliParser.isBiliUrl(task.url) || BiliParser.isBiliUrl(curUrl)
+                    || task.url.indexOf("bilivideo.com") >= 0) pfx = "bl_";
+            else pfx = "dy_";
+            // 去重必须加锁：并发时两个任务可能抢到同一个 _2
+            synchronized(dlNameLock){
+                name = pfx + curId + "_" + task.tag + "." + task.ext;
+                File catDirTmp = new File(dlDirFor2(task.plat, task.cat));
+                if(task.mixDir != null && task.mixDir.length() > 0){
+                    catDirTmp = new File(catDirTmp, task.mixDir);
+                }
+                File probe = new File(catDirTmp, name);
+                int dup = 2;
+                while(probe.exists() && probe.length() > 0 && dup < 100){
+                    name = pfx + curId + "_" + task.tag + "_" + dup + "." + task.ext;
+                    probe = new File(catDirTmp, name);
+                    dup++;
+                }
+                // 抢到名字后立刻占位，避免真正的并发冲突
+                try{
+                    if(!catDirTmp.exists()) catDirTmp.mkdirs();
+                    if(!probe.exists()) probe.createNewFile();
+                }catch(Throwable t){}
+            }
+        }
+        File catDir = new File(dlDirFor2(task.plat, task.cat));
+        if(task.mixDir != null && task.mixDir.length() > 0){
+            catDir = new File(catDir, task.mixDir);
+        }
+        boolean dirWritable = ScopedStore.canWriteDir(catDir);
+        if(getSharedPreferences(SP, MODE_PRIVATE).getBoolean("force_scoped", false)){
+            dirWritable = false;
+            Log.i("DYP", "DL_FORCE_SCOPED 测试开关已开启");
+        }
+        File workDir = catDir;
+        String relSub = task.cat;
+        if(!dirWritable){
+            workDir = new File(getCacheDir(), "dl_tmp");
+            if(!workDir.exists()) workDir.mkdirs();
+            Log.i("DYP", "DL_SCOPED_FALLBACK " + catDir.getAbsolutePath() + " -> " + workDir.getAbsolutePath());
+            DiagLog.w(DiagLog.M_PERM, "下载目录不可写，走 MediaStore 兜底 | "
+                    + catDir.getAbsolutePath() + " | API=" + android.os.Build.VERSION.SDK_INT);
+        }
+        if(task.mixDir != null && task.mixDir.length() > 0){
+            relSub = task.cat + "/" + task.mixDir;
+        }
+        final File target = new File(workDir, name);
+        synchronized(dlNameLock){ lastCatDir[0] = catDir.getAbsolutePath(); }
+        final long[] speedState = new long[]{ System.currentTimeMillis(), 0L };
+        s("下载中 " + idx + "/" + total + "：" + name);
+        Log.i("DYP", "DL_START " + idx + "/" + total + " " + name);
+        // 单个下载(silent)不进「下载」页，只在解析页进度条显示
+        final boolean silent = task.silent;
+        final int rowKey = idx;
+        if (silent) {
+            dlSilentKeys.add(rowKey);   // 标记：所有 dlRow* 调用都会自动忽略
+        } else {
+            dlRowAdd(rowKey, name);
+            dlRowUpdate(rowKey, 0, "连接中…");
+        }
+        boolean ok;
+        if(task.isLive()){
+            ok = downloadLivePhoto(task, target);
+        } else if(task.audioUrl != null && task.audioUrl.length() > 0){
+            ok = downloadDualTrack(task, target, idx, total);
+        } else {
+            final Object ttSes = TtParser.isTtUrl(task.url) ? new TtParser.Session() : curSession;
+            ok = InnerDownloader.fetch(task.url, target, new InnerDownloader.Cb(){
+                @Override public void onStart(long totalBytes){
+                    Log.i("DYP", "DL_ONE_START " + target.getName() + " size=" + totalBytes);
+                    dlRowUpdate(rowKey, 0, totalBytes > 0
+                            ? ("0%  " + InnerDownloader.sizeText(totalBytes)) : "下载中…");
+                }
+                @Override public void onProgress(long done, long tot){
+                    String spd = "";
+                    long nowMs = System.currentTimeMillis();
+                    if(nowMs - speedState[0] >= 1000){
+                        long dBytes = done - speedState[1];
+                        long dMs = nowMs - speedState[0];
+                        if(dMs > 0 && dBytes >= 0){
+                            double bps = dBytes * 1000.0 / dMs;
+                            spd = "  " + InnerDownloader.sizeText((long) bps) + "/s";
+                        }
+                        speedState[0] = nowMs;
+                        speedState[1] = done;
+                    }
+                    Log.i("DYP", "DL_ONE_PROG " + target.getName() + " "
+                            + InnerDownloader.sizeText(done) + spd);
+                    int pct = tot > 0 ? (int)((double) done * 1000 / tot) : -1;
+                    dlRowUpdate(rowKey, pct, tot > 0
+                            ? String.format(Locale.US, "%d%%  %s%s",
+                                (pct / 10), InnerDownloader.sizeText(done), spd)
+                            : (InnerDownloader.sizeText(done) + spd));
+                }
+                @Override public void onDone(boolean ok2, File out, String msg){
+                    Log.i("DYP", "DL_END " + task.tag + " ok=" + ok2 + " " + msg);
+                    String nm = out != null ? out.getName() : (target != null ? target.getName() : "?");
+                    appLog("下载", (ok2 ? "✓ " : "✗ ") + nm + "  " + msg);
+                    if(!ok2 && target != null && target.exists() && target.length() < 1024){
+                        try{ target.delete(); }catch(Throwable t){}
+                    }
+                }
+            }, ttSes, MainActivity.this);
+        }
+        if(ok){
+            File real = target;
+            if(!dirWritable){
+                android.net.Uri mv = ScopedStore.saveToDownloads(
+                        MainActivity.this, target, relSub, target.getName());
+                if(mv != null){
+                    Log.i("DYP", "DL_SCOPED_MOVED " + target.getName() + " -> " + mv);
+                    try{ target.delete(); }catch(Throwable t){}
+                    synchronized(savedDirs){ savedDirs.add(catDir.getAbsolutePath()); }
+                    return true;
+                }
+                Log.i("DYP", "DL_SCOPED_FAIL 保留在私有目录 " + target.getAbsolutePath());
+                DiagLog.e(DiagLog.M_PERM, "MediaStore 兜底失败，文件留在 " + target.getAbsolutePath());
+                synchronized(savedDirs){ savedDirs.add(workDir.getAbsolutePath()); }
+                h.post(new Runnable(){ public void run(){
+                    showHintToast("公共目录写入受限，文件已存到应用私有目录"); }});
+                return true;
+            }
+            real = fixImageExt(target);
+            scanMedia(real);
+            try{ synchronized(savedDirs){ savedDirs.add(real.getParentFile().getAbsolutePath()); } }catch(Throwable t){}
+            dlRowUpdate(rowKey, 1000, "✓ 完成");
+        } else {
+            dlRowUpdate(rowKey, -1, "✗ 失败（可重试续传）");
+        }
+        return ok;
+    }
+
