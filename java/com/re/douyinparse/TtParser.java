@@ -648,6 +648,11 @@ public class TtParser {
         if(html.contains("verify_event") || html.contains("captcha")) return "触发验证码";
         if(html.contains("statusCode") && html.contains("10101")) return "风控拦截(10101)";
         if(html.contains("statusCode") && html.contains("10000")) return "风控拦截(10000)";
+        // 10222 = 作品在 TikTok 侧不可用（私密账号 / 已删除 / 区域限制）。
+        // 实测单个私密账号的作品会稳定返回 10222，页面上却仍是 200 和完整外壳，
+        // 之前落到「页面里没找到 itemStruct」，用户只看到一直转圈，误以为 App 坏了。
+        if(html.contains("statusCode") && html.contains("10222"))
+            return "作品不可用（私密、已删除或限制访问）";
         if(html.contains("Couldn't find this account") || html.contains("Video currently unavailable"))
             return "作品不存在或已删除";
         return "";
