@@ -8,6 +8,69 @@
 
 ---
 
+## v2.1.1 — 2026-11-06
+
+本轮重点是 **YouTube 解析恢复**。YouTube 在 2026-11 改了播放器下发策略：网页端
+`ytInitialPlayerResponse.streamingData` 里的 `adaptiveFormats` **只剩下
+`itag` / `mimeType` / `contentLength` 这类元数据，`url` 和 `signatureCipher` 两个字段全部消失**
+（实测 `playabilityStatus=OK`、34 条 adaptive 格式、带 url 的 0 条）。
+这意味着流地址必须由服务端计算 n-challenge 才会下发，手机上抓页面拿不到任何直链。
+
+雪上加霜的是自建服务器的 yt-dlp 也挂了：服务器机场节点 `lxyus1.777078.xyz`
+IPv4/IPv6 全端口不通，而旧的 `proxy_alive()` 只测本地 10809 端口在不在，
+xray 进程活着就一直返回 True，导致每次解析都白等 240 秒 × 3 次重试 = 720 秒。
+
+### 新增
+
+**YouTube · Invidious 直连通道（`YtInvidious.java`，约 480 行）**
+- Invidious 是开源的 YouTube 前端，它在自己的服务端做完整解析，
+  `/api/v1/videos/{id}` 直接返回带 `url` 的 `adaptiveFormats`（实测 32 条全带 url）
+- 返回的 googlevideo 直链支持 Range（实测 206），手机可以直接拉流 / 下载
+- 5 个实例轮询，成功过的实例记在 `lastGood` 里下次优先，避免每次都从头试
+- **关键坑点**：请求必须走 `MainActivity.openConn()` 套手机代理。
+  实测直接 `new URL().openConnection()` 走系统直连，打 `yt.chocolatemoo53.com`
+  会 `SSLHandshakeException: connection closed`，而同一台机器 python（走本地代理）
+  访问同一地址 200 / 12105 字节 —— 公共实例在 TUN 直连路径上会被中断
+
+**YouTube · 本机 player.js 求解通道（`YtJsSolver.java`）**
+- 作为 Invidious 全部失效时的第二道保障
+- 调查结论：新版 player.js 已完全 VM 化混淆，
+  `Xn=function(a,b,c,...){var m=b^a; if((a-4&14)==2){ud(m^3463,m^78,c);...}}`
+  这类 opcode 分发的虚拟机调用取代了所有逻辑，经典的 `a=a.split("")`
+  特征全部消失，**静态正则提取 sig / n 函数已经完全不可行**
+- 因此改为用隐藏 WebView 跑 YouTube 自己的 player.js，让播放器自己算 n
+- 实测受限于本机代理链路（桌面 UA 抓 watch 页时断流 / 超时），
+  代码路径完整，网络良好时会自动兜住
+
+### 修复
+
+**YouTube 解析卡死（服务器端 `yt_module.py`）**
+- `proxy_alive()` 改为「通过代理发一个真实 HTTPS 请求」，
+  15 秒拿不到就判定不可用，结果缓存 60 秒
+- `_run_ytdlp()` 加 `_TOTAL_BUDGET = 70` 总预算，不再 240s × 3 = 720s 白等
+- 效果：`/api/yt/parse` 从「110 秒 0 字节」变成「0.1 秒返回明确错误」
+
+**YouTube 解析超时过长（App 端 `YtParser.httpGetApi`）**
+- 读超时从 600 秒（10 分钟）收到 75 秒，失败立刻提示而不是干等
+
+**TikTok 私密 / 已删除作品一直转圈（`TtParser.detectBlock`）**
+- 新增 `statusCode=10222` 识别，提示「作品不可用（私密、已删除或限制访问）」
+- 原来落到「页面里没找到 itemStruct」，用户只看到转圈，误以为 App 坏了
+
+**应用图标丢失**
+- `res/drawable-{m,h,xh,xxh,xxxh}dpi/ic_launcher.png` 五个文件全部丢失，
+  导致编译报 `No resource found that matches the given name (at 'icon' with value '@drawable/ic_launcher')`
+- 已从已安装的 APK 中提取恢复
+
+### 说明
+
+- YouTube 的 Invidious 通道走第三方公共实例，可用性随时会变
+  （实测 2026-11 除 `yt.chocolatemoo53.com` 外，其余全部 403 / 401 / 404 / SSL 中断）
+- 全部实例失效时会自动回退自建服务器
+- 服务器到期后 YouTube 解析仍可用，只是少了服务器这条兜底
+
+---
+
 ## v2.1.0 — 2026-11-03
 本轮重点是**磁力下载转正**、**TikTok / X 主页解析重做**，以及一串「列表 / 批量下载」相关 bug。
 
