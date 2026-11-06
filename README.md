@@ -96,7 +96,7 @@
 | 豆包 | 分享页内嵌 JSON → 递归取 `vid` → `POST samantha/media/get_play_info` `{"key":vid}` → `original_media_info.main_url` |
 | TikTok | 纯 HTTP + 自管 Cookie 会话，双页面模板互为兜底；下载走服务器中转（tikwm 直链） |
 | X（推特） | fxtwitter / syndication 双源纯 HTTP；挂代理直连 CDN，失败自动回退服务器中转；外链卡片深挖 |
-| YouTube | 服务器 yt-dlp 中转（需用户登录 Cookie + node 解 n-challenge）；播放直连优先、403 回退 `/api/yt/stream` 流式中转；下载走服务器中转（已缓存视频吃缓存） |
+| YouTube | **Invidious 直连优先**（免服务器、免登录，手机直连公共实例取带 url 的 adaptiveFormats）；失效后回退本机 player.js 求解；再回退服务器 yt-dlp |
 | 主页列表 | 服务器 `/api/profile/list`：YouTube/TikTok 用 yt-dlp flat，X 用页面正则 |
 | 数据提取 | 抖音优先 `window._ROUTER_DATA`，降级到 HTML 正则 |
 | JSON 解析 | 自实现轻量 `JP` 解析器，避免引入第三方依赖 |
@@ -199,7 +199,7 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 
 | 功能 | 为什么必须服务器 | 无服务器时的表现 |
 |---|---|---|
-| **YouTube 解析/播放/下载** | 解析接口在国内被墙（DNS 污染）；实测 googlevideo 直链绑定解析 IP，挂代理也拿不到；需用户登录 Cookie + 服务器 yt-dlp（node 解 n-challenge） | 提示「YouTube 需登录 + 服务器」 |
+| **YouTube 解析/播放/下载** | **v2.1.1 起本地可用**：Invidious 公共实例直连解析 + 手机直连取流（支持 Range），免服务器；实例全挂时回退本机 player.js 求解，再回退服务器 yt-dlp | 正常情况下完全不受影响；只有所有 Invidious 实例都失效时才会退到服务器 |
 | **YouTube 主页列表** | 同上，频道列表走 yt-dlp flat | 同单视频 |
 | **X 无代理时的播放/下载** | X 视频 CDN（video.twimg.com）国内 DNS 污染；没挂代理时只能服务器中转 | 提示用户挂代理；服务器可用时自动回退中转 |
 | **X 外链卡片深挖** | 短链（tinyurl 等）解跳 + 落地页抓取在服务器执行 | 纯卡片推提示「外链没挖到视频」 |
@@ -224,7 +224,8 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 - **Instagram 解析、主页、下载不受影响**（Cookie 存本地，全走你自己网络）
 - **TikTok / 快手 / X 主页列表自 v2.1.0 起不受影响**（本地 WebView 滚动收集 / x.com 网页直连）
 - **TikTok 下载自 v2.1.0 起本地优先**（本地 `TtParser`），X 挂代理可下载
-- YouTube 解析、主页列表、X 无代理时的中转、X 外链深挖不可用
+- **YouTube 单视频解析/播放/下载自 v2.1.1 起不受影响**（Invidious 直连 + 本机 player.js 求解，纯手机侧）
+- YouTube 主页列表、X 无代理时的中转、X 外链深挖不可用
 - 所有功能自动降级，不会崩
 
 > ⚠️ 服务端源码未进开源仓库（含 HMAC 鉴权与访客凭据池）。自建服务器可参考 README 技术实现章节自行实现（yt-dlp + ffmpeg + 机场代理即可），或联系作者获取服务端部署支持。
