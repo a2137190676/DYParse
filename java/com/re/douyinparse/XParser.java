@@ -654,7 +654,7 @@ public class XParser {
         HttpURLConnection c = null;
         try{
             // 一律直连（用户自己的网络/代理/TUN 自然生效）
-            c = (HttpURLConnection) new URL(url).openConnection(java.net.Proxy.NO_PROXY);
+            c = (HttpURLConnection) new URL(url).openConnection();
             c.setRequestProperty("User-Agent", UA);
             c.setRequestProperty("Accept", "application/json,*/*");
             if(isApi){
