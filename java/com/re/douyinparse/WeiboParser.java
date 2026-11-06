@@ -89,6 +89,9 @@ public class WeiboParser {
             uc.setRequestProperty("User-Agent",
                 "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
             uc.setRequestProperty("Accept", "application/json, text/plain, */*");
+            // 关键：不带这个头，微博 statuses/show 会返回 HTML 而不是 JSON
+            uc.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+            uc.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
             if(referer != null && referer.length() > 0) uc.setRequestProperty("Referer", referer);
             if(cookie != null && cookie.length() > 0) uc.setRequestProperty("Cookie", cookie);
             int code = uc.getResponseCode();
@@ -303,9 +306,32 @@ public class WeiboParser {
     static void resolveStatus(WbVideo v, String mid, String cookie){
         try{
             String api = "https://m.weibo.cn/statuses/show?id=" + mid;
-            String body = httpGet(api, "https://m.weibo.cn/", cookie);
-            if(body == null){ v.err = "微博接口无返回"; return; }
-            JSONObject root = new JSONObject(body);
+            // 关键：visitor SUB Cookie 会让微博返回「精简版」（page_info 直接没有）。
+            // 实测匿名请求才给完整 page_info，所以先用空 Cookie。
+            String body = httpGet(api, "https://m.weibo.cn/status/", "");
+            Log.i(TAG, "WB_STATUS_ANON len=" + (body == null ? 0 : body.length()));
+            JSONObject root = null;
+            if(body != null && body.trim().startsWith("{")){
+                try{ root = new JSONObject(body); }catch(Throwable t){}
+            }
+            // 匿名拿不到（HTML 或解析失败）再带 visitor Cookie 重试
+            if(root == null){
+                Log.i(TAG, "WB_STATUS_ANON_FAIL，改用 visitor Cookie 重试");
+                String b2 = httpGet(api, "https://m.weibo.cn/", cookie);
+                if(b2 != null && b2.trim().startsWith("{")){
+                    try{ root = new JSONObject(b2); }catch(Throwable t){}
+                }
+                if(root == null){
+                    v.err = "微博接口无返回（可能触发了风控）";
+                    return;
+                }
+            }
+            // 微博返回的是 {"ok":1,"data":{...}}，必须先解包 data 层
+            JSONObject inner = root.optJSONObject("data");
+            if(inner != null){
+                Log.i(TAG, "WB_UNWRAP data 层");
+                root = inner;
+            }
             v.id = mid;
             JSONObject user = root.optJSONObject("user");
             if(user != null){
@@ -319,6 +345,36 @@ public class WeiboParser {
             v.likeCount = root.optLong("attitudes_count", 0);
             // 视频
             JSONObject pageInfo = root.optJSONObject("page_info");
+            Log.i(TAG, "WB_PAGEINFO " + (pageInfo == null ? "NULL" : pageInfo.toString().substring(
+                    0, Math.min(400, pageInfo.toString().length()))));
+
+            // 关键：带 visitor Cookie 时微博会返回「精简版」，page_info 直接没有。
+            // 拿不到 page_info 就再发一次不带 Cookie 的请求（curl 实测能拿到完整数据）。
+            if(pageInfo == null){
+                try{
+                    String body2 = httpGet(api, "https://m.weibo.cn/", "");
+                    Log.i(TAG, "WB_RETRY_NOCOOKIE len=" + (body2 == null ? 0 : body2.length()));
+                    if(body2 != null && body2.length() > 100){
+                        JSONObject root2 = new JSONObject(body2);
+                        JSONObject pi2 = root2.optJSONObject("page_info");
+                        if(pi2 != null){
+                            Log.i(TAG, "WB_RETRY_GOT_PAGEINFO");
+                            pageInfo = pi2;
+                            // 顺带补上用户信息
+                            if(v.author.length() == 0){
+                                JSONObject u2 = root2.optJSONObject("user");
+                                if(u2 != null){
+                                    v.author = u2.optString("screen_name", "");
+                                    v.avatar = u2.optString("avatar_hd",
+                                            u2.optString("profile_image_url", ""));
+                                }
+                            }
+                        }
+                    }
+                }catch(Throwable t2){
+                    Log.i(TAG, "WB_RETRY_ERR " + t2);
+                }
+            }
             if(pageInfo != null){
                 String t = pageInfo.optString("type", "");
                 JSONObject mi = pageInfo.optJSONObject("media_info");
@@ -338,8 +394,42 @@ public class WeiboParser {
                     }
                     String su = mi.optString("stream_url", "");
                     String mp4 = mi.optString("mp4_720p_mp4", mi.optString("mp4_hd_url", ""));
-                    if(su.length() > 0) v.playUrl = su;
-                    else if(mp4.length() > 0) v.playUrl = mp4;
+                    // 微博转腾讯视频：stream_url 是 redirect_tencent_video.json?vid=xxx
+                    // 该跳转接口已失效（400），必须拿 vid 走腾讯自己的 getinfo
+                    if(su.indexOf("redirect_tencent_video") >= 0){
+                        String vid = "";
+                        int q = su.indexOf("vid=");
+                        if(q >= 0){
+                            String rest = su.substring(q + 4);
+                            StringBuilder sb = new StringBuilder();
+                            for(int k = 0; k < rest.length(); k++){
+                                char c = rest.charAt(k);
+                                if((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                                        || (c >= '0' && c <= '9')) sb.append(c);
+                                else break;
+                            }
+                            vid = sb.toString();
+                        }
+                        Log.i(TAG, "WB_TENCENT vid=" + vid);
+                        if(vid.length() >= 8){
+                            TxParser.TxVideo tv = TxParser.parse(
+                                    "https://v.qq.com/x/page/" + vid + ".html");
+                            if(tv.ok && tv.playUrl.length() > 0){
+                                v.playUrl = tv.playUrl;
+                                v.durMs = (long)(tv.durSec * 1000);
+                                for(String[] g : tv.gears){
+                                    v.gears.add(new String[]{ "腾讯" + g[0], g[1], "0", "0" });
+                                }
+                                Log.i(TAG, "WB_TENCENT_OK td=" + tv.durSec + " gears=" + tv.gears.size());
+                            } else {
+                                Log.i(TAG, "WB_TENCENT_FAIL " + tv.err);
+                            }
+                        }
+                    } else if(su.length() > 0){
+                        v.playUrl = su;
+                    } else if(mp4.length() > 0){
+                        v.playUrl = mp4;
+                    }
                     if(v.gears.size() > 0 && v.playUrl.length() == 0){
                         v.playUrl = v.gears.get(0)[1];
                     }
