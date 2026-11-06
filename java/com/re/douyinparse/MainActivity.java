@@ -63,6 +63,17 @@ public class MainActivity extends Activity {
     LinearLayout progressBox;
     TextView progressLabel, progressPct;
     ProgressBar progressBar;
+    /** 并发下载任务列表容器（每个任务一行） */
+    LinearLayout dlTaskList;
+    /** 任务 key -> 行内 TextView（文件名/状态）与 ProgressBar */
+    final java.util.HashMap<Integer, TextView> dlRowName = new java.util.HashMap<Integer, TextView>();
+    final java.util.HashMap<Integer, TextView> dlRowMeta = new java.util.HashMap<Integer, TextView>();
+    final java.util.HashMap<Integer, ProgressBar> dlRowBar = new java.util.HashMap<Integer, ProgressBar>();
+    /** 行 key -> 整行 View（删除某行时用） */
+    final java.util.HashMap<Integer, android.view.View> dlRowView =
+            new java.util.HashMap<Integer, android.view.View>();
+    /** 行顺序（保证列表稳定，不跳动） */
+    final java.util.ArrayList<Integer> dlRowOrder = new java.util.ArrayList<Integer>();
     volatile boolean progCancel = false;
     int miniVideoW = 0, miniVideoH = 0;
     boolean miniPrepared = false, miniSeeking = false, miniZoomedLongPress = false;
@@ -73,6 +84,10 @@ public class MainActivity extends Activity {
     long miniLastTapTime = 0;
     float miniLastTapX = 0;
     String curPlay="", curCover="", curWs="", curImgs="", curId="", curDesc="";
+    /** TikTok 实况图动轨（| 分隔，与 curImgs 一一对应） */
+    String curDyn = "";
+    /** 本条是否是实况图 */
+    boolean curIsLive = false;
     /** 抖音 4K 作品的 1080p 兜底地址：起播失败 / 解码不支持时自动降级，用户无感 */
     String curFallbackPlay="";
     /** 本次播放是否已经降级过一次（防止反复降级死循环） */
@@ -90,10 +105,14 @@ public class MainActivity extends Activity {
     // ===== 主题与关于 =====
     TextView btnTheme;
     boolean curDark = false;
+    /** 当前页签（主题切换后用它回到原页面） */
+    int settingsOrCurrentTab = 0;
     String curResult = "";
     static final String SP = "dyp_pref";
     static final String KEY_DARK = "dark_mode";
     static final String KEY_PROXY_ON = "proxy_on";       // 内置代理（服务器中转）开关，默认关
+    /** BT tracker 线路：0 极简 / 1 全部TCP / 2 全量（见 BtDownloader.setTrackMode） */
+    static final String KEY_BT_LINE = "bt_line";
     /** 抖音访客凭据 UIFID_TEMP：由真实浏览器通过挑战后签发，缺失时 detail 接口一律 403 */
     static final String KEY_UIFID = "dy_uifid_temp";
     /** 视频号凭据：腾讯元宝 Cookie（hy_user + hy_token），用于换 generalToken 解析视频流 */
@@ -189,6 +208,8 @@ public class MainActivity extends Activity {
     static boolean isSupportedParseUrl(String url){
         if(url == null || url.length() == 0) return false;
         String u = url.toLowerCase();
+        // 磁力链接 / .torrent 直链（BT 引擎处理，不走平台解析）
+        if(u.startsWith("magnet:") || u.contains(".torrent")) return true;
         // 抖音（含短链 v.douyin.com / iesdouyin / douyinpic 图床）
         if(u.contains("douyin.com") || u.contains("iesdouyin.com")
                 || u.contains("amemv.com") || u.contains("snssdk.com")
@@ -219,8 +240,14 @@ public class MainActivity extends Activity {
         if(XhsParser.isXhsUrl(u)) return true;
         // 微博（含 video.weibo.com / m.weibo.cn / t.cn / sinaimg）
         if(WeiboParser.isWeiboUrl(u)) return true;
+        // 腾讯视频
+        if(TxParser.isTxUrl(u)) return true;
         return false;
     }
+
+    /** X（Twitter）登录模式（WebView 登录 → 抓 Cookie，敏感账号主页需要） */
+    volatile boolean xLoginMode = false;
+    Thread xWatchThread = null;
 
     /** YouTube 登录模式（WebView 登录 → 抓 Cookie） */
     volatile boolean ytLoginMode = false;
@@ -239,6 +266,8 @@ public class MainActivity extends Activity {
     String dyLastCkSnap = null;
     /** 是否已经拿到过 UIFID_TEMP（只记录首次出现的时机） */
     volatile boolean dyUifidGot = false;
+    /** 本次登录页会话里是否已检测到登录成功 */
+    volatile boolean dyCookieLoggedIn = false;
     volatile boolean dyWatchRun = false;
     Thread dyWatchThread = null;
     /** 静默自动获取凭据：是否正在跑 / 完成后回调 */
@@ -293,7 +322,7 @@ public class MainActivity extends Activity {
                     ytCookieLast = full;
                     getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_YT_COOKIE, full).apply();
                     saveYtCookieLocal(full);
-                    Log.i("DYP", "YT_CK_GRAB len=" + full.length() + " head=" + full.substring(0, Math.min(60, full.length())));
+                    DypLog.i("YT_CK_GRAB len=" + full.length() + " head=" + full.substring(0, Math.min(60, full.length())));
                     uploadYtCookie(full);
                     h.post(new Runnable(){ public void run(){
                         s("YouTube 登录成功！Cookie 已保存，解析时自动使用");
@@ -302,7 +331,7 @@ public class MainActivity extends Activity {
                     }});
                 }
             }
-        }catch(Throwable t){ Log.i("DYP", "YT_CK_GRAB_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("YT_CK_GRAB_ERR " + t); }
     }
 
     // ================= Instagram Cookie（WebView 登录 → 抓取 → 本地直连） =================
@@ -340,14 +369,14 @@ public class MainActivity extends Activity {
             insCookieLast = full;
 
             int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_INS, full);
-            Log.i("DYP", "INS_CK_GRAB len=" + full.length() + " saved=" + n
+            DypLog.i("INS_CK_GRAB len=" + full.length() + " saved=" + n
                     + " file=" + CookieStore.filePath(MainActivity.this, CookieStore.PLATFORM_INS));
             // 只保存，不退出登录页——用户可能还要在页面里完成安全验证 / 解除风控
             h.post(new Runnable(){ public void run(){
                 s("Cookie 已保存（" + n + " 项），页面保留：需要的话先完成安全验证，再点右上「完成」");
                 updateInsLoginBar();
             }});
-        }catch(Throwable t){ Log.i("DYP", "INS_CK_GRAB_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("INS_CK_GRAB_ERR " + t); }
     }
 
     // ================= 抖音主页：桌面 UA + 登录态（唯一能拿全量列表的路径） =================
@@ -361,16 +390,27 @@ public class MainActivity extends Activity {
         boolean logged = dyProfileCookiesLikelyLoggedIn();
         int n = CookieStore.count(this, CookieStore.PLATFORM_DY);
         dypDlg()
-            .setTitle("抖音主页登录")
-            .setMessage("解析主页时要看到全部作品，需要登录抖音账号。\n\n"
-                + "实测结论：\n"
-                + "· 未登录：主页接口只回第一页，约 21 条，后面直接返回空\n"
-                + "· 已登录：可以逐页翻完（实测 49 条作品 3 页拿全）\n"
-                + "· 不需要访客凭据 UIFID，只要登录 Cookie + 签名就够\n\n"
-                + "说明：抖音没有移动版网页登录入口，网页端登录会要求手机 App 扫码验证，"
-                + "这是平台风控，无法绕过。\n"
-                + "推荐「手动填 Cookie」：电脑浏览器登录后复制过来，一次搞定。\n\n"
-                + "Cookie 只存手机本地，不上传服务器，也不发给任何第三方。\n"
+            .setTitle("抖音登录 / 风控处理")
+            .setMessage("【一、登录有什么用】\n"
+                + "· 未登录：主页只回第一页约 21 条，且极易触发风控\n"
+                + "· 已登录：主页可逐页翻完（实测 49 条 3 页拿全），风控强度大幅下降\n"
+                + "· 不需要访客凭据 UIFID，登录 Cookie + 签名就够\n\n"
+                + "【二、怎么登录】\n"
+                + "抖音没有移动版网页登录入口，网页登录要手机 App 扫码。\n"
+                + "推荐「手动填 Cookie」：电脑浏览器登录 douyin.com →\n"
+                + "F12 → Network → 任一请求 → 复制 Cookie 整串，粘贴进来即可。\n\n"
+                + "【三、遇到风控怎么办】\n"
+                + "界面出现「抱歉出错了」或反复要求滑块验证时：\n"
+                + "1. 先停手 10~15 分钟，期间不要点解析（风控按请求频率累加，\n"
+                + "   越点恢复越慢，重试太频繁会从滑块升级成完全拒绝）\n"
+                + "2. 确认已登录（见下方状态）；没登录就先登录一次\n"
+                + "3. 已登录还被风控 → 用「清除登录 Cookie」重登一次，\n"
+                + "   换一份新的 Cookie（旧的可能已被标记）\n"
+                + "4. 也可以换网络（WiFi ↔ 5G）后再试\n\n"
+                + "【四、需要清 Cookie 重登吗】\n"
+                + "· 刚登录且能正常解析 → 不用清\n"
+                + "· 登录很久了 / 一直风控 → 建议清掉重登（见操作菜单）\n\n"
+                + "Cookie 只存手机本地，不上传服务器，不发给任何第三方。\n"
                 + (logged ? "\n当前状态：已检测到登录票据。" : "\n当前状态：还没有登录。"))
             .setPositiveButton("选择操作", new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int w){
@@ -587,19 +627,61 @@ public class MainActivity extends Activity {
      *        → 本地文件（App 重启、WebView 数据被清后的兜底）
      *  注意：顺序不能反。本地文件是登录那一刻的快照，里面的 msToken 等签名字段不会更新，
      *  用它去翻页第 2 页就被服务端拒（这也是之前「第一次能拿 49 条、后面只 18 条」的原因）。 */
+    /**
+     * 解析抖音链接前，把本地保存的登录 Cookie 灌进 WebView。
+     *
+     * 为什么必须每次都灌：
+     *   用户「在设置里登录过」→ Cookie 存在 CookieStore（本地文件）。
+     *   但 WebView 的 CookieManager 是另一个存储，两者不同步。
+     *   restoreDyCookieToWebView() 只在启动跑一次，而且发现 WebView
+     *   里有 sessionid 就直接 return —— 实际那个 sessionid 可能是
+     *   很久以前的半截，或者压根只有 ttwid。
+     *   结果：解析用的是匿名会话 → 天天风控。
+     *
+     * 这里在每次解析前无条件补齐，成本只是遍历几十个 key=value。
+     */
+    void injectDyCookieBeforeParse(){
+        try{
+            String local = CookieStore.header(this, CookieStore.PLATFORM_DY);
+            if(local == null || local.trim().length() < 32){
+                DypLog.i("DY_CK_INJECT skip 本地无登录态");
+                return;
+            }
+            boolean hasLogin = local.indexOf("sessionid=") >= 0
+                    || local.indexOf("sid_tt=") >= 0
+                    || local.indexOf("sid_guard=") >= 0;
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            int n = 0;
+            for(String kv : local.split("[;\n\r]+")){
+                String t = kv.trim();
+                if(t.length() < 3 || t.indexOf('=') <= 0) continue;
+                // 两个域都灌：抖音的分享页在 iesdouyin，主站在 douyin
+                cm.setCookie("https://www.douyin.com/", t + "; path=/");
+                cm.setCookie("https://www.iesdouyin.com/", t + "; path=/");
+                n++;
+            }
+            try{ cm.flush(); }catch(Throwable t){}
+            DypLog.i("DY_CK_INJECT n=" + n + " hasLogin=" + hasLogin
+                    + " hasSid=" + (local.indexOf("sessionid=") >= 0));
+        }catch(Throwable t){
+            DypLog.i("DY_CK_INJECT_ERR " + t);
+        }
+    }
+
     String dyEffectiveCookie(){
         try{
             String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
             if(cm != null && cm.length() > 0
                     && (cm.indexOf("sessionid=") >= 0 || cm.indexOf("sid_tt=") >= 0)){
-                Log.i("DYP", "DY_CK_SOURCE webview(live) len=" + cm.length());
+                DypLog.i("DY_CK_SOURCE webview(live) len=" + cm.length());
                 return cm;
             }
         }catch(Throwable t){}
         try{
             String local = CookieStore.header(this, CookieStore.PLATFORM_DY);
             if(local != null && local.trim().length() > 0){
-                Log.i("DYP", "DY_CK_SOURCE local(fallback) len=" + local.length());
+                DypLog.i("DY_CK_SOURCE local(fallback) len=" + local.length());
                 return local;
             }
         }catch(Throwable t){}
@@ -614,11 +696,11 @@ public class MainActivity extends Activity {
             String local = CookieStore.header(this, CookieStore.PLATFORM_DY);
             if(local == null || local.length() < 32) return;
             String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
-            boolean liveOk = cm != null && (cm.indexOf("sessionid=") >= 0 || cm.indexOf("sid_tt=") >= 0);
-            if(liveOk) {
-                Log.i("DYP", "DY_CK_RESTORE skip webview_already_ok");
-                return;
-            }
+            // 注意：这里不要因为「WebView 里看着有 sessionid」就跳过。
+            // WebView 的 Cookie 可能是很早以前的半截，而本地文件才是刚登录的真凭据。
+            // 以本地为准，直接覆盖灌入（同名 key 后写覆盖前写）。
+            DypLog.i("DY_CK_RESTORE force 以本地为准 len(local)="
+                    + local.length() + " len(web)=" + (cm == null ? 0 : cm.length()));
             android.webkit.CookieManager c = android.webkit.CookieManager.getInstance();
             int n = 0;
             for(String kv : local.split(";")){
@@ -633,9 +715,9 @@ public class MainActivity extends Activity {
                 n++;
             }
             c.flush();
-            Log.i("DYP", "DY_CK_RESTORE ok n=" + n);
+            DypLog.i("DY_CK_RESTORE ok n=" + n);
         }catch(Throwable t){
-            Log.i("DYP", "DY_CK_RESTORE_ERR " + t);
+            DypLog.i("DY_CK_RESTORE_ERR " + t);
         }
     }
 
@@ -724,7 +806,7 @@ public class MainActivity extends Activity {
             flp.gravity = android.view.Gravity.TOP;
             host.addView(bar, flp);
             bar.bringToFront();
-        }catch(Throwable t){ Log.i("DYP", "INS_BAR_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("INS_BAR_ERR " + t); }
     }
 
     void hideInsLoginBar(){
@@ -804,13 +886,13 @@ public class MainActivity extends Activity {
             // 抓到新的 SESSDATA，作废旧的 buvid3 缓存，让下次请求重新拼
             BiliParser.buvid3 = "";
             BiliParser.biliLoginLogged = false;
-            Log.i("DYP", "BILI_CK_GRAB len=" + full.length() + " saved=" + n
+            DypLog.i("BILI_CK_GRAB len=" + full.length() + " saved=" + n
                     + " file=" + CookieStore.filePath(MainActivity.this, CookieStore.PLATFORM_BILI));
             h.post(new Runnable(){ public void run(){
                 s("B站 Cookie 已保存（" + n + " 项），页面保留：需要的话先完成验证，再点右上「完成」");
                 updateBiliLoginBar();
             }});
-        }catch(Throwable t){ Log.i("DYP", "BILI_CK_GRAB_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("BILI_CK_GRAB_ERR " + t); }
     }
 
     /** 抖音登录/凭据抓取模式：WebView 打开抖音网页，从请求头抓 UIFID_TEMP（HttpOnly） */
@@ -842,7 +924,7 @@ public class MainActivity extends Activity {
         }catch(Throwable t){}
         web.loadUrl("https://www.douyin.com/");
         startDyCookieWatch();
-        Log.i("DYP", "DY_LOGIN_START");
+        DypLog.i("DY_LOGIN_START");
     }
 
     /** 探测指定页面的 Cookie 下发时机（--es dyurl <url> 启动） */
@@ -872,7 +954,7 @@ public class MainActivity extends Activity {
             }
             ws.setUserAgentString(DyDetail.UA);
         }catch(Throwable t){}
-        Log.i("DYP", "DY_PROBE_URL " + target);
+        DypLog.i("DY_PROBE_URL " + target);
         web.loadUrl(target);
         startDyCookieWatch();
     }
@@ -882,7 +964,7 @@ public class MainActivity extends Activity {
         dyLoginMode = false;
         dyProbe = null;
         stopDyCookieWatch();
-        Log.i("DYP", "DY_LOGIN_STOP");
+        DypLog.i("DY_LOGIN_STOP");
     }
 
     /** 当前是否已有抖音访客凭据 */
@@ -902,18 +984,18 @@ public class MainActivity extends Activity {
             try{
                 String ck = CookieManager.getInstance().getCookie("https://www.douyin.com/");
                 String v = pickUifid(ck);
-                if(v.length() >= 32){ Log.i("DYP", "DY_UID_SRC webview len=" + v.length()); return v; }
+                if(v.length() >= 32){ DypLog.i("DY_UID_SRC webview len=" + v.length()); return v; }
             }catch(Throwable t){}
             // 2) 本地文件
             try{
                 String ck = CookieStore.header(this, CookieStore.PLATFORM_DY);
                 String v = pickUifid(ck);
-                if(v.length() >= 32){ Log.i("DYP", "DY_UID_SRC local len=" + v.length()); return v; }
+                if(v.length() >= 32){ DypLog.i("DY_UID_SRC local len=" + v.length()); return v; }
             }catch(Throwable t){}
             // 3) 访客凭据
             if(!dyHasUifid()) return "";
             String v2 = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_UIFID, "");
-            if(v2 != null && v2.length() > 0) Log.i("DYP", "DY_UID_SRC sp len=" + v2.length());
+            if(v2 != null && v2.length() > 0) DypLog.i("DY_UID_SRC sp len=" + v2.length());
             return v2 == null ? "" : v2;
         }catch(Throwable t){ return ""; }
     }
@@ -949,7 +1031,7 @@ public class MainActivity extends Activity {
         }
         dyAutoRunning = true;
         dyAutoCallback = onDone;
-        Log.i("DYP", "DY_AUTO_START 开始静默获取访客凭据");
+        DypLog.i("DY_AUTO_START 开始静默获取访客凭据");
 
         h.post(new Runnable(){ public void run(){
             try{
@@ -976,7 +1058,7 @@ public class MainActivity extends Activity {
 
                 w.setWebViewClient(new WebViewClient(){
                     public void onPageFinished(WebView vw, String u){
-                        Log.i("DYP", "DY_AUTO_PAGE " + u);
+                        DypLog.i("DY_AUTO_PAGE " + u);
                     }
                 });
 
@@ -1000,11 +1082,11 @@ public class MainActivity extends Activity {
 
                     if(got.length() >= 32){
                         getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_UIFID, got).apply();
-                        Log.i("DYP", "DY_AUTO_OK len=" + got.length()
+                        DypLog.i("DY_AUTO_OK len=" + got.length()
                             + " cost=" + (System.currentTimeMillis() - t0) + "ms");
                         done = true;
                     } else if(System.currentTimeMillis() - t0 > 20000){
-                        Log.i("DYP", "DY_AUTO_TIMEOUT 20s 未拿到凭据");
+                        DypLog.i("DY_AUTO_TIMEOUT 20s 未拿到凭据");
                         done = true;
                     }
 
@@ -1022,7 +1104,7 @@ public class MainActivity extends Activity {
                 h.postDelayed(poll[0], 2500);
                 w.loadUrl("https://www.douyin.com/");
             }catch(Throwable t){
-                Log.i("DYP", "DY_AUTO_ERR " + t);
+                DypLog.i("DY_AUTO_ERR " + t);
                 dyAutoRunning = false;
                 Runnable cb = dyAutoCallback;
                 dyAutoCallback = null;
@@ -1038,6 +1120,9 @@ public class MainActivity extends Activity {
             String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
             String ufTemp = "";
             String ufPlain = "";
+            String sessId = "";
+            String sidTt = "";
+            String uidTt = "";
             StringBuilder nm = new StringBuilder();
             if(cm != null){
                 for(String kv : cm.split(";")){
@@ -1048,13 +1133,20 @@ public class MainActivity extends Activity {
                     String v3 = kv.substring(e3 + 1).trim();
                     if(k3.equals("UIFID_TEMP")) ufTemp = v3;
                     else if(k3.equals("UIFID") || k3.equals("uifid")) ufPlain = v3;
+                    else if(k3.equals("sessionid") || k3.equals("sessionid_ss")) sessId = v3;
+                    else if(k3.equals("sid_tt")) sidTt = v3;
+                    else if(k3.equals("uid_tt")) uidTt = v3;
                 }
             }
+            // 真正的登录凭据：sessionid 或 sid_tt 够长才算登录成功
+            boolean loggedIn = sessId.length() >= 8 || sidTt.length() >= 8;
             // 只在内容有变化时打日志，避免刷屏
             if(cm != null && cm.equals(dyLastCkSnap)) return;
             dyLastCkSnap = cm;
-            Log.i("DYP","DY_CK[" + tag + "] len=" + (cm==null?-1:cm.length())
+            DypLog.i("DY_CK[" + tag + "] len=" + (cm==null?-1:cm.length())
                 + " TEMP=" + ufTemp.length() + " UIFID=" + ufPlain.length()
+                + " sessionid=" + sessId.length() + " sid_tt=" + sidTt.length()
+                + " uid_tt=" + uidTt.length() + " loggedIn=" + loggedIn
                 + " names=" + nm);
             // 优先用 UIFID_TEMP；没有时退回 UIFID
             String uf = ufTemp.length() >= 32 ? ufTemp : ufPlain;
@@ -1063,9 +1155,25 @@ public class MainActivity extends Activity {
                 dyUifidGot = true;
                 dyCookieLast = cm;
                 getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_UIFID, uf).apply();
-                Log.i("DYP","DY_UIFID_SAVED firstGotAt=" + tag + " src=" + src + " len=" + uf.length());
+                DypLog.i("DY_UIFID_SAVED firstGotAt=" + tag + " src=" + src + " len=" + uf.length());
             }
-        }catch(Throwable t5){ Log.i("DYP","DY_CK_ERR " + t5); }
+            // 登录成功：完整 Cookie 落盘（只存本机，不上传），并自动退出登录页
+            if(loggedIn && cm != null && cm.length() > 40){
+                dyCookieLast = cm;
+                try{
+                    CookieStore.save(MainActivity.this, CookieStore.PLATFORM_DY, cm);
+                    DypLog.i("DY_LOGIN_CK_SAVED len=" + cm.length());
+                }catch(Throwable t6){ DypLog.i("DY_LOGIN_SAVE_ERR " + t6); }
+                if(!dyCookieLoggedIn){
+                    dyCookieLoggedIn = true;
+                    DypLog.i("DY_LOGIN_OK 自动退出登录页");
+                    h.post(new Runnable(){ public void run(){
+                        try{ stopDyLogin(); }catch(Throwable t7){}
+                        showHintToast("抖音已登录 · 主页可解析全部作品");
+                    }});
+                }
+            }
+        }catch(Throwable t5){ DypLog.i("DY_CK_ERR " + t5); }
     }
 
     /** 启动 Cookie 轮询（抖音凭据抓取期间每 3 秒查一次） */
@@ -1074,14 +1182,15 @@ public class MainActivity extends Activity {
         dyWatchRun = true;
         dyWatchThread = new Thread(new Runnable(){ public void run(){
             int sec = 0;
-            while(dyWatchRun && sec < 90){
-                try{ Thread.sleep(3000); }catch(Throwable t){ break; }
-                sec += 3;
+            // 扫码登录是异步的，90 秒经常不够，拉到 5 分钟 / 2 秒一查
+            while(dyWatchRun && sec < 300){
+                try{ Thread.sleep(2000); }catch(Throwable t){ break; }
+                sec += 2;
                 if(!dyWatchRun) break;
                 final int s2 = sec;
                 h.post(new Runnable(){ public void run(){ checkDyCookie("t" + s2 + "s"); }});
             }
-            Log.i("DYP","DY_WATCH_END");
+            DypLog.i("DY_WATCH_END");
         }});
         dyWatchThread.start();
     }
@@ -1126,6 +1235,144 @@ public class MainActivity extends Activity {
     android.widget.Button biliBarDone;
 
     /** 抖音登录页顶部操作条：显示 Cookie 抓取状态 + 完成/取消 */
+    // ============================================================
+    // 风控操作条
+    //
+    // 为什么需要它：
+    //   抖音验证通过后，URL 经常还停在 verify 页，代码没法从 URL 判断
+    //   「用户到底过没过」。以前硬猜，结果是死循环或永久卡住。
+    //   现在把判断权交给用户：页面上叠一条条，
+    //   用户过完验证自己点「我已完成验证」，App 就存 Cookie 收页面。
+    // ============================================================
+
+    LinearLayout riskBar = null;
+
+    /** 风控操作条：✓ 我已完成验证 / 重试 / 关闭 */
+    void showRiskBar(){
+        try{
+            if(riskBar != null && riskBar.getParent() != null) return;
+            android.view.ViewGroup host = (web == null) ? null
+                    : (web.getParent() instanceof android.view.ViewGroup
+                        ? (android.view.ViewGroup) web.getParent() : null);
+            if(host == null){ DypLog.i("RISK_BAR no_host"); return; }
+
+            LinearLayout bar = new LinearLayout(this);
+            bar.setOrientation(LinearLayout.HORIZONTAL);
+            bar.setBackgroundColor(curDark ? 0xEE22262E : 0xEEFFFFFF);
+            bar.setPadding(dp(10), dp(8), dp(8), dp(8));
+            bar.setId(900005);
+
+            TextView tip = new TextView(this);
+            tip.setTextSize(11);
+            tip.setTextColor(curDark ? 0xFFB8BEC9 : 0xFF4B5563);
+            tip.setText("验证完成后点右边 →");
+            LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            bar.addView(tip, lp1);
+
+            android.widget.Button bOk = new android.widget.Button(this);
+            bOk.setText("我已完成验证");
+            bOk.setTextSize(12);
+            bOk.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                // 用户说过了 → 存 Cookie，收起网页，回到解析页
+                try{ saveDyCookieAfterVerify(); }catch(Throwable t){
+                    DypLog.i("RISK_BAR_SAVE_ERR " + t);
+                }
+                curRiskBlocked = false;
+                riskRetryUrl = "";
+                riskAutoRetry = 0;
+                riskLastRetryMs = 0L;
+                DypLog.i("RISK_BAR_USER_OK 用户确认已完成验证");
+                hideRiskBar();
+                try{
+                    web.setVisibility(View.GONE);
+                    web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+                    pageParse.setVisibility(View.VISIBLE);
+                }catch(Throwable t){}
+                showHintToast("已验证并已保存。请点「解析」重试一次");
+                s("验证已完成，请点「解析」重试");
+            }});
+            bar.addView(bOk);
+
+            android.widget.Button bRetry = new android.widget.Button(this);
+            bRetry.setText("重试");
+            bRetry.setTextSize(12);
+            bRetry.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                // 用户自己点的重试，不受自动重试上限限制
+                final String u = (riskRetryUrl != null && riskRetryUrl.length() > 0)
+                        ? riskRetryUrl : curUrl;
+                DypLog.i("RISK_BAR_USER_RETRY " + u);
+                hideRiskBar();
+                curRiskBlocked = false;
+                riskRetryUrl = "";
+                riskAutoRetry = 0;
+                riskLastRetryMs = 0L;
+                try{
+                    web.setVisibility(View.GONE);
+                    web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+                    pageParse.setVisibility(View.VISIBLE);
+                }catch(Throwable t){}
+                if(u != null && u.length() > 0){
+                    final String uu = u;
+                    h.postDelayed(new Runnable(){ public void run(){
+                        try{ loadForParse(uu); }catch(Throwable t){}
+                    }}, 600);
+                }
+            }});
+            bar.addView(bRetry);
+
+            android.widget.Button bClose = new android.widget.Button(this);
+            bClose.setText("关闭");
+            bClose.setTextSize(12);
+            bClose.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                DypLog.i("RISK_BAR_USER_CLOSE");
+                hideRiskBar();
+                curRiskBlocked = false;
+                riskRetryUrl = "";
+                riskAutoRetry = 0;
+                try{
+                    web.setVisibility(View.GONE);
+                    web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+                    pageParse.setVisibility(View.VISIBLE);
+                }catch(Throwable t){}
+                showHintToast("已关闭。风控通常需要等 10~15 分钟再试");
+                s("就绪");
+            }});
+            bar.addView(bClose);
+
+            android.view.ViewGroup.LayoutParams flp;
+            if(host instanceof android.widget.FrameLayout){
+                android.widget.FrameLayout.LayoutParams p =
+                    new android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+                p.gravity = android.view.Gravity.BOTTOM;
+                flp = p;
+            } else if(host instanceof LinearLayout){
+                flp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            } else {
+                flp = new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            }
+            host.addView(bar, flp);
+            bar.bringToFront();
+            riskBar = bar;
+            DypLog.i("RISK_BAR_SHOWN");
+        }catch(Throwable t){ DypLog.i("RISK_BAR_ERR " + t); }
+    }
+
+    void hideRiskBar(){
+        try{
+            if(riskBar != null && riskBar.getParent() instanceof android.view.ViewGroup){
+                ((android.view.ViewGroup) riskBar.getParent()).removeView(riskBar);
+            }
+        }catch(Throwable t){}
+        riskBar = null;
+    }
+
     void showDyLoginBar(){
         try{
             if(dyBarDone != null && dyBarDone.getParent() != null) return;
@@ -1267,7 +1514,7 @@ public class MainActivity extends Activity {
             }
             host.addView(bar, flp);
             bar.bringToFront();
-        }catch(Throwable t){ Log.i("DYP", "BILI_BAR_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("BILI_BAR_ERR " + t); }
     }
 
     void hideBiliLoginBar(){
@@ -1314,7 +1561,7 @@ public class MainActivity extends Activity {
                 String body = "{\"uid\":\"" + ytUid(MainActivity.this) + "\",\"cookie\":\""
                         + ck.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
                 java.net.URL u = new java.net.URL(srv + "/api/yt/cookie");
-                c = (HttpURLConnection) u.openConnection(java.net.Proxy.NO_PROXY);
+                c = (HttpURLConnection) u.openConnection();
                 c.setRequestMethod("POST");
                 c.setDoOutput(true);
                 c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
@@ -1336,15 +1583,15 @@ public class MainActivity extends Activity {
                         c.setRequestProperty("X-NONCE", nonce);
                         c.setRequestProperty("X-SIGN", sb.toString());
                     }
-                }catch(Throwable t){ Log.i("DYP", "YT_CK_SIGN_ERR " + t); }
+                }catch(Throwable t){ DypLog.i("YT_CK_SIGN_ERR " + t); }
                 c.setConnectTimeout(15000);
                 c.setReadTimeout(15000);
                 java.io.OutputStream os = c.getOutputStream();
                 os.write(body.getBytes("UTF-8"));
                 os.close();
                 int code = c.getResponseCode();
-                Log.i("DYP", "YT_CK_UPLOAD http=" + code);
-            }catch(Throwable t){ Log.i("DYP", "YT_CK_UPLOAD_ERR " + t); }
+                DypLog.i("YT_CK_UPLOAD http=" + code);
+            }catch(Throwable t){ DypLog.i("YT_CK_UPLOAD_ERR " + t); }
             finally{
                 try{ if(c != null) c.disconnect(); }catch(Throwable t){}
                 ytCkUploading = false;
@@ -1353,6 +1600,121 @@ public class MainActivity extends Activity {
     }
 
     /** YouTube 登录 WebView：加载 YouTube 首页让用户自己点「登录」（YouTube 域登录 Google 不拦） */
+    /** X（Twitter）登录：WebView 加载 x.com 让用户自己登录，登录后自动抓 Cookie */
+    void startXLogin(){
+        switchTab(0);
+        setupWebView();
+        ytLoginMode = false;
+        insLoginMode = false;
+        biliLoginMode = false;
+        dyLoginMode = false;
+        xLoginMode = true;
+        try{
+            pageParse.setVisibility(View.GONE);
+            web.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        }catch(Throwable t){}
+        web.setVisibility(View.VISIBLE);
+        web.bringToFront();
+        try{
+            WebSettings ws = web.getSettings();
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                ws.setForceDark(WebSettings.FORCE_DARK_OFF);
+            }
+            if(android.os.Build.VERSION.SDK_INT >= 33){
+                ws.setAlgorithmicDarkeningAllowed(false);
+            }
+            // 桌面 UA：X 网页版登录入口只在桌面页可用
+            ws.setUserAgentString(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        }catch(Throwable t){}
+        injectXCookiesToWebView();
+        web.loadUrl("https://x.com/i/flow/login");
+        startXCookieWatch();
+        DypLog.i("X_LOGIN_START");
+    }
+
+    /** 退出 X 登录模式（恢复 UA / 恢复解析页，抓到 Cookie 后自动调用） */
+    void stopXLogin(){
+        xLoginMode = false;
+        try{
+            if(web != null && webReady){
+                WebSettings ws = web.getSettings();
+                ws.setUserAgentString(MUA);
+            }
+        }catch(Throwable t){}
+        try{
+            if(web != null){
+                web.loadUrl("about:blank");
+                web.setVisibility(View.GONE);
+                web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+            }
+            if(pageParse != null) pageParse.setVisibility(View.VISIBLE);
+        }catch(Throwable t){}
+    }
+
+    /** 把本地保存的 X Cookie 灌进 WebView（重启后仍保持登录态） */
+    void injectXCookiesToWebView(){
+        try{
+            java.util.Map<String, String> m = CookieStore.load(this, CookieStore.PLATFORM_X);
+            if(m.isEmpty()){
+                DypLog.i("X_CK_INJECT skip (empty)");
+                return;
+            }
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            int c = 0;
+            for(java.util.Map.Entry<String, String> e : m.entrySet()){
+                String kv = e.getKey() + "=" + e.getValue();
+                cm.setCookie("https://x.com/", kv);
+                cm.setCookie("https://twitter.com/", kv);
+                c++;
+            }
+            DypLog.i("X_CK_INJECT n=" + c);
+        }catch(Throwable t){ DypLog.i("X_CK_INJECT_ERR " + t); }
+    }
+
+    /** 轮询抓 X 登录 Cookie（auth_token + ct0 才算登录成功） */
+    void startXCookieWatch(){
+        if(xWatchThread != null) return;
+        xWatchThread = new Thread(new Runnable(){ public void run(){
+            int sec = 0;
+            boolean saved = false;
+            while(xLoginMode && sec < 300){
+                try{ Thread.sleep(2000); }catch(Throwable t){ break; }
+                sec += 2;
+                if(!xLoginMode) break;
+                try{
+                    String ck = android.webkit.CookieManager.getInstance()
+                            .getCookie("https://x.com/");
+                    if(ck == null) ck = "";
+                    java.util.Map<String, String> cmap = CookieStore.parse(ck);
+                    String auth = cmap.containsKey("auth_token") ? cmap.get("auth_token") : "";
+                    String ct0 = cmap.containsKey("ct0") ? cmap.get("ct0") : "";
+                    DypLog.i("X_CK_WATCH sec=" + sec + " len=" + ck.length()
+                            + " auth=" + auth.length() + " ct0=" + ct0.length());
+                    if(auth.length() >= 16 && ct0.length() >= 16){
+                        int cnt = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_X, ck);
+                        DypLog.i("X_CK_SAVED n=" + cnt);
+                        if(!saved){
+                            saved = true;
+                            h.post(new Runnable(){ public void run(){
+                                showHintToast("X 已登录 · 主页可解析");
+                                s("X 登录成功，Cookie 已保存到本机");
+                                stopXLogin();
+                                buildSettingsPage();
+                            }});
+                        }
+                        break;
+                    }
+                }catch(Throwable t){ DypLog.i("X_CK_WATCH_ERR " + t); }
+            }
+            DypLog.i("X_CK_WATCH_END sec=" + sec);
+        }});
+        xWatchThread.start();
+    }
+
     void startYtLogin(){
         switchTab(0);
         setupWebView();
@@ -1410,9 +1772,9 @@ public class MainActivity extends Activity {
     void saveYtCookieLocal(String full){
         try{
             int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_YT, full);
-            Log.i("DYP", "YT_CK_LOCAL n=" + n + " file="
+            DypLog.i("YT_CK_LOCAL n=" + n + " file="
                     + CookieStore.filePath(MainActivity.this, CookieStore.PLATFORM_YT));
-        }catch(Throwable t){ Log.i("DYP", "YT_CK_LOCAL_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("YT_CK_LOCAL_ERR " + t); }
     }
 
     /** 本地是否已有 YouTube Cookie */
@@ -1462,6 +1824,15 @@ public class MainActivity extends Activity {
         return (HttpURLConnection)(px != null ? u.openConnection(px) : u.openConnection());
     }
 
+    /** 取 URL 的 host，用于日志定位（不做异常抛出） */
+    static String hostOf(String url){
+        try{
+            if(url == null) return "null";
+            if(url.startsWith("/")) return "local";
+            return new java.net.URL(url).getHost();
+        }catch(Throwable t){ return "bad:" + url; }
+    }
+
     /** 强制把 host 解析成 IPv4（绕开设备 IPv6-only 导致的 UnknownHost） */
     static String ipv4Host(String host){
         try{
@@ -1493,7 +1864,7 @@ public class MainActivity extends Activity {
         try{
             return openConn(url);
         }catch(java.net.UnknownHostException e){
-            Log.i("DYP", "IPV4_FALLBACK " + url.substring(0, Math.min(80, url.length())));
+            DypLog.i("IPV4_FALLBACK " + url.substring(0, Math.min(80, url.length())));
             Proxy px = curProxyFor(url);
             URL u2 = new URL(url);
             String h = u2.getHost();
@@ -1603,21 +1974,54 @@ public class MainActivity extends Activity {
      +"XMLHttpRequest.prototype.send=function(){var x=this;try{x.addEventListener('load',function(){try{rec(x.__du,x.responseText);}catch(e){}});}catch(e){}return os.apply(this,arguments);};"
      +"}catch(e){}})();";
 
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration cfg){
+        super.onConfigurationChanged(cfg);
+        try{
+            if(THEME_FOLLOW.equals(themeMode())){
+                boolean now = systemDark();
+                if(now != curDark){
+                    DypLog.i("THEME_FOLLOW_CHANGED dark=" + now);
+                    curDark = now;
+                    applyTheme(curDark);
+                }
+                refreshThemeDependents();
+            }else{
+                applyTheme(curDark);
+            }
+            if(btnTheme != null) btnTheme.setText(themeButtonLabel());
+        }catch(Throwable t){
+            DypLog.i("THEME_CFG_ERR " + t);
+        }
+    }
+
     protected void onCreate(Bundle b){
         super.onCreate(b);
         savedState = b;
         // 日志系统：先初始化，后面所有失败信息才有地方落盘
+        appBootAt = System.currentTimeMillis();
         DiagLog.init(this);
         AppInfo.init(this);
         installCrashHandler();
         // 把本地保存的各平台 Cookie 灌回 WebView（不覆盖已有的实时 Cookie）
         try{ restoreDyCookieToWebView(); }catch(Throwable t){}
+        // 把已保存的 BT tracker 线路同步给下载引擎
+        try{ syncBtLine(); }catch(Throwable t){}
         DiagLog.i(DiagLog.M_APP, "=== App 启动 === " + AppInfo.versionLine() + " | " + AppInfo.deviceLine());
-        Log.i("DYP", "SRV_DEBUG addr=[" + SrvSecret.serverAddr() + "] hmacLen=" + SrvSecret.hmacKey().length());
+        DypLog.i("SRV_DEBUG addr=[" + SrvSecret.serverAddr() + "] hmacLen=" + SrvSecret.hmacKey().length());
         appLog("启动", "v" + versionName() + " (build " + curVersionCode() + ") 内置服务器=" + (SrvSecret.serverAddr().length() > 0 ? "ON" : "OFF"));
         setContentView(R.layout.activity_main);
         // 列表内容恢复：批量解析结果退出重进仍在（受「保留解析列表」开关控制）
-        h.postDelayed(new Runnable(){ public void run(){ loadBatchList(); }}, 600);
+        h.postDelayed(new Runnable(){ public void run(){
+            loadBatchList();
+            // 三个子页签的数据池（批量解析 / 视频图文 / 主页解析）也要恢复，
+            // 否则重启后列表页三个子页签全是 0 条。
+            loadListPools();
+        }}, 600);
+        // 恢复上次没下完的下载任务（退出软件后继续下载）
+        // 不再自动续传：只把上次没下完的任务「列到下载页」，由用户手动点「继续」。
+        // （用户要求：去掉打开软件自动恢复，全部走下载列表手动恢复）
+        h.postDelayed(new Runnable(){ public void run(){ showSavedDlTasks(); }}, 800);
         // 启动动画：盖在内容之上，620ms 后自动移除；不影响解析流程
         if(b == null){
             try{ SplashOverlay.show(this, isDarkMode(), null); }catch(Throwable t){}
@@ -1628,6 +2032,23 @@ public class MainActivity extends Activity {
         }
         input=(EditText)findViewById(R.id.input);
         btn=(TextView)findViewById(R.id.btn);
+        // 解析页顶部「支持 N 个平台」文案：按 PLATFORM_LIST 动态生成，
+        // 以后再加平台不用回来改布局（以前 xml 里写死 20 个，加了平台就对不上）。
+        try{
+            TextView tvPb = (TextView)findViewById(R.id.tvPlatBar);
+            if(tvPb != null){
+                StringBuilder pb = new StringBuilder();
+                for(int i = 0; i < PLATFORM_LIST.length; i++){
+                    String nm = PLATFORM_LIST[i];
+                    // 「X（推特）」简写成「X」，「微信公众号」简写成「公众号」
+                    if(nm.startsWith("X（")) nm = "X";
+                    if("微信公众号".equals(nm)) nm = "公众号";
+                    if(pb.length() > 0) pb.append('·');
+                    pb.append(nm);
+                }
+                tvPb.setText("支持 " + PLATFORM_LIST.length + " 个平台：" + pb);
+            }
+        }catch(Throwable t){}
         status=(TextView)findViewById(R.id.status);
         out=(LinearLayout)findViewById(R.id.out);
         // WebView 改为懒加载：抖音解析时才初始化，避免拖慢冷启动
@@ -1643,20 +2064,27 @@ public class MainActivity extends Activity {
         btnMusic=(TextView)findViewById(R.id.btnMusic);
         btnMusic.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ downloadBgm(); }});
         progressBox=(LinearLayout)findViewById(R.id.progressBox);
+        // 开屏兜底：解析页进度框默认隐藏（只在真正下载/转码时由 progShow 打开）
+        if(progressBox != null) progressBox.setVisibility(View.GONE);
         progressLabel=(TextView)findViewById(R.id.progressLabel);
         progressPct=(TextView)findViewById(R.id.progressPct);
         progressBar=(ProgressBar)findViewById(R.id.progressBar);
+        dlTaskList=(LinearLayout)findViewById(R.id.dlTaskList);
         video=(android.view.TextureView)findViewById(R.id.video);
         // 右上角「设置」按钮已移除：设置走「设置」页签（switchTab(3) 仍在 tab 栏）
         btnTheme=(TextView)findViewById(R.id.btnTheme);
         if(btnTheme != null){
-            btnTheme.setText(isDarkMode() ? "亮" : "暗");
+            btnTheme.setText(themeButtonLabel());
             btnTheme.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-                boolean d = !isDarkMode();
-                applyTheme(d);
-                btnTheme.setText(d ? "亮" : "暗");
-                buildSettingsPage();
-                Toast.makeText(MainActivity.this, d ? "已切换夜间" : "已切换日间", Toast.LENGTH_SHORT).show();
+                // 三态循环：自动 → 夜 → 日 → 自动
+                String m = themeMode();
+                String next = THEME_FOLLOW.equals(m) ? THEME_DARK
+                        : (THEME_DARK.equals(m) ? THEME_LIGHT : THEME_FOLLOW);
+                setThemeMode(next);
+                btnTheme.setText(themeButtonLabel());
+                String tip = THEME_DARK.equals(next) ? "已切换夜间"
+                        : (THEME_LIGHT.equals(next) ? "已切换日间" : "已跟随系统");
+                Toast.makeText(MainActivity.this, tip, Toast.LENGTH_SHORT).show();
             }});
         }
         applyTheme(isDarkMode());
@@ -1726,8 +2154,8 @@ public class MainActivity extends Activity {
                     if(e2 > 0) names.append(kv.substring(0, e2).trim()).append(",");
                 }
             }
-            Log.i("DYP", "COOKIES_AT_SETUP len=" + (ck == null ? -1 : ck.length()) + " names=" + names);
-        }catch(Throwable t){ Log.i("DYP", "COOKIES_ERR " + t); }
+            DypLog.i("COOKIES_AT_SETUP len=" + (ck == null ? -1 : ck.length()) + " names=" + names);
+        }catch(Throwable t){ DypLog.i("COOKIES_ERR " + t); }
         web.setWebViewClient(new WebViewClient(){
             int pageHits=0;
             public void onPageStarted(WebView v,String u,android.graphics.Bitmap f){
@@ -1748,7 +2176,7 @@ public class MainActivity extends Activity {
                         +"return 'DCK len='+c.length+' hasUIFID='+(c.indexOf('UIFID')>=0?1:0)"
                         +"+' hasTtwid='+(c.indexOf('ttwid')>=0?1:0);}catch(e){return 'DCK_ERR '+e;}})()",
                         new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
-                            Log.i("DYP","WS_PROBE_JS "+r);
+                            DypLog.i("WS_PROBE_JS "+r);
                             // CookieManager 能拿到 HttpOnly（UIFID_TEMP 就是 HttpOnly）
                             try{
                                 String cm = CookieManager.getInstance().getCookie("https://www.douyin.com/");
@@ -1765,9 +2193,9 @@ public class MainActivity extends Activity {
                                         }
                                     }
                                 }
-                                Log.i("DYP","WS_PROBE_CM len=" + (cm == null ? -1 : cm.length())
+                                DypLog.i("WS_PROBE_CM len=" + (cm == null ? -1 : cm.length())
                                     + " uifidLen=" + uifidVal.length() + " names=" + nm);
-                            }catch(Throwable t3){ Log.i("DYP","WS_PROBE_CM_ERR " + t3); }
+                            }catch(Throwable t3){ DypLog.i("WS_PROBE_CM_ERR " + t3); }
                         }});
                 }
                 if(profileMode){
@@ -1793,7 +2221,7 @@ public class MainActivity extends Activity {
                         && u.indexOf("m.douyin.com") >= 0 && u.indexOf("/share/user/") >= 0){
                     if(!dyBlockedMobileShare){
                         dyBlockedMobileShare = true;
-                        Log.i("DYP", "DYPROF_BLOCK_M " + u.substring(0, Math.min(90, u.length())));
+                        DypLog.i("DYPROF_BLOCK_M " + u.substring(0, Math.min(90, u.length())));
                         DiagLog.i(DiagLog.M_PARSE, "阻止抖音把主页打回手机版，保持在 PC 主页");
                     }
                     return true;
@@ -1804,11 +2232,11 @@ public class MainActivity extends Activity {
                         u.startsWith("snssdk") || u.startsWith("aweme") || u.startsWith("bytedance")
                         || u.startsWith("intent:") || u.indexOf("snssdk1128") >= 0
                         || u.indexOf("openapp.jdmobile") >= 0 || u.indexOf("package=com.ss.android.ugc.aweme") >= 0)){
-                    Log.i("DYP", "DYPROF_BLOCK_APP " + u.substring(0, Math.min(80, u.length())));
+                    DypLog.i("DYPROF_BLOCK_APP " + u.substring(0, Math.min(80, u.length())));
                     return true;
                 }
                 if(u.startsWith("http://")||u.startsWith("https://")) return false;
-                Log.i("DYP","BLOCK_SCHEME "+u);
+                DypLog.i("BLOCK_SCHEME "+u);
                 return true;
             }
             public boolean shouldOverrideUrlLoading(WebView v,android.webkit.WebResourceRequest r){
@@ -1820,16 +2248,16 @@ public class MainActivity extends Activity {
                     final String u = req.getUrl().toString();
                     // 微信视频号：dump 所有 qq.com 请求，找数据接口
                     if(u != null && u.contains("qq.com")){
-                        Log.i("DYP", "SPH_REQ " + u);
+                        DypLog.i("SPH_REQ " + u);
                     }
                     // 视频号视频/封面直链：截到就存（封面是 jpg，视频需要登录态才有）
                     if(u != null && u.contains("finder.video.qq.com")){
-                        Log.i("DYP", "SPH_VIDEO_URL " + u);
+                        DypLog.i("SPH_VIDEO_URL " + u);
                         if(sphCoverUrl == null || sphCoverUrl.length() == 0) sphCoverUrl = u;
                     }
                     // 视频号数据接口：只记录，绝不自造响应（会破坏页面渲染）
                     if(u != null && u.contains("/finder-preview/api/feed/get_feed_info")){
-                        Log.i("DYP", "SPH_FEED_REQ " + u);
+                        DypLog.i("SPH_FEED_REQ " + u);
                     }
                     // 抖音登录/探测模式：从请求头抓完整 Cookie（含 HttpOnly 的 UIFID_TEMP）
                     if(dyLoginMode && u != null && u.contains("douyin.com")){
@@ -1838,7 +2266,7 @@ public class MainActivity extends Activity {
                             String ckH = hh != null ? hh.get("Cookie") : null;
                             if(ckH != null && ckH.length() > 0){
                                 boolean hasU = ckH.contains("UIFID");
-                                Log.i("DYP","DY_HDR uifid=" + (hasU?1:0) + " len=" + ckH.length()
+                                DypLog.i("DY_HDR uifid=" + (hasU?1:0) + " len=" + ckH.length()
                                     + " url=" + u.substring(0, Math.min(70, u.length())));
                                 if(hasU){
                                     java.util.regex.Matcher mm2 = java.util.regex.Pattern
@@ -1848,7 +2276,7 @@ public class MainActivity extends Activity {
                                         String ufVal = mm2.group(1) != null ? mm2.group(1)
                                                  : (mm2.group(2) != null ? mm2.group(2) : mm2.group(3));
                                         dyProbe = ufVal;
-                                        Log.i("DYP","DY_UIFID_HIT len=" + (ufVal==null?0:ufVal.length()));
+                                        DypLog.i("DY_UIFID_HIT len=" + (ufVal==null?0:ufVal.length()));
                                     }
                                 }
                             }
@@ -1875,7 +2303,7 @@ public class MainActivity extends Activity {
                     String acc = req.getRequestHeaders() != null ? req.getRequestHeaders().get("Accept") : null;
                     if(u != null && (u.indexOf("aweme") >= 0 || u.indexOf("mix") >= 0 || u.indexOf("collection") >= 0
                             || (acc != null && acc.indexOf("json") >= 0) || ac != null)){
-                        Log.i("DYP", "REQ " + u.substring(0, Math.min(260, u.length())));
+                        DypLog.i("REQ " + u.substring(0, Math.min(260, u.length())));
                     }
 // 合集/短剧列表接口：拿到首页 URL 后由 fetchAllMixPages 自动翻页抓全
                      boolean isMix = u != null && u.indexOf("/aweme/v1/mix/aweme/") >= 0;
@@ -1885,20 +2313,20 @@ if(isMix || isPlaylet){
                               mixFetching = true;
                               final String firstUrl = u;
                               final boolean playlet = isPlaylet;
-                              Log.i("DYP", (playlet ? "PLAYLET_HIT " : "MIX_HIT ") + u.substring(0, Math.min(200, u.length())));
+                              DypLog.i((playlet ? "PLAYLET_HIT " : "MIX_HIT ") + u.substring(0, Math.min(200, u.length())));
                               final String kind = playlet ? "短剧" : "合集";
                               // 合集/短剧会抓全量条目并清空列表：先确认一次
                               if(!mixFetchConfirmed){
                                   mixFetchConfirmed = true;
                                   h.post(new Runnable(){ public void run(){
-                                      Log.i("DYP", "MIX_CONFIRM 弹出确认 kind=" + kind);
+                                      DypLog.i("MIX_CONFIRM 弹出确认 kind=" + kind);
                                       confirmBigParse(kind, new Runnable(){ public void run(){
                                           new Thread(new Runnable(){ public void run(){
                                               try{ fetchAllMixPages(firstUrl); }
-                                              catch(Throwable t){ Log.i("DYP", "MIX_ALL_ERR " + t); mixFetching = false; }
+                                              catch(Throwable t){ DypLog.i("MIX_ALL_ERR " + t); mixFetching = false; }
                                           }}).start();
                                       }}, new Runnable(){ public void run(){
-                                          Log.i("DYP", "MIX_CANCEL 用户取消" + kind + "解析");
+                                          DypLog.i("MIX_CANCEL 用户取消" + kind + "解析");
                                           mixFetching = false;
                                           s("已取消" + kind + "解析");
                                           showHintToast("已取消" + kind + "解析");
@@ -1909,7 +2337,7 @@ if(isMix || isPlaylet){
                                       try{
                                           fetchAllMixPages(firstUrl);
                                       }catch(Throwable t){
-                                          Log.i("DYP", "MIX_ALL_ERR " + t);
+                                          DypLog.i("MIX_ALL_ERR " + t);
                                           mixFetching = false;
                                       }
                                   }}).start();
@@ -1931,7 +2359,7 @@ if(isProfileList && !profileFetching){
                            // 确认框还在等用户点：这期间不要真正去抓主页列表，
                            // 否则用户还没点「继续解析」页面就已经把单页 20 条结果渲染出来了
                            if(bigParsePending || !profileAutoConfirmed){
-                               Log.i("DYP", "PROFILE_LIST_SKIP 未确认主页解析，先不抓");
+                               DypLog.i("PROFILE_LIST_SKIP 未确认主页解析，先不抓");
                                return null;
                            }
                            // 同一个 sec_uid 只翻一次：页面会反复发 aweme/post（首屏 + 预加载 + 重试），
@@ -1939,16 +2367,16 @@ if(isProfileList && !profileFetching){
                           String secNow = extractSecUid(u);
                           if(secNow != null && secNow.length() > 10
                                   && secNow.equals(dyProfileDoneSecUid)){
-                              Log.i("DYP", "DYPROF_SKIP_DUP sec_uid 已翻完，忽略重复请求");
+                              DypLog.i("DYPROF_SKIP_DUP sec_uid 已翻完，忽略重复请求");
                               return null;
                           }
                           profileFetching = true;
                           final String lu = u;
-                          Log.i("DYP", "PROFILE_LIST_HIT " + u.substring(0, Math.min(200, u.length())));
+                          DypLog.i("PROFILE_LIST_HIT " + u.substring(0, Math.min(200, u.length())));
                           // 诊断：WebView 自己发的抖音主页请求，把 cursor 和是否有 msToken/uifid 打出来
                           if(u.indexOf("aweme/post") >= 0 || u.indexOf("/aweme/v1/web/aweme/post/") >= 0){
                               String ck2 = CookieManager.getInstance().getCookie("https://www.douyin.com/");
-                              Log.i("DYP", "DYPROF_WEBREQ hasMsToken=" + (u.indexOf("msToken=") >= 0 ? 1 : 0)
+                              DypLog.i("DYPROF_WEBREQ hasMsToken=" + (u.indexOf("msToken=") >= 0 ? 1 : 0)
                                   + " hasUifid=" + (u.indexOf("uifid=") >= 0 ? 1 : 0)
                                   + " hasABogus=" + (u.indexOf("a_bogus=") >= 0 ? 1 : 0)
                                   + " ckUifid=" + (ck2 != null && ck2.indexOf("UIFID") >= 0 ? 1 : 0));
@@ -1966,7 +2394,7 @@ if(isProfileList && !profileFetching){
                                           if(k.equals("max_cursor")) cursorVal = kv.substring(ee + 1);
                                           if(k.equals("count")) countVal = kv.substring(ee + 1);
                                       }
-                                      Log.i("DYP", "DYPROF_WEBKEYS cursor=" + cursorVal + " count=" + countVal
+                                      DypLog.i("DYPROF_WEBKEYS cursor=" + cursorVal + " count=" + countVal
                                           + " keys=" + names);
                                   }
                               }catch(Throwable t){}
@@ -1978,7 +2406,7 @@ if(isProfileList && !profileFetching){
                                   boolean isDy = lu.indexOf("/aweme/post/") >= 0 && lu.indexOf("kuaishou") < 0;
                                   if(isDy){
                                       // 抖音主页：签名接口翻页（带 uifid + 登录 Cookie）
-                                      Log.i("DYP", "DYPROF_USE_SIGNED 先用签名接口翻页");
+                                      DypLog.i("DYPROF_USE_SIGNED 先用签名接口翻页");
                                       fetchAllDyProfilePages(lu);
                                   } else {
                                       String ck = CookieManager.getInstance().getCookie(lu);
@@ -1995,17 +2423,17 @@ if(isProfileList && !profileFetching){
                                       while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
                                       in.close();
                                       String body = new String(bo.toByteArray(), "UTF-8");
-                                      Log.i("DYP", "PROFILE_BODY len=" + body.length());
+                                      DypLog.i("PROFILE_BODY len=" + body.length());
                                       if(body.length() > 100){
                                           parseProfileBody(body);
                                       }
                                   }
-                              }catch(Throwable t){ Log.i("DYP", "PROFILE_REQ_ERR " + t); }
+                              }catch(Throwable t){ DypLog.i("PROFILE_REQ_ERR " + t); }
                               profileFetching = false;
                           }}).start();
                       }
                      if(u != null && u.indexOf("slidesinfo") >= 0){
-                        Log.i("DYP", "INTERCEPT_HIT " + u.substring(0, Math.min(180, u.length())));
+                        DypLog.i("INTERCEPT_HIT " + u.substring(0, Math.min(180, u.length())));
                         // 用同一份 Cookie 自己发一次，拿到 body
                         new Thread(new Runnable(){ public void run(){
                             try{
@@ -2021,26 +2449,68 @@ if(isProfileList && !profileFetching){
                                 while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
                                 in.close();
                                 String body = new String(bo.toByteArray(), "UTF-8");
-                                Log.i("DYP", "INTERCEPT_BODY len=" + body.length());
+                                DypLog.i("INTERCEPT_BODY len=" + body.length());
                                 if(body.length() > 50 && (body.indexOf("aweme_list") >= 0 || body.indexOf("aweme_details") >= 0)){
                                     final String fin = body;
                                     h.post(new Runnable(){ public void run(){ handleSlidesJson(fin); }});
                                 }
-                            }catch(Throwable t){ Log.i("DYP", "INTERCEPT_ERR " + t); }
+                            }catch(Throwable t){ DypLog.i("INTERCEPT_ERR " + t); }
                         }}).start();
                     }
                     // 主页条目下载的 detail 请求：只记日志，不 native 重发。
                     // 签名（a_bogus/msToken）绑定 WebView 浏览器环境，native 重发必 404；
                     // 直链数据走 JS fetch 回调（onDetailData）。
                     if(u != null && u.indexOf("/aweme/v1/web/aweme/detail/") >= 0 && pendingDetailId.length() > 0){
-                        Log.i("DYP", "DETAIL_NATIVE_HIT " + u.substring(0, Math.min(160, u.length())));
+                        DypLog.i("DETAIL_NATIVE_HIT " + u.substring(0, Math.min(160, u.length())));
                     }
                 }catch(Throwable t){}
                 return null;
             }
             public void onPageFinished(WebView v,String u){
                 pageHits++;
-                Log.i("DYP","onPageFinished#"+pageHits+" "+u);
+                DypLog.i("onPageFinished#"+pageHits+" "+u);
+                // 【风控页主动亮出来】
+                //
+                // 除了 render() 的失败分支，WebView 自己也可能直接跳到 verify 页
+                // （抖音的验证码中间页就是这种，URL 停在 verify，不会走 render）。
+                // 之前只有 render 失败才显示网页，于是第二条开始：
+                // 风控了 → 没人亮页面 → 用户只看到转圈，以为卡死。
+                // 这里统一在页面加载完成时兜一次。
+                if(u != null && (u.indexOf("verify") >= 0 || u.indexOf("captcha") >= 0
+                        || u.indexOf("secsdk") >= 0)){
+                    if(!curRiskBlocked){
+                        DypLog.i("DY_RISK_PAGE_DETECTED url=" + u);
+                        curRiskBlocked = true;
+                        if(riskRetryUrl.length() == 0) riskRetryUrl = curUrl;
+                        h.post(new Runnable(){ public void run(){
+                            try{
+                                pageParse.setVisibility(View.GONE);
+                                web.setLayoutParams(new LinearLayout.LayoutParams(
+                                        LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                                web.setVisibility(View.VISIBLE);
+                                web.bringToFront();
+                            }catch(Throwable t){}
+                            showRiskBar();
+                        }});
+                        showHintToast("请在页面里完成验证，完成后点下方「我已完成验证」");
+                        s("需要安全验证，请完成验证后点按钮");
+                    }
+                }
+                // 风控页自动续跑：用户在页面里过完验证后，
+                // URL 会自己跳回作品页 / 分享页，这时自动重新解析一次，
+                // 用户不用手动再点「解析」按钮。
+                // 【风控不再由代码猜】
+                //
+                // 以前这里靠 URL 判断「验证过没过」，两个致命问题：
+                //   a) 抖音验证通过后 URL 常停在 verify 页，靠 URL 永远判不出来
+                //      → 风控页永远不消失，用户被卡在 web 界面
+                //   b) 分享页地址 /share/video/ 本身就含 /share/，
+                //      于是「误判通过 → 自动重解析 → 立刻又被拦」死循环
+                //      → 最后被抖音升级成「抱歉出错了」
+                //
+                // 现在改成：代码不再猜。风控页上叠一条操作条，
+                // 由用户点「我已完成验证」，App 才存 Cookie 并收起网页。
+                // 用户还能点「重试」「关闭」，任何情况都不会卡死。
                 // 小红书登录模式：每页加载完都从 CookieManager 抓一次兜底
                 if(xhsLoginMode && u != null && u.indexOf("xiaohongshu.com") >= 0){
                     h.postDelayed(new Runnable(){ public void run(){
@@ -2056,7 +2526,7 @@ if(isProfileList && !profileFetching){
                 // 抖音主页登录模式：每页加载完就尝试把登录 Cookie 落到本地；抓到就自动退出回解析页
                 if(dyProfileLoginMode){
                     if(u != null && u.indexOf("douyin.com") >= 0){
-                        Log.i("DYP","DY_PROFILE_LOGIN_PAGE " + u.substring(0, Math.min(80, u.length())));
+                        DypLog.i("DY_PROFILE_LOGIN_PAGE " + u.substring(0, Math.min(80, u.length())));
                         final boolean got = saveDyCookieLocal(null);
                         if(got){
                             // 和 YouTube 一样：抓到 Cookie 就直接回解析页，不保留网页
@@ -2078,7 +2548,7 @@ if(isProfileList && !profileFetching){
                             +"var hasAv=!!document.querySelector('a[href*=\\'/space/\\'],.header-entry-mini,.bili-avatar');"
                             +"return ck.length+'|'+(hasSj?1:0)+'|'+(hasAv?1:0);}catch(e){return '0|0|0';}})()",
                             new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
-                                Log.i("DYP","BILI_LOGIN_PROBE "+r);
+                                DypLog.i("BILI_LOGIN_PROBE "+r);
                                 try{
                                     String[] p = r.replace("\"","").split("\\|");
                                     if(p.length >= 3 && (p[1].equals("1") || p[2].equals("1"))){
@@ -2096,7 +2566,7 @@ if(isProfileList && !profileFetching){
                                                         int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_BILI, full);
                                                         BiliParser.buvid3 = "";
                                                         BiliParser.biliLoginLogged = false;
-                                                        Log.i("DYP","BILI_CK_GRAB len=" + full.length() + " saved=" + n);
+                                                        DypLog.i("BILI_CK_GRAB len=" + full.length() + " saved=" + n);
                                                         DiagLog.i(DiagLog.M_PARSE, "B站登录成功，Cookie 已存本地（" + n + " 项），自动回解析页");
                                                         // 和 YouTube / 抖音一样：抓到就自动退出，不保留网页
                                                         h.postDelayed(new Runnable(){ public void run(){
@@ -2109,7 +2579,7 @@ if(isProfileList && !profileFetching){
                                                 }});
                                         }});
                                     }
-                                }catch(Throwable t2){ Log.i("DYP","BILI_LOGIN_PROBE_ERR " + t2); }
+                                }catch(Throwable t2){ DypLog.i("BILI_LOGIN_PROBE_ERR " + t2); }
                             }});
                     }
                     return;
@@ -2122,7 +2592,7 @@ if(isProfileList && !profileFetching){
                             +"var li=!!document.querySelector('a[href*=\\'/direct/inbox/\\'],svg[aria-label=\\'Home\\']');"
                             +"return (m?m[1].length:0)+'|'+(d?1:0)+'|'+(li?1:0);}catch(e){return '0|0|0';}})()",
                             new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
-                                Log.i("DYP","INS_LOGIN_PROBE "+r);
+                                DypLog.i("INS_LOGIN_PROBE "+r);
                                 try{
                                     String[] p = r.replace("\"","").split("\\|");
                                     if(p.length >= 3 && (p[1].equals("1") || p[2].equals("1"))){
@@ -2138,21 +2608,21 @@ if(isProfileList && !profileFetching){
                                                     if(full.contains("sessionid=") && !full.equals(insCookieLast)){
                                                         insCookieLast = full;
                                                         int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_INS, full);
-                                                        Log.i("DYP","INS_CK_GRAB len=" + full.length() + " saved=" + n);
+                                                        DypLog.i("INS_CK_GRAB len=" + full.length() + " saved=" + n);
                                                         s("Cookie 已保存（" + n + " 项），页面保留：完成安全验证后点「完成」");
                                                         updateInsLoginBar();
                                                     }
                                                 }});
                                         }});
                                     }
-                                }catch(Throwable t2){ Log.i("DYP","INS_LOGIN_PROBE_ERR " + t2); }
+                                }catch(Throwable t2){ DypLog.i("INS_LOGIN_PROBE_ERR " + t2); }
                             }});
                     }
                     return;
                 }
                 // 抖音凭据抓取模式：持续监控 Cookie，记录每次变化（区分主页/视频页下发时机）
                 if(dyLoginMode){
-                    Log.i("DYP","DY_LOGIN_PROBE page=" + u);
+                    DypLog.i("DY_LOGIN_PROBE page=" + u);
                     checkDyCookie("onPageFinished");
                     return;
                 }
@@ -2162,7 +2632,7 @@ if(isProfileList && !profileFetching){
                         v.evaluateJavascript(
                             "(function(){try{var ck=document.cookie||'';var hasLogin=ck.indexOf('SAPISID')>=0||ck.indexOf('LOGIN_INFO')>=0;return ck.length+'|'+(hasLogin?1:0)+'|'+((window.ytInitialPlayerResponse||window.ytcfg)?1:0);}catch(e){return '0|0|0';}})()",
                             new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
-                                Log.i("DYP","YT_LOGIN_PROBE "+r);
+                                DypLog.i("YT_LOGIN_PROBE "+r);
                                 try{
                                     String[] p=r.replace("\"","").split("\\|");
                                     int len=Integer.parseInt(p[0]);
@@ -2180,7 +2650,7 @@ if(isProfileList && !profileFetching){
                                                         ytCookieLast=full;
                                                         getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_YT_COOKIE, full).apply();
                                                         saveYtCookieLocal(full);
-                                                        Log.i("DYP","YT_CK_GRAB len="+full.length()+" head="+full.substring(0,Math.min(60,full.length())));
+                                                        DypLog.i("YT_CK_GRAB len="+full.length()+" head="+full.substring(0,Math.min(60,full.length())));
                                                         uploadYtCookie(full);
                                                         s("YouTube 登录成功！Cookie 已保存，解析时自动使用");
                                                         showHintToast("YouTube 登录成功");
@@ -2191,7 +2661,7 @@ if(isProfileList && !profileFetching){
                                                 }});
                                         }});
                                     }
-                                }catch(Throwable t){ Log.i("DYP","YT_LOGIN_PROBE_ERR "+t); }
+                                }catch(Throwable t){ DypLog.i("YT_LOGIN_PROBE_ERR "+t); }
                             }});
                     }
                     return;
@@ -2200,34 +2670,34 @@ if(isProfileList && !profileFetching){
                  if(isProfilePage(u) && !profileMode){
                      // 签名翻页已出结果：拒绝页面再触发新一轮，避免覆盖
                      if(dyProfileRenderLocked){
-                         Log.i("DYP", "PROFILE_AUTO_SKIP 结果已锁定，忽略页面触发");
+                         DypLog.i("PROFILE_AUTO_SKIP 结果已锁定，忽略页面触发");
                          return;
                      }
                      // 已经翻完并渲染出结果的主页，不再被页面的二次跳转覆盖
                      String secSeen = extractSecUid(u);
                      if(secSeen != null && secSeen.length() > 10
                              && secSeen.equals(dyProfileDoneSecUid) && profileCollected.size() > 0){
-                         Log.i("DYP", "PROFILE_AUTO_SKIP 该主页已翻完，忽略重复触发");
+                         DypLog.i("PROFILE_AUTO_SKIP 该主页已翻完，忽略重复触发");
                          return;
                      }
-Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
+DypLog.i("PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                      // 短链/页面自动跳到主页：先让用户确认要不要按主页解析
                      // （直接粘主页链接的情况已在 parse() 里确认过，这里只处理「页面自己跳过来」）
                      if(!profileAutoConfirmed){
                          // 确认框正在等用户点：忽略页面后续的重复触发，避免绕过确认
                          if(bigParsePending){
-                             Log.i("DYP", "PROFILE_AUTO_SKIP 确认框等待中，忽略重复触发");
+                             DypLog.i("PROFILE_AUTO_SKIP 确认框等待中，忽略重复触发");
                              return;
                          }
                          final String uu = u;
-                         Log.i("DYP", "PROFILE_AUTO_CONFIRM 弹出确认");
+                         DypLog.i("PROFILE_AUTO_CONFIRM 弹出确认");
                          h.post(new Runnable(){ public void run(){
                              confirmBigParse("主页", new Runnable(){ public void run(){
                                  // 只有用户真点了「继续解析」，confirmBigParse 内部才会置 true
                                  enterProfileMode(uu);
                              }}, new Runnable(){ public void run(){
                                  // 用户取消：停掉 WebView，回到可继续解析的状态
-                                 Log.i("DYP", "PROFILE_AUTO_CANCEL 用户取消主页解析");
+                                 DypLog.i("PROFILE_AUTO_CANCEL 用户取消主页解析");
                                  profileMode = false;
                                  webDone = true;
                                  s("已取消主页解析");
@@ -2246,7 +2716,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                         final String sec = extractSecUid(u);
                         if(sec != null && sec.length() > 10 && !dyProfileJumped){
                             dyProfileJumped = true;
-                            Log.i("DYP", "DYPROF_JUMP_SEC " + sec);
+                            DypLog.i("DYPROF_JUMP_SEC " + sec);
                             h.postDelayed(new Runnable(){ public void run(){
                                 try{
                                     if(profileMode && web != null){
@@ -2268,7 +2738,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                             .compile("/fw/user/([A-Za-z0-9_]+)").matcher(u);
                         if(km.find()){
                             final String real = "https://live.kuaishou.com/profile/" + km.group(1);
-                            Log.i("DYP", "KS_PROFILE_JUMP " + real);
+                            DypLog.i("KS_PROFILE_JUMP " + real);
                             h.postDelayed(new Runnable(){ public void run(){
                                 try{
                                     if(profileMode && web != null
@@ -2293,7 +2763,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                     return;
                 }
                 if(webDone) return;
-                if(mixMode){ Log.i("DYP", "SKIP_INJECT mixMode"); return; }
+                if(mixMode){ DypLog.i("SKIP_INJECT mixMode"); return; }
                 if(u==null || !(u.startsWith("http://")||u.startsWith("https://"))) return;
                 // 短剧页：主动构造 item/list 请求，不依赖页面自己触发
                 if(u.indexOf("/share/playlet/detail/") >= 0 && !mixFetching){
@@ -2306,7 +2776,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                     if(pid.length() > 0){
                         mixFetching = true;
                         final String fpid = pid;
-                        Log.i("DYP", "PLAYLET_SELF pid=" + pid);
+                        DypLog.i("PLAYLET_SELF pid=" + pid);
                         new Thread(new Runnable(){ public void run(){
                             try{
                                 String firstUrl = "https://www.iesdouyin.com/web/api/playlet/item/list/"
@@ -2315,7 +2785,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                                     + "&version_code=280500&version_name=28.5.0";
                                 fetchAllMixPages(firstUrl);
                             }catch(Throwable t){
-                                Log.i("DYP", "PLAYLET_SELF_ERR " + t);
+                                DypLog.i("PLAYLET_SELF_ERR " + t);
                                 mixFetching = false;
                             }
                         }}).start();
@@ -2326,7 +2796,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 // heuristics: challenge/shell page has no aweme marker
                 v.evaluateJavascript("(function(){try{return (document.body?document.body.innerText.length:0)+'|'+((location.href.indexOf('/video/')>=0||location.href.indexOf('/note/')>=0||location.href.indexOf('/slides/')>=0||location.href.indexOf('/mix/')>=0||location.href.indexOf('/playlet/')>=0)?1:0)+'|'+(window._ROUTER_DATA?1:0);}catch(e){return '0|0|0';}})()",
                     new android.webkit.ValueCallback<String>(){ public void onReceiveValue(String r){
-                        Log.i("DYP","probe="+r);
+                        DypLog.i("probe="+r);
                         boolean real=false;
                         try{
                             String[] p=r.replace("\"","").split("\\|");
@@ -2335,7 +2805,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                             real=(len>200)||p[1].equals("1")||p[2].equals("1");
                         }catch(Exception e){}
                         if(real){ final WebView vv=v; h.post(new Runnable(){ public void run(){ inject(vv); }}); }
-                        else { Log.i("DYP","shell page, wait for reload..."); }
+                        else { DypLog.i("shell page, wait for reload..."); }
                     }});
             }
         });
@@ -2349,26 +2819,96 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
     TextView historyEmpty, listHead, btnDlAll;
     /** 列表页「清空列表」按钮 */
     TextView btnClearList;
+    TextView btnBatchParse, btnProfileParse, btnBatchDl;
     /** 解析页「上一个 / 下一个」导航 */
     LinearLayout parseNavRow;
     TextView btnParsePrev, btnParseNext, parseNavLabel;
-    TextView tabParse, tabHistory, tabList, tabSettings;
+    TextView tabParse, tabHistory, tabList, tabSettings, tabDownload;
+    LinearLayout pageDownload;
+    TextView dlHead, dlCount, btnDlCancel, btnDlClear;
+    ProgressBar dlTotalBar;
 
     void setupTabs(){
         tabParse = (TextView)findViewById(R.id.tabParse);
         tabList = (TextView)findViewById(R.id.tabList);
+        tabDownload = (TextView)findViewById(R.id.tabDownload);
         tabHistory = (TextView)findViewById(R.id.tabHistory);
         tabSettings = (TextView)findViewById(R.id.tabSettings);
         pageParse = findViewById(R.id.pageParse);
         pageList = findViewById(R.id.pageList);
+        pageDownload = (LinearLayout)findViewById(R.id.pageDownload);
         pageHistory = findViewById(R.id.pageHistory);
         pageSettings = findViewById(R.id.pageSettings);
+        dlHead = (TextView)findViewById(R.id.dlHead);
+        dlCount = (TextView)findViewById(R.id.dlCount);
+        dlTotalBar = (ProgressBar)findViewById(R.id.dlTotalBar);
+        btnDlCancel = (TextView)findViewById(R.id.btnDlCancel);
+        if(btnDlCancel != null){
+            btnDlCancel.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                progCancel = true;
+                DypLog.i("DL_CANCEL_ALL");
+                showHintToast("已取消剩余下载");
+            }});
+        }
+        // 「清空已完成」：只保留没下完的（含磁力未完成）
+        btnDlClear = (TextView)findViewById(R.id.btnDlClear);
+        if(btnDlClear != null){
+            btnDlClear.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                clearFinishedDl();
+            }});
+        }
         historyWrap = (LinearLayout)findViewById(R.id.historyWrap);
         historyEmpty = (TextView)findViewById(R.id.historyEmpty);
         listWrap = (LinearLayout)findViewById(R.id.listWrap);
         listHead = (TextView)findViewById(R.id.listHead);
         btnDlAll = (TextView)findViewById(R.id.btnDlAll);
         btnClearList = (TextView)findViewById(R.id.btnClearList);
+        // ===== 列表页功能入口 =====
+        // 布局里已删掉「批量解析 / 主页解析」两个大按钮（改成子页签了），
+        // 这里不再 findViewById 它们，否则找不到 R.id 编译不过。
+        btnBatchDl = (TextView)findViewById(R.id.btnBatchDl);
+        if(btnBatchDl != null){
+            btnBatchDl.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){ startBatchDlFromList(); }});
+        }
+
+        // ===== 列表页子页签：批量解析 / 主页解析 / 批量下载 =====
+        subTabBatchParse = (TextView)findViewById(R.id.subTabBatchParse);
+        subTabMixParse = (TextView)findViewById(R.id.subTabMixParse);
+        subTabProfileParse = (TextView)findViewById(R.id.subTabProfileParse);
+        subTabBatchDl = (TextView)findViewById(R.id.subTabBatchDl);
+        // 诊断：确认布局里这三个控件到底有没有被找到
+        DypLog.i("SUBTAB_FIND batch=" + (subTabBatchParse != null)
+                + " mix=" + (subTabMixParse != null)
+                + " single=" + (subTabBatchDl != null)
+                + " profile=" + (subTabProfileParse != null));
+        // 子页签语义（用户定的顺序）：
+        //   idx 0 = 批量解析   idx 1 = 视频/图文解析(默认)   idx 2 = 主页解析
+        // 子页签：只负责切显示，不自动弹输入框。
+        // （之前空池子会自动弹解析框，用户只是看一下列表就被弹窗打断）
+        // 子页签只负责切换显示。
+        // 所有解析都在「解析」页发起（粘贴链接 → 点解析），
+        // 批量解析走设置页的「批量解析」入口，主页链接也是粘到解析框。
+        // 这里不要弹输入框 —— 用户只是来看分类结果，弹窗会打断。
+        if(subTabBatchParse != null){
+            subTabBatchParse.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){ switchListSub(0); }});
+        }
+        if(subTabBatchDl != null){
+            subTabBatchDl.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){ switchListSub(1); }});
+        }
+        if(subTabProfileParse != null){
+            subTabProfileParse.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){ switchListSub(2); }});
+        }
+        if(subTabMixParse != null){
+            subTabMixParse.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){ switchListSub(3); }});
+        }
+        // 默认落在「视频/图文解析」
+        listSubTab = 1;
+        h.post(new Runnable(){ public void run(){ try{ switchListSub(1); }catch(Throwable t){} }});
         if(btnClearList != null){
             btnClearList.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
                 showClearListConfirm();
@@ -2390,25 +2930,91 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             }});
         }
         settingsWrap = (LinearLayout)findViewById(R.id.settingsWrap);
-        tabParse.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(0); }});
-        tabList.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(1); }});
-        tabHistory.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(2); }});
-        tabSettings.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ switchTab(3); }});
+        // 用户主动点页签：先置 userTapTab，绕过启动保护窗口
+        tabParse.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            userTapTab = true; switchTab(0); }});
+        tabList.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            userTapTab = true; switchTab(1); }});
+        tabDownload.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            userTapTab = true; switchTab(2); }});
+        tabHistory.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            userTapTab = true; switchTab(3); }});
+        tabSettings.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            userTapTab = true; switchTab(4); }});
+        // 启动保护：先开 2 秒窗口，挡住所有程序触发的切页，
+        // 窗口结束再强制落回解析页一次。
+        bootGuardUntil = System.currentTimeMillis() + 2000L;
         switchTab(0);
         refreshHistory();
         buildSettingsPage();
+        h.postDelayed(new Runnable(){ public void run(){
+            try{
+                bootGuardUntil = 0L;
+                // 再确认一次：如果被别的逻辑切走了，这里拉回来
+                switchTab(0);
+                DypLog.i("BOOT_TAB_FORCE parse");
+            }catch(Throwable t){}
+        }}, 2100);
     }
 
+    /** 启动保护窗口的结束时间。
+     *
+     *  为什么需要：启动时有一串延迟回调
+     *      loadBatchList / loadListPools（600ms）
+     *      refreshHistory / applyTheme → refreshThemeDependents
+     *  它们内部可能调 switchTab，把用户本来该看到的解析页切走。
+     *  用户反馈「每次启动都不在解析页」就是这个原因。
+     *
+     *  窗口内只允许用户主动点击切页（userTapTab 置 true）。
+     */
+    volatile long bootGuardUntil = 0L;
+    /** true = 本次 switchTab 是用户点页签触发的，不受启动窗口限制 */
+    volatile boolean userTapTab = false;
+
     void switchTab(int idx){
+        // 启动窗口内：程序触发的切页一律拒绝，避免被延迟回调带偏
+        if(!userTapTab && System.currentTimeMillis() < bootGuardUntil){
+            DypLog.i("TAB_BOOT_GUARD 拒绝切换到 idx=" + idx);
+            return;
+        }
+        userTapTab = false;
         try{
             boolean dark = isDarkMode();
             int textC = dark ? 0xFFE8EAF0 : 0xFF1A1C22;
             int hintC = dark ? 0xFF8A8F9C : 0xFF9AA0AC;
             pageParse.setVisibility(idx == 0 ? View.VISIBLE : View.GONE);
             pageList.setVisibility(idx == 1 ? View.VISIBLE : View.GONE);
-            pageHistory.setVisibility(idx == 2 ? View.VISIBLE : View.GONE);
-            pageSettings.setVisibility(idx == 3 ? View.VISIBLE : View.GONE);
-            TextView[] tabs = {tabParse, tabList, tabHistory, tabSettings};
+            pageDownload.setVisibility(idx == 2 ? View.VISIBLE : View.GONE);
+            pageHistory.setVisibility(idx == 3 ? View.VISIBLE : View.GONE);
+            pageSettings.setVisibility(idx == 4 ? View.VISIBLE : View.GONE);
+            // 【关键兜底】切到「非解析页」时把 WebView 收起来。
+            //
+            // 风控时 WebView 会被铺满 + bringToFront，变成最上层浮层。
+            // 以前 switchTab 只 GONE 了自己的 pageParse，
+            // WebView 还盖在最前面，于是用户点「列表」「下载」「设置」
+            // 看到的还是那个验证页面 —— 就是这个原因。
+            //
+            // 登录类模式不能收（用户正在页面里操作），其余一律收起。
+            try{
+                if(idx != 0 && web != null && web.getVisibility() == View.VISIBLE){
+                    boolean loginMode = dyProfileLoginMode || dyMobileLogin
+                            || biliLoginMode || ytLoginMode || insLoginMode
+                            || xhsLoginMode || ybLoginMode;
+                    if(!loginMode){
+                        DypLog.i("TAB_HIDE_WEB idx=" + idx);
+                        web.setVisibility(View.GONE);
+                        web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+                        // 风控态也一起清掉，避免回来又自动展开
+                        if(curRiskBlocked){
+                            DypLog.i("DY_RISK_CLEARED 用户切走了页签");
+                            curRiskBlocked = false;
+                            riskRetryUrl = "";
+                            hideRiskBar();
+                        }
+                    }
+                }
+            }catch(Throwable t){}
+            TextView[] tabs = {tabParse, tabList, tabDownload, tabHistory, tabSettings};
             for(int i = 0; i < tabs.length; i++){
                 if(i == idx){
                     tabs[i].setBackground(makeRoundRect(0x1AFE2C55, 0, 10));
@@ -2420,8 +3026,8 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                     tabs[i].setTypeface(android.graphics.Typeface.DEFAULT);
                 }
             }
-            if(idx == 2) refreshHistory();
-        }catch(Throwable t){ Log.i("DYP", "TAB_ERR " + t); }
+            if(idx == 3) refreshHistory();
+        }catch(Throwable t){ DypLog.i("TAB_ERR " + t); }
     }
 
     /** 设置页：常驻页签版，每项独立入口 */
@@ -2473,17 +3079,17 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 String u = urls.get(0);
                 input.setText(u);
                 input.setSelection(u.length());
-                Log.i("DYP", "CLIP_AUTOFILL len=" + u.length() + " url=" + u.substring(0, Math.min(80, u.length())));
+                DypLog.i("CLIP_AUTOFILL len=" + u.length() + " url=" + u.substring(0, Math.min(80, u.length())));
                 DiagLog.i(DiagLog.M_APP, "剪贴板自动填链接 | " + u);
                 if(clipAutoStartOn()){
                     h.postDelayed(new Runnable(){ public void run(){
-                        Log.i("DYP", "CLIP_AUTO_PARSE_ONE");
+                        DypLog.i("CLIP_AUTO_PARSE_ONE");
                         parse();
                     }}, 700);
                 }
                 if(clipAutoStartOn()){
                     h.postDelayed(new Runnable(){ public void run(){
-                        Log.i("DYP", "CLIP_AUTO_PARSE_ONE");
+                        DypLog.i("CLIP_AUTO_PARSE_ONE");
                         parse();
                     }}, 700);
                 }
@@ -2496,26 +3102,26 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 }
                 input.setText(sb.toString());
                 input.setSelection(sb.length());
-                Log.i("DYP", "CLIP_AUTOFILL_MULTI n=" + urls.size());
+                DypLog.i("CLIP_AUTOFILL_MULTI n=" + urls.size());
                 DiagLog.i(DiagLog.M_APP, "剪贴板识别到 " + urls.size() + " 条链接，已按行填入");
                 showHintToast("剪贴板识别到 " + urls.size() + " 条链接，点解析将批量处理");
                 if(clipAutoStartOn()){
                     final java.util.List<String> go = new java.util.ArrayList<String>(urls);
                     h.postDelayed(new Runnable(){ public void run(){
-                        Log.i("DYP", "CLIP_AUTO_PARSE n=" + go.size());
+                        DypLog.i("CLIP_AUTO_PARSE n=" + go.size());
                         startBatchParse(go);
                     }}, 700);
                 }
                 if(clipAutoStartOn()){
                     final java.util.List<String> go = new java.util.ArrayList<String>(urls);
                     h.postDelayed(new Runnable(){ public void run(){
-                        Log.i("DYP", "CLIP_AUTO_PARSE n=" + go.size());
+                        DypLog.i("CLIP_AUTO_PARSE n=" + go.size());
                         startBatchParse(go);
                     }}, 700);
                 }
             }
         }catch(Throwable t){
-            Log.i("DYP", "CLIP_AUTOFILL_ERR " + t);
+            DypLog.i("CLIP_AUTOFILL_ERR " + t);
         }
     }
 
@@ -2578,7 +3184,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
         try{
             if(!clearInputOn() || input == null) return;
             input.setText("");
-            Log.i("DYP", "CLEAR_INPUT 已清空");
+            DypLog.i("CLEAR_INPUT 已清空");
         }catch(Throwable t){}
     }
 
@@ -2590,25 +3196,233 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
      *  - 两个都开启时同时执行：先起下载任务，再进播放器（下载在后台线程跑，不阻塞）。
      */
     /** 批量解析模式下，把当前这条解析结果攒进 batchCollected。 */
-    void collectBatchItem(){
-        if(!batchCollectMode) return;
+    /** 把当前解析结果收进「列表」页。
+     *  单条解析和批量解析都收（之前只在 batchCollectMode 下收集，
+     *  导致用户单独解析一条后列表里什么都没有）。 */
+    /** 单条解析（解析页正常解析）→ 只写「视频/图文解析」子页签的数据池。
+     *
+     *  和 collectBatchItem 的区别：
+     *    · 不碰 batchCollected（那是批量/主页共用的渲染数据）
+     *    · 不调 renderBatchList()（否则会把当前页刷掉）
+     *    · 同一条重复解析只保留最新一份（刷新地址/标题）
+     *
+     *  但图集的全量图片 + 实况视频必须照收，
+     *  否则「视频/图文解析」里的图集没法批量下载。
+     */
+    void collectSingleItem(){
         try{
+            String u = curUrl == null ? "" : curUrl;
+            boolean hasImgs = imgUrls != null && imgUrls.size() > 0;
+            if(!hasImgs && curImgs != null && curImgs.length() > 0
+                    && curImgs.indexOf("http") >= 0){
+                try{
+                    parseImgs();
+                    hasImgs = imgUrls != null && imgUrls.size() > 0;
+                }catch(Throwable t){}
+            }
+            String purl = curPlay == null ? "" : curPlay;
+            if(purl.indexOf("/aweme/v1/playwm/") > 0){
+                purl = purl.replace("/aweme/v1/playwm/", "/aweme/v1/play/");
+            }
+            if(purl.length() > 0 && isLikelyAudioUrl(purl)) purl = "";
+            boolean hasVideo = purl.length() > 0;
+            if(!hasImgs && !hasVideo){
+                DypLog.i("SINGLE_COLLECT_SKIP 无地址 url=" + u);
+                return;
+            }
+            String sid = curId == null ? "" : curId;
+            String ttl = curDesc == null ? "" : curDesc.trim();
+            if(ttl.length() > 60) ttl = ttl.substring(0, 60) + "…";
+            if(ttl.length() == 0) ttl = sid;
+
+            synchronized(itemsFromSingle){
+                // 同一条链接只留一份
+                for(int i = 0; i < itemsFromSingle.size(); i++){
+                    ProfileParser.ProfileItem o = itemsFromSingle.get(i);
+                    if(o == null) continue;
+                    if(u.length() > 0 && u.equals(o.url)){
+                        o.title = ttl;
+                        o.directUrl = hasImgs ? (imgUrls.get(0)) : purl;
+                        o.isImage = hasImgs;
+                        o.id = sid;
+                        if(hasImgs){
+                            o.cover = imgUrls.get(0);
+                            o.imgs.clear();
+                            o.dyns.clear();
+                            for(int gi = 0; gi < imgUrls.size(); gi++){
+                                String gu = imgUrls.get(gi);
+                                if(gu == null || gu.length() == 0) continue;
+                                o.imgs.add(gu);
+                                String gd = (dynUrls != null && gi < dynUrls.size())
+                                        ? dynUrls.get(gi) : "";
+                                o.dyns.add(gd == null ? "" : gd);
+                            }
+                        }
+                        DypLog.i("SINGLE_COLLECT_UPD img=" + hasImgs
+                                + " imgs=" + o.imgs.size() + " url=" + u);
+                        // 更新完立刻落盘，否则重启后这条改动丢了
+                        saveListPools();
+                        return;
+                    }
+                }
+                ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+                it.url = u;
+                it.id = sid;
+                it.title = ttl;
+                it.isImage = hasImgs;
+                it.directUrl = hasImgs ? imgUrls.get(0) : purl;
+                if(hasImgs){
+                    it.cover = imgUrls.get(0);
+                    for(int gi = 0; gi < imgUrls.size(); gi++){
+                        String gu = imgUrls.get(gi);
+                        if(gu == null || gu.length() == 0) continue;
+                        it.imgs.add(gu);
+                        String gd = (dynUrls != null && gi < dynUrls.size())
+                                ? dynUrls.get(gi) : "";
+                        it.dyns.add(gd == null ? "" : gd);
+                    }
+                }else if(curCover != null && curCover.startsWith("http")){
+                    it.cover = curCover;
+                }
+                itemsFromSingle.add(it);
+                DypLog.i("SINGLE_COLLECT img=" + hasImgs
+                        + " imgs=" + it.imgs.size() + " live=" + liveOf(it.dyns)
+                        + " total=" + itemsFromSingle.size() + " url=" + u);
+                // 新增后落盘（用户明确要求：单条解析也要保存，重启还在）
+                saveListPools();
+            }
+        }catch(Throwable t){
+            DypLog.i("SINGLE_COLLECT_ERR " + t);
+        }
+    }
+
+    void collectBatchItem(){
+        try{
+            // 只有「批量解析 / 主页解析 / 合集」才写入列表。
+            // 单条解析或从列表点「下载/看详情」时会重新走一遍解析流程，
+            // 如果不拦，就会把当前作品塞回列表并 renderBatchList()，
+            // 表现就是列表被刷新、滚动位置丢失、甚至多出重复条目。
+            boolean shouldCollect = batchCollectMode || profileMode || mixMode;
+            if(!shouldCollect){
+                // 单条解析（解析页正常解析）：结果要进「视频/图文解析」子页签。
+                //
+                // 不能在这里直接 return —— 那样用户单独解析一条，
+                // 列表页「视频/图文解析」里永远是空的。
+                // 也不能放开往下走 —— 下面最后会 renderBatchList()，
+                // 那是拿 batchCollected 整个重绘，
+                // 会把批量解析/主页解析已经收集的结果冲掉。
+                //
+                // 所以单条走独立函数，只写 itemsFromSingle。
+                collectSingleItem();
+                return;
+            }
+            String u = curUrl == null ? "" : curUrl;
+            // 没解析出东西就不收（避免空条目）
+            boolean hasImgs = imgUrls != null && imgUrls.size() > 0;
+            // 防御：万一 parseImgs() 还没跑（imgUrls 空），
+            // 但 curImgs 里已经有 http 图片地址，也应当算图集。
+            // 不这么兜的话，图集会被误判成视频，批量下载就会拿图片地址
+            // 去下 mp4，最后被 media 校验拒掉 —— 表现是「图文没下载」。
+            if(!hasImgs && curImgs != null && curImgs.length() > 0
+                    && curImgs.indexOf("http") >= 0){
+                try{
+                    parseImgs();
+                    hasImgs = imgUrls != null && imgUrls.size() > 0;
+                    DypLog.i("BATCH_LATE_IMGS n=" + (imgUrls == null ? 0 : imgUrls.size()));
+                }catch(Throwable t){}
+            }
+            boolean hasVideo = curPlay != null && curPlay.length() > 0;
+            if(!hasImgs && !hasVideo){
+                DypLog.i("BATCH_COLLECT_SKIP 无地址 url=" + u);
+                return;
+            }
             ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
-            it.url = curUrl == null ? "" : curUrl;
+            it.url = u;
             it.id = curId == null ? "" : curId;
             String t = curDesc == null ? "" : curDesc.trim();
             if(t.length() > 60) t = t.substring(0, 60) + "…";
             if(t.length() == 0) t = curId == null ? "" : curId;
             it.title = t;
-            it.directUrl = curPlay == null ? "" : curPlay;
-            boolean hasImgs = imgUrls != null && imgUrls.size() > 0;
+            // 抖音的 playwm 是「带水印」老接口，现已大量 403；
+            // 收集进列表时换成 play 接口，下载才能成功。
+            String purl = curPlay == null ? "" : curPlay;
+            if(purl.indexOf("/aweme/v1/playwm/") > 0){
+                purl = purl.replace("/aweme/v1/playwm/", "/aweme/v1/play/");
+            }
+            // 【音频过滤】批量解析走的是整页解析（render），
+            // 拿到的 curPlay 有时是背景音乐地址（ies-music/*.mp3、
+            // douyinstatic 的 obj/tos-cn-ve-2774 等），不是视频流。
+            // 直接存进列表 → 批量下载下回来就是「只有声音没有画面」。
+            // 判定为音频就置空，让批量下载自动回落到 detail 通道取真视频。
+            if(purl.length() > 0 && isLikelyAudioUrl(purl)){
+                DypLog.i("BATCH_COLLECT_AUDIO 丢弃音频地址 url="
+                        + purl.substring(0, Math.min(80, purl.length())));
+                purl = "";
+            }
+            it.directUrl = purl;
             it.isImage = hasImgs;
             if(hasImgs) it.directUrl = imgUrls.get(0);
-            synchronized(batchCollected){ batchCollected.add(it); }
-            Log.i("DYP", "BATCH_COLLECT now=" + batchCollected.size()
-                + " img=" + hasImgs + " title=" + t.substring(0, Math.min(30, t.length())));
+            // ============================================================
+            // 图集：把「每一张」图 + 对应实况地址都存进列表。
+            //
+            // 只存 imgUrls.get(0) 是不够的 —— 一条图文可能有 9 张图，
+            // 批量下载就只会下第一张，用户看到的就是「图片没下载」。
+            // 实况图更要单独存 dynUrls，否则批量下不到实况视频。
+            // ============================================================
+            if(hasImgs){
+                try{
+                    it.imgs.clear();
+                    it.dyns.clear();
+                    for(int gi = 0; gi < imgUrls.size(); gi++){
+                        String gu = imgUrls.get(gi);
+                        if(gu == null || gu.length() == 0) continue;
+                        it.imgs.add(gu);
+                        String gd = (dynUrls != null && gi < dynUrls.size()) ? dynUrls.get(gi) : "";
+                        it.dyns.add(gd == null ? "" : gd);
+                    }
+                    DypLog.i("BATCH_COLLECT_IMGS n=" + it.imgs.size()
+                            + " live=" + liveOf(it.dyns) + " id=" + it.id);
+                }catch(Throwable gt){
+                    DypLog.i("BATCH_COLLECT_IMGS_ERR " + gt);
+                }
+            }
+            // 封面：图集用第一张图，视频用解析出的封面
+            if(hasImgs) it.cover = imgUrls.get(0);
+            else if(curCover != null && curCover.startsWith("http")) it.cover = curCover;
+
+            boolean dup = false;
+            synchronized(batchCollected){
+                // 同一条链接只保留一份（重复解析不重复堆叠）
+                for(ProfileParser.ProfileItem o : batchCollected){
+                    if(o == null) continue;
+                    if(u.length() > 0 && u.equals(o.url)){
+                        // 已存在：刷新地址/标题（链接内容可能变）
+                        o.title = it.title;
+                        o.directUrl = it.directUrl;
+                        o.cover = it.cover;
+                        o.isImage = it.isImage;
+                        dup = true;
+                        break;
+                    }
+                }
+                if(!dup) batchCollected.add(0, it);
+            }
+            if(!dup) saveBatchList();   // 落盘：退出重进仍在
+            DypLog.i("BATCH_COLLECT now=" + batchCollected.size()
+                + " img=" + hasImgs + " dup=" + dup
+                + " title=" + t.substring(0, Math.min(30, t.length())));
+            if(!dup){
+                h.post(new Runnable(){ public void run(){
+                    try{
+                        renderBatchList();
+                        DypLog.i("LIST_REFRESH_AFTER_PARSE");
+                    }catch(Throwable t2){
+                        DypLog.i("LIST_REFRESH_ERR " + t2);
+                    }
+                }});
+            }
         }catch(Throwable t){
-            Log.i("DYP", "BATCH_COLLECT_ERR " + t);
+            DypLog.i("BATCH_COLLECT_ERR " + t);
         }
     }
 
@@ -2629,14 +3443,20 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 sb.append(batchEsc(it.title)).append('\t')
                   .append(batchEsc(it.url)).append('\t')
                   .append(batchEsc(it.directUrl)).append('\t')
-                  .append(it.isImage ? "1" : "0").append('\n');
+                  .append(it.isImage ? "1" : "0").append('\t')
+                  .append(batchEsc(it.id)).append('\t')
+                  .append(batchEsc(it.cover)).append('\t')
+                  .append(batchEsc(joinList(it.imgs))).append('\t')
+                  .append(batchEsc(joinList(it.dyns))).append('\n');
             }
             java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
             fo.write(sb.toString().getBytes("UTF-8"));
             fo.close();
-            Log.i("DYP", "BATCH_SAVE n=" + snap.size() + " -> " + f.getAbsolutePath());
+            DypLog.i("BATCH_SAVE n=" + snap.size() + " -> " + f.getAbsolutePath());
+            // 顺手把三个来源池也落盘（节流写）
+            saveListPools();
         }catch(Throwable t){
-            Log.i("DYP", "BATCH_SAVE_ERR " + t);
+            DypLog.i("BATCH_SAVE_ERR " + t);
         }
     }
 
@@ -2646,6 +3466,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             if(!batchKeepOn()) return;
             java.io.File f = batchListFile();
             if(f == null || !f.exists()) return;
+            restoringList = true;   // 恢复期间不切页签、不写状态栏
             java.io.BufferedReader br = new java.io.BufferedReader(
                     new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
             java.util.List<ProfileParser.ProfileItem> tmp = new java.util.ArrayList<ProfileParser.ProfileItem>();
@@ -2659,6 +3480,20 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 it.url = batchUnesc(p[1]);
                 it.directUrl = p.length > 2 ? batchUnesc(p[2]) : "";
                 it.isImage = p.length > 3 && "1".equals(p[3]);
+                // 新格式第 7、8 列是全部图片 / 实况地址；
+                // 旧文件只有 6 列，这里兼容读，不报错。
+                if(p.length > 6) it.imgs = splitList(batchUnesc(p[6]));
+                if(p.length > 7) it.dyns = splitList(batchUnesc(p[7]));
+                // 老数据没有第 7 列，但 cover 里是图片 CDN 地址：
+                // 补进 imgs，让老列表也能被批量下载（用户的痛点）。
+                if(it.isImage && it.imgs.isEmpty() && it.cover != null
+                        && it.cover.indexOf("http") == 0
+                        && isImageCdnUrl(it.cover)){
+                    it.imgs.add(it.cover);
+                    it.dyns.add("");
+                }
+                it.id = p.length > 4 ? batchUnesc(p[4]) : "";
+                it.cover = p.length > 5 ? batchUnesc(p[5]) : "";
                 tmp.add(it);
             }
             br.close();
@@ -2666,12 +3501,156 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 batchCollected.clear();
                 batchCollected.addAll(tmp);
             }
-            Log.i("DYP", "BATCH_LOAD n=" + tmp.size());
+            DypLog.i("BATCH_LOAD n=" + tmp.size());
             if(!tmp.isEmpty()){
                 renderBatchList();
             }
         }catch(Throwable t){
-            Log.i("DYP", "BATCH_LOAD_ERR " + t);
+            DypLog.i("BATCH_LOAD_ERR " + t);
+        }finally{
+            restoringList = false;   // 恢复结束，恢复正常行为
+        }
+    }
+
+    /** 三个子页签数据池的持久化文件 */
+    java.io.File listPoolsFile(){
+        try{
+            java.io.File dir = getExternalFilesDir(null);
+            if(dir == null) dir = new java.io.File(getFilesDir(), "data");
+            if(!dir.exists()) dir.mkdirs();
+            return new java.io.File(dir, "list_pools.tsv");
+        }catch(Throwable t){ return null; }
+    }
+
+    /** 写池子的节流锁 */
+    final Object poolSaveLock = new Object();
+    volatile boolean poolSavePending = false;
+
+    /** 三个池任一变动后调用。300ms 合并写，避免连续解析时反复 IO。 */
+    void saveListPools(){
+        synchronized(poolSaveLock){
+            if(poolSavePending) return;
+            poolSavePending = true;
+        }
+        h.postDelayed(new Runnable(){ public void run(){
+            synchronized(poolSaveLock){ poolSavePending = false; }
+            saveListPoolsNow();
+        }}, 300);
+    }
+
+    /** 立即落盘三个池 */
+    void saveListPoolsNow(){
+        try{
+            java.io.File f = listPoolsFile();
+            if(f == null) return;
+            StringBuilder sb = new StringBuilder();
+            int n0, n1, n2;
+            synchronized(itemsFromBatch){
+                for(ProfileParser.ProfileItem it : itemsFromBatch){
+                    appendPoolLine(sb, 0, it);
+                }
+                n0 = itemsFromBatch.size();
+            }
+            synchronized(itemsFromSingle){
+                for(ProfileParser.ProfileItem it : itemsFromSingle){
+                    appendPoolLine(sb, 1, it);
+                }
+                n1 = itemsFromSingle.size();
+            }
+            synchronized(itemsFromProfile){
+                for(ProfileParser.ProfileItem it : itemsFromProfile){
+                    appendPoolLine(sb, 2, it);
+                }
+                n2 = itemsFromProfile.size();
+            }
+            int n3;
+            synchronized(itemsFromMix){
+                for(ProfileParser.ProfileItem it : itemsFromMix){
+                    appendPoolLine(sb, 3, it);
+                }
+                n3 = itemsFromMix.size();
+            }
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
+            fo.write(sb.toString().getBytes("UTF-8"));
+            fo.close();
+            DypLog.i("POOLS_SAVE batch=" + n0 + " single=" + n1
+                    + " profile=" + n2 + " mix=" + n3 + " bytes=" + f.length());
+        }catch(Throwable t){
+            DypLog.i("POOLS_SAVE_ERR " + t);
+        }
+    }
+
+    void appendPoolLine(StringBuilder sb, int pool, ProfileParser.ProfileItem it){
+        if(it == null) return;
+        sb.append(pool).append('\t')
+          .append(batchEsc(it.title)).append('\t')
+          .append(batchEsc(it.url)).append('\t')
+          .append(batchEsc(it.directUrl)).append('\t')
+          .append(it.isImage ? "1" : "0").append('\t')
+          .append(batchEsc(it.id)).append('\t')
+          .append(batchEsc(it.cover)).append('\t')
+          .append(batchEsc(joinList(it.imgs))).append('\t')
+          .append(batchEsc(joinList(it.dyns))).append('\n');
+    }
+
+    /** 启动时把三个池读回来。必须在 itemsFrom* 定义之后才能调。 */
+    void loadListPools(){
+        try{
+            java.io.File f = listPoolsFile();
+            if(f == null || !f.exists() || f.length() == 0) return;
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+            java.util.List<ProfileParser.ProfileItem> l0 =
+                    new java.util.ArrayList<ProfileParser.ProfileItem>();
+            java.util.List<ProfileParser.ProfileItem> l1 =
+                    new java.util.ArrayList<ProfileParser.ProfileItem>();
+            java.util.List<ProfileParser.ProfileItem> l2 =
+                    new java.util.ArrayList<ProfileParser.ProfileItem>();
+            java.util.List<ProfileParser.ProfileItem> l3 =
+                    new java.util.ArrayList<ProfileParser.ProfileItem>();
+            String line;
+            while((line = br.readLine()) != null){
+                if(line.length() == 0) continue;
+                String[] p = line.split("\t", -1);
+                if(p.length < 3) continue;
+                int pool;
+                try{ pool = Integer.parseInt(p[0].trim()); }catch(Throwable t){ continue; }
+                ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
+                it.title = batchUnesc(p[1]);
+                it.url = batchUnesc(p[2]);
+                it.directUrl = p.length > 3 ? batchUnesc(p[3]) : "";
+                it.isImage = p.length > 4 && "1".equals(p[4]);
+                it.id = p.length > 5 ? batchUnesc(p[5]) : "";
+                it.cover = p.length > 6 ? batchUnesc(p[6]) : "";
+                if(p.length > 7) it.imgs = splitList(batchUnesc(p[7]));
+                if(p.length > 8) it.dyns = splitList(batchUnesc(p[8]));
+                // 老数据 / 缺 imgs 时用 cover 兜底（图集必须能批量下载）
+                if(it.isImage && it.imgs.isEmpty() && it.cover != null
+                        && it.cover.indexOf("http") == 0 && isImageCdnUrl(it.cover)){
+                    it.imgs.add(it.cover);
+                    it.dyns.add("");
+                }
+                if(pool == 0) l0.add(it);
+                else if(pool == 1) l1.add(it);
+                else if(pool == 3) l3.add(it);
+                else l2.add(it);
+            }
+            br.close();
+            synchronized(itemsFromBatch){ itemsFromBatch.clear(); itemsFromBatch.addAll(l0); }
+            synchronized(itemsFromSingle){ itemsFromSingle.clear(); itemsFromSingle.addAll(l1); }
+            synchronized(itemsFromProfile){ itemsFromProfile.clear(); itemsFromProfile.addAll(l2); }
+            synchronized(itemsFromMix){ itemsFromMix.clear(); itemsFromMix.addAll(l3); }
+            DypLog.i("POOLS_LOAD batch=" + l0.size() + " single=" + l1.size()
+                    + " profile=" + l2.size() + " mix=" + l3.size());
+            // 批量池也同步进 batchCollected，否则列表页「批量下载」读不到
+            if(!l0.isEmpty()){
+                synchronized(batchCollected){
+                    batchCollected.clear();
+                    batchCollected.addAll(l0);
+                }
+            }
+        }catch(Throwable t){
+            DypLog.i("POOLS_LOAD_ERR " + t);
         }
     }
 
@@ -2715,7 +3694,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             int n;
             synchronized(batchCollected){ n = batchCollected.size(); }
             if(n > 0){
-                Log.i("DYP", "LIST_RESTORE n=" + n);
+                DypLog.i("LIST_RESTORE n=" + n);
                 renderBatchList();
             }
         }catch(Throwable t){}
@@ -2725,7 +3704,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
     void renderBatchList(){
         int n;
         synchronized(batchCollected){ n = batchCollected.size(); }
-        Log.i("DYP", "BATCH_RENDER n=" + n + " wrap=" + (listWrap != null));
+        DypLog.i("BATCH_RENDER n=" + n + " wrap=" + (listWrap != null));
         if(n == 0){
             if(listWrap != null) listWrap.removeAllViews();
             if(listHead != null) listHead.setText("批量解析没有拿到结果");
@@ -2749,16 +3728,32 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             synchronized(profileSeen){ profileSeen.clear(); }
             synchronized(batchCollected){ batchCollected.clear(); }
             synchronized(mixItems){ mixItems.clear(); }
+            // 四个子页签数据池必须一起清：
+            // 只清 batchCollected 的话，切到主页/合集子页签时
+            // showProfileList 会用 itemsFromXxx 把内容重新渲染回来，
+            // 表现为「删了以后再点一次又刷新出来了」。
+            synchronized(itemsFromProfile){ itemsFromProfile.clear(); }
+            synchronized(itemsFromBatch){ itemsFromBatch.clear(); }
+            synchronized(itemsFromSingle){ itemsFromSingle.clear(); }
+            synchronized(itemsFromMix){ itemsFromMix.clear(); }
+            profileMode = false;
             profilePage = 0;
             batchCollectMode = false;
             // 同步删掉落盘的列表，否则重启后又冒出来
             try{ java.io.File f = batchListFile(); if(f != null && f.exists()) f.delete(); }catch(Throwable t){}
+            // 关键：list_pools.tsv 也必须清掉并重写空文件，
+            // 否则下次启动 restoreListPools 又把四个池读回来。
+            try{
+                java.io.File pf = listPoolsFile();
+                if(pf != null && pf.exists()) pf.delete();
+                saveListPoolsNow();
+            }catch(Throwable t){}
             if(listHead != null) listHead.setText("粘贴主页链接或批量链接后点解析，列表会出现在这里");
             if(btnDlAll != null) btnDlAll.setVisibility(View.GONE);
             if(btnClearList != null) btnClearList.setVisibility(View.GONE);
-            Log.i("DYP", "LIST_CLEARED");
+            DypLog.i("LIST_CLEARED pools=cleared");
         }catch(Throwable t){
-            Log.i("DYP", "LIST_CLEAR_ERR " + t);
+            DypLog.i("LIST_CLEAR_ERR " + t);
         }
     }
 
@@ -2783,7 +3778,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
     }
 
     void maybeAutoAction(){
-        Log.i("DYP", "AUTO_CHECK fired=" + autoFired + " play=" + autoPlayOn() + " dl=" + autoDlOn()
+        DypLog.i("AUTO_CHECK fired=" + autoFired + " play=" + autoPlayOn() + " dl=" + autoDlOn()
             + " curPlay=" + (curPlay == null ? 0 : curPlay.length())
             + " imgs=" + (imgUrls == null ? 0 : imgUrls.size()));
         // 批量解析模式：把本条结果攒进列表
@@ -2804,24 +3799,24 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 if(ad){
                     // 主页列表模式没有单一目标，不自动下（避免批量误下几百个文件）
                     if(!profileMode && (hasImgs || hasVideo)){
-                        Log.i("DYP", "AUTO_DL 触发 图集=" + hasImgs + " 视频=" + hasVideo);
+                        DypLog.i("AUTO_DL 触发 图集=" + hasImgs + " 视频=" + hasVideo);
                         doDownload();
                     } else {
-                        Log.i("DYP", "AUTO_DL 跳过 profileMode=" + profileMode);
+                        DypLog.i("AUTO_DL 跳过 profileMode=" + profileMode);
                     }
                 }
                 if(ap){
                     if(hasVideo && !hasImgs){
                         // 自动播放默认留在页内小窗（不跳全屏），
                         // 想看全屏让用户自己点「全屏」按钮。
-                        Log.i("DYP", "AUTO_PLAY 留在小窗");
+                        DypLog.i("AUTO_PLAY 留在小窗");
                         pokeMiniBar();     // 顺便把控制栏亮一下，告诉用户能操作
                     } else {
-                        Log.i("DYP", "AUTO_PLAY 跳过 图集=" + hasImgs + " 视频=" + hasVideo);
+                        DypLog.i("AUTO_PLAY 跳过 图集=" + hasImgs + " 视频=" + hasVideo);
                     }
                 }
             }catch(Throwable t){
-                Log.i("DYP", "AUTO_ACTION_ERR " + t);
+                DypLog.i("AUTO_ACTION_ERR " + t);
             }
         }}, 600);   // 等 UI 布局完成再动作，避免播放器拿不到窗口
     }
@@ -2851,6 +3846,7 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
         et.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
         et.setMinLines(6);
         et.setMaxLines(12);
+        styleInput(et);
         et.setInputType(android.text.InputType.TYPE_CLASS_TEXT
                 | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -2895,12 +3891,339 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             .show();
     }
 
+    /** 当前 BT tracker 线路（0 极简 / 1 全部TCP / 2 全量） */
+    int btLine(){
+        try{
+            int v = getSharedPreferences(SP, MODE_PRIVATE).getInt(KEY_BT_LINE, 0);
+            return (v < 0 || v > 2) ? 0 : v;
+        }catch(Throwable t){ return 0; }
+    }
+    void setBtLine(int v){
+        if(v < 0 || v > 2) v = 0;
+        try{ getSharedPreferences(SP, MODE_PRIVATE).edit().putInt(KEY_BT_LINE, v).apply(); }
+        catch(Throwable t){}
+        try{ BtDownloader.setTrackMode(v); }catch(Throwable t){}
+    }
+    /** 把已保存的线路同步给 BtDownloader（每次启动都要做） */
+    void syncBtLine(){
+        try{ BtDownloader.setTrackMode(btLine()); }catch(Throwable t){}
+    }
+    /** 线路名（给设置页副标题用） */
+    String btLineName(){
+        int v = btLine();
+        if(v == 2) return "全量 · HTTP+UDP 全部 " + BtDownloader.ALL_TRACKERS_COUNT + " 条";
+        if(v == 1) return "全部 TCP · 只走 HTTP/HTTPS " + BtDownloader.HTTP_TRACKERS_COUNT + " 条";
+        return "极简 · 精选 " + BtDownloader.MAGNET_TRACKERS_COUNT + " 条（默认，最快）";
+    }
+
+    /**
+     * Tracker 线路选择弹窗。
+     *
+     * 用户反馈：100 多个 tracker 每次只用 40 个不合理，应该让用户自己选。
+     * 这里做成三档，用单选列表，选中即生效并落盘。
+     */
+    void showBtLineDialog(){
+        curDark = isDarkMode();
+        final int bgDlg = curDark ? 0xFF17191F : 0xFFFFFFFF;
+        final int textDlg = curDark ? 0xFFE6E8EE : 0xFF1A1A1F;
+        final int subDlg = curDark ? 0xFF9AA0AC : 0xFF6B6F7A;
+        final int accent = 0xFFFE2C55;
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setBackgroundColor(bgDlg);
+        wrap.setPadding(dp(18), dp(14), dp(18), dp(8));
+
+        final String[] names = new String[]{
+            "极简（推荐）",
+            "全部 TCP",
+            "全量"
+        };
+        final String[] descs = new String[]{
+            "精选 " + BtDownloader.MAGNET_TRACKERS_COUNT + " 条高质量 tracker。\n"
+                + "magnet 最短、首次拿种子信息最快，日常够用。",
+            "只走 HTTP/HTTPS，共 " + BtDownloader.HTTP_TRACKERS_COUNT + " 条。\n"
+                + "手机挂着代理、或运营商掐了 UDP 时用这个。",
+            "HTTP + UDP 全部 " + BtDownloader.ALL_TRACKERS_COUNT + " 条。\n"
+                + "最全，但 magnet 很长，可能被个别 tracker 拒绝。\n"
+                + "极简线路找不到 peer 时切到这里再试。"
+        };
+
+        final int cur = btLine();
+        final int[] sel = new int[]{ cur };
+        final TextView[] rows = new TextView[3];
+
+        for(int i = 0; i < 3; i++){
+            final int idx = i;
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(dp(14), dp(11), dp(14), dp(11));
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            clp.bottomMargin = dp(8);
+            card.setLayoutParams(clp);
+
+            TextView t = new TextView(this);
+            t.setTextSize(15);
+            t.setTextColor(textDlg);
+            t.setSingleLine(false);
+
+            TextView d = new TextView(this);
+            d.setText(descs[i]);
+            d.setTextSize(12);
+            d.setTextColor(subDlg);
+            d.setLineSpacing(dp(2), 1f);
+            d.setPadding(0, dp(5), 0, 0);
+
+            card.addView(t);
+            card.addView(d);
+
+            final String baseTitle = names[i];
+            t.setText((i == cur ? "● " : "○ ") + baseTitle + "（" + BtDownloader.countOf(i) + " 条）");
+            final TextView titleView = t;
+            rows[i] = t;
+
+            card.setBackground(makeRoundRect(
+                i == cur ? (curDark ? 0xFF2A1A20 : 0xFFFFEEF2) : (curDark ? 0xFF23262E : 0xFFF5F6F8),
+                i == cur ? accent : (curDark ? 0xFF333842 : 0xFFE1E4E9),
+                12));
+
+            card.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    sel[0] = idx;
+                    for(int k = 0; k < 3; k++){
+                        rows[k].setText((k == idx ? "● " : "○ ") + names[k]
+                            + "（" + BtDownloader.countOf(k) + " 条）");
+                        rows[k].setTextColor(textDlg);
+                        View p = (View) rows[k].getParent();
+                        p.setBackground(makeRoundRect(
+                            k == idx ? (curDark ? 0xFF2A1A20 : 0xFFFFEEF2) : (curDark ? 0xFF23262E : 0xFFF5F6F8),
+                            k == idx ? accent : (curDark ? 0xFF333842 : 0xFFE1E4E9),
+                            12));
+                    }
+                }});
+
+            wrap.addView(card);
+        }
+
+        TextView tip = new TextView(this);
+        tip.setText("说明：tracker 的效果跟着资源走——某条磁力在极简线路没人，"
+                  + "换到全量可能就有了。改完对之后的新任务生效，正在下载的任务会按新线路重新 announce。");
+        tip.setTextSize(11);
+        tip.setTextColor(subDlg);
+        tip.setLineSpacing(dp(2), 1f);
+        tip.setPadding(0, dp(6), 0, dp(2));
+        wrap.addView(tip);
+
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle("磁力 Tracker 线路")
+            .setView(wrap)
+            .setPositiveButton("保存", null)
+            .setNegativeButton("取消", null)
+            .create();
+        dlg.setOnShowListener(new android.content.DialogInterface.OnShowListener(){
+            public void onShow(android.content.DialogInterface d){
+                dlg.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener(
+                    new View.OnClickListener(){ public void onClick(View vv){
+                        setBtLine(sel[0]);
+                        Toast.makeText(MainActivity.this,
+                            "Tracker 线路已切换为「" + names[sel[0]] + "」", Toast.LENGTH_SHORT).show();
+                        buildSettingsPage();
+                        dlg.dismiss();
+                    }});
+            }});
+        try{
+            android.view.Window win = dlg.getWindow();
+            if(win != null) win.setBackgroundDrawable(
+                makeRoundRect(bgDlg, curDark ? 0xFF2B2F39 : 0xFFE3E5EA, 16));
+        }catch(Throwable t){}
+        dlg.show();
+    }
+
+    // ============================================================
+    // 备份 / 恢复
+    //
+    // 为什么必须有这个东西：
+    //   Cookie 存在 Android/data/{包名}/files/cookies/，
+    //   设置存在 /data/data/{包名}/shared_prefs/dyp_pref.xml，
+    //   这俩都是 App 私有数据 —— **清数据 / 卸载重装一定全没**，
+    //   这是 Android 系统行为，App 拦不住。
+    //   唯一办法是把它们导出到公共目录（Download/DYParse/备份/），
+    //   重装后再读回来。
+    //
+    // 备份是全量的：所有平台 Cookie + 全部 SharedPreferences
+    //（下载路径、代理、主题、并发、磁力线路、更新源、访客凭据…）
+    // 以后新增设置项也自动带上，不用改代码。
+    // ============================================================
+
+    String bakSubLabel(){
+        try{
+            java.util.List<File> ls = BackupMgr.list();
+            if(ls.isEmpty()) return "导出/导入 Cookie 与全部设置（重装后可恢复）";
+            File f = ls.get(0);
+            java.text.SimpleDateFormat f2 = new java.text.SimpleDateFormat(
+                    "MM-dd HH:mm", java.util.Locale.US);
+            return "最近备份 " + f2.format(new java.util.Date(f.lastModified()))
+                    + " · " + BackupMgr.sizeOf(f) + " · 共 " + ls.size() + " 份";
+        }catch(Throwable t){
+            return "导出/导入 Cookie 与全部设置";
+        }
+    }
+
+    void showBackupMenu(){
+        dypDlg()
+            .setTitle("备份 / 恢复")
+            .setMessage("备份会把「所有平台 Cookie + 全部设置」打包到：\n"
+                + BackupMgr.BAK_DIR + "\n\n"
+                + "这个位置在公共 Download 目录，"
+                + "清数据、卸载重装都不会被删。\n"
+                + "重装后进这里点「恢复配置」选回那个 zip 就行。\n\n"
+                + "当前登录状态：\n"
+                + "· 抖音 " + ckN(CookieStore.PLATFORM_DY) + " 项\n"
+                + "· B站 " + ckN(CookieStore.PLATFORM_BILI) + " 项\n"
+                + "· YouTube " + ckN(CookieStore.PLATFORM_YT) + " 项\n"
+                + "· Instagram " + ckN(CookieStore.PLATFORM_INS) + " 项\n"
+                + "· 小红书 " + ckN(CookieStore.PLATFORM_XHS) + " 项\n"
+                + "· X " + ckN(CookieStore.PLATFORM_X) + " 项")
+            .setPositiveButton("立即备份", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ doBackup(); }})
+            .setNeutralButton("恢复配置", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){ showRestorePicker(); }})
+            .setNegativeButton("关闭", null)
+            .show();
+    }
+
+    String ckN(String plat){
+        try{ return String.valueOf(CookieStore.count(this, plat)); }catch(Throwable t){ return "0"; }
+    }
+
+    void doBackup(){
+        try{
+            File f = BackupMgr.backup(this);
+            if(f == null){
+                showHintToast("备份失败，看一下有没有存储权限");
+                s("备份失败");
+                return;
+            }
+            s("已备份");
+            buildSettingsPage();   // 刷新副标题
+            dypDlg()
+                .setTitle("备份完成")
+                .setMessage("文件：" + f.getAbsolutePath() + "\n\n"
+                    + "大小：" + BackupMgr.sizeOf(f) + "\n\n"
+                    + "里面包含所有平台的 Cookie 和全部设置项。\n"
+                    + "这个文件在公共目录，卸载重装不会丢。\n\n"
+                    + "⚠ 含登录凭据，别发给别人。")
+                .setPositiveButton("知道了", null)
+                .setNeutralButton("打开备份目录", new android.content.DialogInterface.OnClickListener(){
+                    public void onClick(android.content.DialogInterface d, int w){
+                        // 项目没引 androidx.core / 没配 FileProvider，
+                        // 所以不做系统分享，直接引导到备份目录：
+                        // 用户可以用文件管理器自己拷到网盘 / 电脑。
+                        showHintToast("备份在：" + BackupMgr.BAK_DIR);
+                        try{
+                            android.content.Intent it = new android.content.Intent(
+                                    android.content.Intent.ACTION_VIEW);
+                            it.setDataAndType(Uri.parse("content://com.android.externalstorage.documents/root/primary"),
+                                    "vnd.android.document/root");
+                            startActivity(it);
+                        }catch(Throwable t){
+                            // 打不开就算了，Toast 里已经有路径
+                        }
+                    }})
+                .show();
+        }catch(Throwable t){
+            DypLog.i("BAK_UI_ERR " + t);
+        }
+    }
+
+    void showRestorePicker(){
+        try{
+            final java.util.List<File> ls = BackupMgr.list();
+            if(ls.isEmpty()){
+                dypDlg()
+                    .setTitle("没有找到备份")
+                    .setMessage("在 " + BackupMgr.BAK_DIR + " 里没有 .zip 备份文件。\n\n"
+                        + "如果你之前备份过，确认一下文件还在不在；\n"
+                        + "如果还没备份过，先点「立即备份」。")
+                    .setPositiveButton("知道了", null)
+                    .show();
+                return;
+            }
+            String[] items = new String[ls.size()];
+            java.text.SimpleDateFormat f2 = new java.text.SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm", java.util.Locale.US);
+            for(int i = 0; i < ls.size(); i++){
+                File f = ls.get(i);
+                items[i] = f2.format(new java.util.Date(f.lastModified()))
+                        + "  ·  " + BackupMgr.sizeOf(f);
+            }
+            dypDlg()
+                .setTitle("选择要恢复的备份")
+                .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                    public void onClick(android.content.DialogInterface d, int which){
+                        confirmRestore(ls.get(which));
+                    }})
+                .setNegativeButton("取消", null)
+                .show();
+        }catch(Throwable t){
+            DypLog.i("RST_UI_ERR " + t);
+        }
+    }
+
+    void confirmRestore(final File f){
+        dypDlg()
+            .setTitle("确认恢复")
+            .setMessage("将从这份备份恢复：\n" + f.getName() + "\n\n"
+                + "会覆盖当前的 Cookie 和设置项。\n"
+                + "（下载好的视频/音频不受影响）\n\n"
+                + "恢复后可能需要重启 App 才能全部生效。")
+            .setPositiveButton("恢复", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    String r = BackupMgr.restore(MainActivity.this, f);
+                    if(r == null){
+                        showHintToast("恢复失败，文件可能损坏");
+                        s("恢复失败");
+                    }else{
+                        showHintToast(r);
+                        s(r);
+                        buildSettingsPage();
+                        // Cookie 变了，重灌进 WebView，并清掉风控节流状态
+                        try{ restoreDyCookieToWebView(); }catch(Throwable t){}
+                        try{
+                            curRiskBlocked = false;
+                            riskRetryUrl = "";
+                            riskAutoRetry = 0;
+                            riskLastRetryMs = 0L;
+                        }catch(Throwable t){}
+                        dypDlg()
+                            .setTitle("恢复完成")
+                            .setMessage(r + "\n\n"
+                                + "建议把 App 完全退出再打开一次，"
+                                + "让 Cookie 和设置全部生效。")
+                            .setPositiveButton("知道了", null)
+                            .show();
+                    }
+                }})
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
     void buildSettingsPage(){
         if(settingsWrap == null) return;
         settingsWrap.removeAllViews();
 
         addSettingRow("批量解析", "一次粘贴多条链接，一行一个", new View.OnClickListener(){
             public void onClick(View v){ showBatchInputDialog(); }});
+        addSettingRow("本地种子文件", "选择手机里的 .torrent 种子，直接开始下载",
+            new View.OnClickListener(){
+                public void onClick(View v){ pickTorrentFile(); }});
+        addSettingRow("磁力 Tracker 线路",
+            "当前：" + btLineName(),
+            new View.OnClickListener(){
+                public void onClick(View v){ showBtLineDialog(); }});
+        addSettingRow("备份 / 恢复", bakSubLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showBackupMenu(); }});
         addSettingRow("支持的平台", PLATFORM_LIST.length + " 个平台 · 点看完整清单", new View.OnClickListener(){
             public void onClick(View v){ showPlatforms(); }});
         addSettingRow("更新日志", "每个版本改了什么", new View.OnClickListener(){
@@ -2931,6 +4254,10 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                     s("无法打开浏览器");
                 }
             }});
+
+        addSettingSection("外观");
+        addSettingRow("主题", themeModeLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showThemeDialog(); }});
 
         addSettingSection("代理");
         addSettingRow("内置代理", "海外平台走服务器中转的开关", new View.OnClickListener(){
@@ -2970,11 +4297,18 @@ Log.i("DYP", "PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
             new View.OnClickListener(){
                 public void onClick(View v){
                     String r = PowerHelper.openOemBackgroundSettings(MainActivity.this);
-                    Log.i("DYP", "OEM_SETTINGS_OPEN " + r);
+                    DypLog.i("OEM_SETTINGS_OPEN " + r);
                     showHintToast("请在列表里把本应用设为「允许后台运行」");
                     DiagLog.i(DiagLog.M_APP, "打开厂商后台设置 | " + PowerHelper.deviceLabel() + " | " + r);
                 }});
 
+        addSettingSection("下载性能");
+        addSettingRow("同时下载数", dlConcurrency() + " 个任务 / 上限 " + DL_CONC_MAX
+                + " · 批量/全部/主页/合集共用", new View.OnClickListener(){
+            public void onClick(View v){ showDlConcDialog(); }});
+        addSettingRow("单文件分片数", InnerDownloader.segCount(MainActivity.this)
+                + " 段 · 大文件多线程加速（4MB 以下不分片）", new View.OnClickListener(){
+            public void onClick(View v){ showSegDialog(); }});
         addSettingSection("下载路径");
 LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), new View.OnClickListener(){
             public void onClick(View v){ showStorageState(); }});
@@ -2984,16 +4318,11 @@ LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), ne
                 public boolean onLongClick(View v){ toggleForceScoped(); return true; }
             });
         }catch(Throwable t){}
-        addSettingRow("视频目录", curDlDirLabel("视频"), new View.OnClickListener(){
-            public void onClick(View v){ showDlDirDialog("视频", KEY_DL_VIDEO, "Download/DYParse/视频"); }});
-        addSettingRow("图片目录", curDlDirLabel("图片"), new View.OnClickListener(){
-            public void onClick(View v){ showDlDirDialog("图片", KEY_DL_IMG, "Download/DYParse/图片"); }});
-        addSettingRow("音频目录", curDlDirLabel("音频"), new View.OnClickListener(){
-            public void onClick(View v){ showDlDirDialog("音频", KEY_DL_AUDIO, "Download/DYParse/音频"); }});
-        addSettingRow("合集目录", curDlDirLabel("合集"), new View.OnClickListener(){
-            public void onClick(View v){ showDlDirDialog("合集", KEY_DL_MIX, "Download/DYParse/合集"); }});
-        addSettingRow("动图目录", curDlDirLabel("动图"), new View.OnClickListener(){
-            public void onClick(View v){ showDlDirDialog("动图", KEY_DL_ANIM, "Download/DYParse/动图"); }});
+        addSettingRow("各平台下载路径", dlPlatSummary(), new View.OnClickListener(){
+            public void onClick(View v){ showDlPlatDialog(); }});
+        addSettingRow("下载保存位置", dlRootLabel(),
+            new View.OnClickListener(){
+            public void onClick(View v){ showDlRootDialog(); }});
         addSettingRow("修复媒体库", "相册里看不到已下载文件？点这里补录", new View.OnClickListener(){
             public void onClick(View v){ fixMediaLibrary(); }});
 
@@ -3010,6 +4339,8 @@ LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), ne
         addSettingSection("Cookie（本地保存）");
         addSettingRow("YouTube Cookie", curYtCkLabel(), new View.OnClickListener(){
             public void onClick(View v){ showCookieDialog(CookieStore.PLATFORM_YT, "YouTube"); }});
+        addSettingRow("X（Twitter）登录", xLoginSummary(), new View.OnClickListener(){
+            public void onClick(View v){ showXLoginDialog(); }});
         addSettingRow("Instagram Cookie", curInsCkLabel(), new View.OnClickListener(){
             public void onClick(View v){ showInsLoginDialog(); }});
 addSettingRow("B站 Cookie", curBiliCkLabel(), new View.OnClickListener(){
@@ -3038,6 +4369,105 @@ addSettingSection("平台支持");
             public void onClick(View v){ showDebugLogView(); }});
         addSettingRow("崩溃日志", curCrashLogLabel(), new View.OnClickListener(){
             public void onClick(View v){ showCrashLogView(); }});
+        addSettingRow("强制记录", forceLogLabel(), new View.OnClickListener(){
+            public void onClick(View v){ toggleForceLog(); }});
+        addSettingRow("日志保留天数", keepDaysLabel(), new View.OnClickListener(){
+            public void onClick(View v){ showKeepDaysDialog(); }});
+    }
+
+    // ================= 日志：强制记录 / 保留天数 =================
+
+    /** 「强制记录」副标题 */
+    String forceLogLabel(){
+        boolean on = DypLog.isForceOn();
+        if(on){
+            return "已开启 · 调试日志开关关着也照写（帮我们抓现场用）";
+        }
+        return "已关闭 · 开关关着就不写文件，打开后即使日志开关关着也记录";
+    }
+
+    /** 切换强制记录 */
+    void toggleForceLog(){
+        boolean on = DypLog.isForceOn();
+        DypLog.setForceOn(!on);
+        showHintToast(!on
+            ? "强制记录已开启：即使调试日志关着，功能日志也会写入文件"
+            : "强制记录已关闭");
+        buildSettingsPage();
+    }
+
+    /** 「日志保留天数」副标题 */
+    String keepDaysLabel(){
+        int d = DiagLog.keepDays();
+        long sz = 0, dirSz = 0;
+        int files = 0;
+        try{
+            java.io.File f = DiagLog.debugFile();
+            if(f != null && f.exists()) sz = f.length();
+            if(f != null && f.getParentFile() != null){
+                java.io.File[] fs = f.getParentFile().listFiles();
+                if(fs != null){
+                    files = fs.length;
+                    for(java.io.File x : fs) if(x != null && x.isFile()) dirSz += x.length();
+                }
+            }
+        }catch(Throwable t){}
+        String keep = (d <= 0) ? "不按时间清理" : ("保留 " + d + " 天");
+        return keep + " · 单文件上限 100MB · 当前 "
+                + InnerDownloader.sizeText(sz) + " / 目录 " + files + " 个共 "
+                + InnerDownloader.sizeText(dirSz);
+    }
+
+    /** 选日志保留天数 */
+    void showKeepDaysDialog(){
+        curDark = isDarkMode();
+        // 两步弹窗：先说明，再选。
+        // 不能 setMessage + setSingleChoiceItems 混用 ——
+        // message 会把列表挤掉，用户只能看到说明和取消按钮，
+        // 选项一条都不显示（这个坑本项目踩过一次，用户明确要求禁止）。
+        dypDlg()
+            .setTitle("日志保留天数")
+            .setMessage("超过天数的旧日志文件会被自动删除。\n\n"
+                    + "另有两条固定规则，不受这里影响：\n"
+                    + "· 单个日志文件超过 100MB → 截断保留后半段\n"
+                    + "· logs 目录总大小超过 100MB → 从最旧的文件开始删\n\n"
+                    + "debug.log / crash.log 是当前正在写的文件，不按天数删。\n\n"
+                    + "当前：" + (DiagLog.keepDays() <= 0
+                        ? "不按时间清理" : ("保留 " + DiagLog.keepDays() + " 天")))
+            .setPositiveButton("选择天数", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    showKeepDaysList();
+                }
+            })
+            .setNegativeButton("关闭", null)
+            .create().show();
+    }
+
+    /** 第二步：纯列表弹窗（不带 message，避免列表被挤没） */
+    void showKeepDaysList(){
+        final int[] vals = { 3, 7, 15, 30, 0 };
+        String[] items = new String[vals.length];
+        for(int i = 0; i < vals.length; i++){
+            if(vals[i] == 0) items[i] = "不按时间清理（只受 100MB 上限约束）";
+            else items[i] = "保留 " + vals[i] + " 天";
+        }
+        int cur = DiagLog.keepDays();
+        int sel = 1;   // 默认 7 天
+        for(int i = 0; i < vals.length; i++) if(vals[i] == cur) sel = i;
+        dypDlg()
+            .setTitle("选择日志保留天数")
+            .setSingleChoiceItems(items, sel, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    DiagLog.setKeepDays(vals[which]);
+                    Log.i("DYP", "LOG_KEEP_DAYS set=" + vals[which]);
+                    try{ dd.dismiss(); }catch(Throwable t){}
+                    buildSettingsPage();
+                    showHintToast(vals[which] == 0
+                        ? "已关闭按天数清理" : ("日志保留 " + vals[which] + " 天"));
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
     }
 
     // ================= 崩溃捕获 =================
@@ -3059,11 +4489,19 @@ addSettingSection("平台支持");
                 if(prev != null) prev.uncaughtException(th, ex);
             }
         });
-Log.i("DYP", "CRASH_HANDLER_INSTALLED");
+DypLog.i("CRASH_HANDLER_INSTALLED");
     }
 
     // ================= 存储权限 =================
     static final int REQ_STORAGE = 1001;
+    /** 选本地 .torrent 种子文件 */
+    static final int REQ_TORRENT = 1002;
+    /** 系统目录选择器（ACTION_OPEN_DOCUMENT_TREE） */
+    static final int REQ_DIR_TREE = 1003;
+    /** 本次系统目录选择要写进哪个 prefs key（选完在 onActivityResult 里用） */
+    volatile String pendingDirKey = null;
+    /** 本次选择的默认值（用来判断「选的就是默认目录」→ 存空值） */
+    volatile String pendingDirDef = null;
     /** 本次启动是否已经自动申请过存储权限（避免每次回前台都弹） */
     volatile boolean permAskedThisLaunch = false;
     /** 本次启动是否已经弹过后台保活提示（避免 onResume 反复弹） */
@@ -3130,7 +4568,7 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
             it.setData(android.net.Uri.parse("package:" + getPackageName()));
             startActivity(it);
         }catch(Throwable t){
-            Log.i("DYP", "OPEN_SETTINGS_ERR " + t);
+            DypLog.i("OPEN_SETTINGS_ERR " + t);
             showHintToast("无法打开设置，请手动到系统设置里开启存储权限");
         }
     }
@@ -3530,13 +4968,13 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
             if(m.isEmpty()) return false;
             int n = m.size();
             CookieStore.saveMap(this, CookieStore.PLATFORM_DY, m);
-            Log.i("DYP", "DY_CK_GRAB len=" + ck.length() + " saved=" + n + "（仅登录票据）"
+            DypLog.i("DY_CK_GRAB len=" + ck.length() + " saved=" + n + "（仅登录票据）"
                     + " file=" + CookieStore.filePath(this, CookieStore.PLATFORM_DY));
             DiagLog.i(DiagLog.M_PARSE, "抖音登录票据已存本地 | " + n + " 项 | "
                     + CookieStore.filePath(this, CookieStore.PLATFORM_DY));
             return true;
         }catch(Throwable t){
-            Log.i("DYP", "DY_CK_GRAB_ERR " + t);
+            DypLog.i("DY_CK_GRAB_ERR " + t);
             DiagLog.e(DiagLog.M_PARSE, "保存抖音 Cookie 失败", t);
             return false;
         }
@@ -3580,6 +5018,7 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
         et.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
         et.setMinLines(8);
         et.setMaxLines(14);
+        styleInput(et);
         et.setHorizontallyScrolling(false);
         et.setText(cur);
         et.setHint(CookieStore.PLATFORM_INS.equals(platform)
@@ -3663,6 +5102,88 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
         }catch(Throwable t){}
     }
 
+    /** X 登录状态摘要（设置页副标题） */
+    String xLoginSummary(){
+        try{
+            int n = CookieStore.count(this, CookieStore.PLATFORM_X);
+            if(n <= 0) return "未登录 · 敏感账号主页需登录";
+            String auth = CookieStore.get(this, CookieStore.PLATFORM_X, "auth_token");
+            return (auth != null && auth.length() >= 16)
+                    ? ("已登录（" + n + " 项）· 主页可解析") : ("已保存 " + n + " 项 · 缺 auth_token");
+        }catch(Throwable t){ return "未登录"; }
+    }
+
+    /** X 登录弹窗：App 内登录 / 手动粘贴 / 清除 */
+    void showXLoginDialog(){
+        curDark = isDarkMode();
+        int n = CookieStore.count(this, CookieStore.PLATFORM_X);
+        StringBuilder tip = new StringBuilder();
+        tip.append("X（Twitter）敏感账号（如成人内容号）的主页，匿名接口会返回空，必须带登录 Cookie。\n\n");
+        if(n > 0){
+            tip.append("当前已保存 ").append(n).append(" 项 Cookie。\n\n");
+        }else{
+            tip.append("当前未登录。\n\n");
+        }
+        tip.append("方式一：点「App 内登录」，在页面里登录你自己的 X 账号，登录成功后自动抓 Cookie 保存到手机本地（不上传服务器）。\n\n");
+        tip.append("方式二：点「手动填写」，粘贴浏览器里的 Cookie（需含 auth_token 与 ct0）。");
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle("X（Twitter）登录")
+            .setMessage(tip.toString())
+            .setPositiveButton("App 内登录", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){ startXLogin(); }})
+            .setNeutralButton("手动填写", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){ showXCookieManual(); }})
+            .setNegativeButton("关闭", null)
+            .create();
+        dlg.show();
+        try{
+            android.widget.TextView msg = dlg.findViewById(android.R.id.message);
+            if(msg != null) msg.setTextSize(12);
+        }catch(Throwable t){}
+        if(CookieStore.count(this, CookieStore.PLATFORM_X) > 0){
+            dlg.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "清除",
+                new android.content.DialogInterface.OnClickListener(){
+                    public void onClick(android.content.DialogInterface dd, int w){
+                        CookieStore.clear(MainActivity.this, CookieStore.PLATFORM_X);
+                        showHintToast("X Cookie 已清除");
+                        buildSettingsPage();
+                    }});
+        }
+    }
+
+    /** 手动粘贴 X Cookie（两步弹窗：先说明再输入） */
+    void showXCookieManual(){
+        curDark = isDarkMode();
+        final android.widget.EditText et = new android.widget.EditText(this);
+        et.setHint("auth_token=xxx; ct0=yyy");
+        et.setTextSize(12);
+        et.setMinLines(3);
+        et.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
+        String exist = CookieStore.dump(this, CookieStore.PLATFORM_X);
+        if(exist != null && exist.length() > 0) et.setText(exist);
+        android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int pad = dp(16);
+        box.setPadding(pad, pad / 2, pad, 0);
+        box.addView(et, new android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+        android.app.AlertDialog dlg = dypDlg()
+            .setTitle("粘贴 X Cookie")
+            .setView(box)
+            .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    String t = et.getText() == null ? "" : et.getText().toString().trim();
+                    if(t.length() < 16){ showHintToast("Cookie 太短"); return; }
+                    int c = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_X, t);
+                    showHintToast("已保存 " + c + " 项 X Cookie");
+                    buildSettingsPage();
+                }})
+            .setNegativeButton("取消", null)
+            .create();
+        dlg.show();
+    }
+
     /** Instagram 登录方式选择（风险提示同意后进入） */
     void showInsLoginMenu(){
         curDark = isDarkMode();
@@ -3734,6 +5255,311 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
         return "默认：Download/DYParse/" + cat;
     }
 
+    /** 「下载保存位置」的副标题：显示当前实际路径 + 是不是自定义 */
+    String dlRootLabel(){
+        String def = new java.io.File(
+                android.os.Environment.getExternalStorageDirectory(),
+                "Download/DYParse").getAbsolutePath();
+        String cur = getSharedPreferences(SP, MODE_PRIVATE)
+                .getString(KEY_DL_PATH, "");
+        boolean custom = cur != null && cur.length() > 0;
+        String shown = custom ? cur : def;
+        return (custom ? "当前（自定义）：" : "当前（默认）：") + "\n" + shown;
+    }
+
+    /** 下载保存位置：先说明弹窗（含「恢复默认」），再进系统选择器。
+     *
+     *  为什么要有这一层：
+     *      系统选择器（SAF）只有「取消 / 确定」，没地方放「恢复默认」。
+     *      加这一层后：
+     *        · 用户能先看到自己现在存在哪
+     *        · 「恢复默认」有地方放了
+     */
+    void showDlRootDialog(){
+        curDark = isDarkMode();
+        final String def = new java.io.File(
+                android.os.Environment.getExternalStorageDirectory(),
+                "Download/DYParse").getAbsolutePath();
+        String cur = getSharedPreferences(SP, MODE_PRIVATE)
+                .getString(KEY_DL_PATH, "");
+        final boolean custom = cur != null && cur.length() > 0;
+        String shown = custom ? cur : def;
+
+        dypDlg()
+            .setTitle("下载保存位置")
+            .setMessage((custom ? "当前（自定义）：\n" : "当前（默认）：\n") + shown
+                    + "\n\n默认位置：\n" + def
+                    + "\n\n所有平台的文件都会放进这个文件夹，"
+                    + "里面再按「平台 / 视频·图片·动图·音频·合集」自动分子目录。")
+            .setPositiveButton("选择文件夹", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    pickDirWithSystem(KEY_DL_PATH, def, "选择下载保存位置");
+                }
+            })
+            .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putString(KEY_DL_PATH, "").apply();
+                    DypLog.i("DIR_PICK root -> (恢复默认)");
+                    buildSettingsPage();
+                    showHintToast("已恢复默认：" + def);
+                }
+            })
+            .setNegativeButton("关闭", null)
+            .create().show();
+    }
+
+    /** 打开系统目录选择器（SAF）。
+     *
+     *  为什么用它：系统选择器自带「返回上一级」、能浏览全盘、
+     *  还能新建文件夹，比自建的好用得多。
+     *
+     *  选完在 onActivityResult 里把 treeUri 还原成真实绝对路径
+     *  （见 treeUriToPath），下游全部用 File，不受影响。
+     */
+    void pickDirWithSystem(final String key, final String defAbs, final String title){
+        try{
+            pendingDirKey = key;
+            pendingDirDef = defAbs;
+            android.content.Intent it = new android.content.Intent(
+                    android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
+            it.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            // 起点：尽量让系统选择器直接落在当前目录
+            try{
+                String cur = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+                String start = (cur != null && cur.length() > 0) ? cur : defAbs;
+                android.net.Uri u = android.provider.DocumentsContract
+                        .buildDocumentUri("com.android.externalstorage.documents",
+                                pathToTreeDocId(start));
+                it.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, u);
+            }catch(Throwable t){}
+            startActivityForResult(it, REQ_DIR_TREE);
+            DypLog.i("DIR_TREE_OPEN key=" + key + " title=" + title);
+        }catch(Throwable t){
+            DypLog.e("DIR_TREE_OPEN_ERR " + t);
+            showHintToast("系统选择器打不开，改用内置选择器");
+            showDirPicker(key, defAbs, title);
+        }
+    }
+
+    /** 绝对路径 → SAF 的 documentId（primary:Download/DYParse） */
+    String pathToTreeDocId(String absPath){
+        try{
+            String root = android.os.Environment.getExternalStorageDirectory()
+                    .getAbsolutePath();
+            String p = new java.io.File(absPath).getAbsolutePath();
+            if(p.startsWith(root)){
+                String rel = p.substring(root.length());
+                if(rel.startsWith("/")) rel = rel.substring(1);
+                return rel.length() == 0 ? "primary:" : ("primary:" + rel);
+            }
+            if(p.startsWith("/storage/")){
+                String rest = p.substring("/storage/".length());
+                int slash = rest.indexOf('/');
+                if(slash > 0){
+                    return rest.substring(0, slash) + ":" + rest.substring(slash + 1);
+                }
+                return rest + ":";
+            }
+        }catch(Throwable t){}
+        return "primary:";
+    }
+
+    /** SAF treeUri → 真实绝对路径。
+     *
+     *  documentId 形如：
+     *      primary:Download/DYParse        → /storage/emulated/0/Download/DYParse
+     *      XXXX-XXXX:Movies                → /storage/XXXX-XXXX/Movies
+     *  还原失败返回空串。
+     */
+    String treeUriToPath(android.net.Uri treeUri){
+        try{
+            String docId = android.provider.DocumentsContract
+                    .getTreeDocumentId(treeUri);
+            if(docId == null || docId.length() == 0) return "";
+            int colon = docId.indexOf(':');
+            if(colon < 0) return "";
+            String vol = docId.substring(0, colon);
+            String rel = docId.substring(colon + 1);
+            String base;
+            if("primary".equalsIgnoreCase(vol)){
+                base = android.os.Environment.getExternalStorageDirectory()
+                        .getAbsolutePath();
+            }else{
+                base = "/storage/" + vol;
+            }
+            String full = rel.length() == 0 ? base : (base + "/" + rel);
+            return new java.io.File(full).getAbsolutePath();
+        }catch(Throwable t){
+            DypLog.e("TREE_URI_TO_PATH_ERR " + t);
+            return "";
+        }
+    }
+
+    /** 目录选择器的当前对话框引用（切目录时要 dismiss 旧的） */
+    final android.app.AlertDialog[] dirPickerRef = new android.app.AlertDialog[1];
+
+    /** 目录选择器：浏览并选一个真实目录。
+     *
+     *  为什么自己写而不是用系统 SAF：
+     *      SAF 给的是 content:// 树，下载层全是 File，改造成本太高。
+     *      本 App 有 MANAGE_EXTERNAL_STORAGE，可以直接读写真实路径，
+     *      自己弹个目录浏览器最省事，选完直接是 File 可用的绝对路径。
+     *
+     *  @param key     写进哪个 prefs key
+     *  @param defAbs  默认绝对路径（用户点「恢复默认」时把这个 key 置空）
+     *  @param title   标题
+     */
+    void showDirPicker(final String key, final String defAbs, final String title){
+        curDark = isDarkMode();
+        // 起点：已存的自定义路径 > 默认路径 > 外部存储根
+        String saved = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+        String start = (saved != null && saved.length() > 0) ? saved : defAbs;
+        java.io.File f0 = new java.io.File(start);
+        if(!f0.exists() || !f0.isDirectory()) f0 = new java.io.File(defAbs);
+        if(!f0.exists() || !f0.isDirectory()){
+            f0 = android.os.Environment.getExternalStorageDirectory();
+        }
+        showDirPickerAt(key, defAbs, title, f0.getAbsolutePath());
+    }
+
+    /** 目录选择器的实际渲染（点进子目录时递归调用） */
+    void showDirPickerAt(final String key, final String defAbs,
+                         final String title, final String curPath){
+        curDark = isDarkMode();
+        final java.io.File dir = new java.io.File(curPath);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(16);
+        box.setPadding(pad, dp(6), pad, dp(4));
+
+        // 「⬆ 上一级」——之前没有这个，用户进去就出不来了（截图反馈）
+        TextView upTv = new TextView(this);
+        upTv.setText("⬆  上一级");
+        upTv.setTextSize(13);
+        upTv.setTextColor(curDark ? 0xFF7FB0FF : 0xFF2F6FE0);
+        upTv.setPadding(0, 0, 0, dp(8));
+        upTv.setOnClickListener(new View.OnClickListener(){
+            public void onClick(View v){
+                java.io.File p = dir.getParentFile();
+                if(p == null || !p.exists() || !p.isDirectory()){
+                    showHintToast("已经是最顶层了");
+                    return;
+                }
+                try{ if(dirPickerRef[0] != null) dirPickerRef[0].dismiss(); }catch(Throwable t){}
+                showDirPickerAt(key, defAbs, title, p.getAbsolutePath());
+            }
+        });
+        box.addView(upTv);
+
+        TextView pathTv = new TextView(this);
+        pathTv.setText(curPath);
+        pathTv.setTextSize(11);
+        pathTv.setTextColor(curDark ? 0xFF8A8F9C : 0xFF6B6F7A);
+        pathTv.setPadding(0, 0, 0, dp(6));
+        box.addView(pathTv);
+
+        java.io.File[] subs = dir.listFiles();
+        java.util.List<java.io.File> dirs = new java.util.ArrayList<java.io.File>();
+        if(subs != null){
+            for(java.io.File f : subs){
+                if(f == null || !f.isDirectory()) continue;
+                String nm = f.getName();
+                if(nm.startsWith(".")) continue;      // 跳过隐藏目录
+                if(nm.equals("Android")) continue;    // Android/data 不可写，跳过
+                dirs.add(f);
+            }
+        }
+        java.util.Collections.sort(dirs, new java.util.Comparator<java.io.File>(){
+            public int compare(java.io.File a, java.io.File b){
+                String x = a.getName().toLowerCase();
+                String y = b.getName().toLowerCase();
+                return x.compareTo(y);
+            }
+        });
+
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        LinearLayout listBox = new LinearLayout(this);
+        listBox.setOrientation(LinearLayout.VERTICAL);
+        sv.addView(listBox);
+        LinearLayout.LayoutParams svLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(240));
+        box.addView(sv, svLp);
+
+        if(dirs.isEmpty()){
+            TextView empty = new TextView(this);
+            empty.setText("（这个目录下没有子目录）");
+            empty.setTextSize(12);
+            empty.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+            empty.setPadding(0, dp(8), 0, dp(8));
+            listBox.addView(empty);
+        }
+        for(final java.io.File d : dirs){
+            TextView row = new TextView(this);
+            row.setText("📁 " + d.getName());
+            row.setTextSize(13);
+            row.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+            row.setPadding(dp(6), dp(11), dp(6), dp(11));
+            row.setOnClickListener(new View.OnClickListener(){
+                public void onClick(View v){
+                    try{ if(dirPickerRef[0] != null) dirPickerRef[0].dismiss(); }catch(Throwable t){}
+                    showDirPickerAt(key, defAbs, title, d.getAbsolutePath());
+                }
+            });
+            listBox.addView(row);
+        }
+
+        final String target = curPath;
+        String warn = "";
+        try{
+            if(!android.os.Environment.isExternalStorageManager()){
+                warn = "\n\n⚠ 未开启「所有文件访问权限」，选任意目录可能写入失败。";
+            }
+        }catch(Throwable t){}
+
+        final android.app.AlertDialog dlg = dypDlg()
+            .setTitle(title)
+            .setView(box)
+            .setMessage("当前：\n" + target + "\n\n"
+                    + "点文件夹进下一级，点「就用这个目录」确定。" + warn)
+            .setPositiveButton("就用这个目录", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    // 选的恰好是默认目录 → 存空值走默认，
+                    // 这样以后改「下载根目录」时不会因为写死绝对路径而失效
+                    String v = target;
+                    try{
+                        String defNorm = new java.io.File(defAbs).getAbsolutePath();
+                        String curNorm = new java.io.File(target).getAbsolutePath();
+                        if(defNorm.equals(curNorm)) v = "";
+                    }catch(Throwable t){}
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putString(key, v).apply();
+                    DypLog.i("DIR_PICK key=" + key + " -> "
+                            + (v.length() == 0 ? "(默认)" : v));
+                    buildSettingsPage();
+                    Toast.makeText(MainActivity.this,
+                        v.length() == 0 ? "已恢复默认目录" : ("已选择：" + v),
+                        Toast.LENGTH_SHORT).show();
+                }
+            })
+            .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putString(key, "").apply();
+                    DypLog.i("DIR_PICK key=" + key + " -> (恢复默认)");
+                    buildSettingsPage();
+                    Toast.makeText(MainActivity.this, "已恢复默认目录", Toast.LENGTH_SHORT).show();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create();
+        dirPickerRef[0] = dlg;
+        dlg.show();
+    }
+
     /** 下载目录设置弹窗（独立对话框，直接输入路径） */
     void showDlDirDialog(final String cat, final String key, final String def){
         curDark = isDarkMode();
@@ -3743,8 +5569,7 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
         et.setHint(def);
         et.setSingleLine(true);
         et.setTextSize(13);
-        et.setTextColor(curDark ? 0xFFE6E8EC : 0xFF23262E);
-        et.setHintTextColor(curDark ? 0xFF7A8194 : 0xFF9AA0AC);
+        styleInput(et);
         int pad = dp(16);
         LinearLayout wrap = new LinearLayout(this);
         wrap.setOrientation(LinearLayout.VERTICAL);
@@ -3767,7 +5592,7 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
                             v.length() == 0 ? ("已恢复" + cat + "默认目录")
                                             : ("已设置" + cat + "目录：" + v),
                             Toast.LENGTH_SHORT).show();
-                    }catch(Throwable t){ Log.i("DYP", "DLDIR_SAVE_ERR " + t); }
+                    }catch(Throwable t){ DypLog.i("DLDIR_SAVE_ERR " + t); }
                 }
             })
             .setNegativeButton("取消", null)
@@ -3791,13 +5616,45 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
           null, null);
     }
 
+    /** 统一设置输入框样式：高亮可读。
+     *
+     *  原来的输入框只设了文字色，没设背景 ——
+     *  在 ColorOS 的对话框主题下，输入框和对话框底色几乎一样，
+     *  用户根本看不清自己输入了什么（尤其深色模式）。
+     *
+     *  这里给：实心底色 + 明显描边 + 圆角 + 内边距，
+     *  保证「没聚焦时也能一眼看出这是输入区」。
+     */
+    void styleInput(EditText et){
+        if(et == null) return;
+        boolean dark = isDarkMode();
+        int bg  = dark ? 0xFF1A1D24 : 0xFFF7F8FA;
+        int str = dark ? 0xFF3A3F4B : 0xFFD8DBE2;
+        int txt = dark ? 0xFFE6E8EC : 0xFF1A1C22;
+        int sub = dark ? 0xFF8A8F9C : 0xFF9AA0AC;
+        int accent = 0xFFFE2C55;
+        try{
+            et.setBackground(makeRoundRect(bg, str, 10));
+        }catch(Throwable t){}
+        et.setTextColor(txt);
+        et.setHintTextColor(sub);
+        int p = dp(12);
+        et.setPadding(p, dp(10), p, dp(10));
+        // 光标用主题强调色，聚焦时看得见
+        try{
+            if(android.os.Build.VERSION.SDK_INT >= 29){
+                et.setTextCursorDrawable(null);
+            }
+        }catch(Throwable t){}
+    }
+
     /** 设置页行 */
     /** 平台清单：一行一个平台 */
     static final String[] PLATFORM_LIST = new String[]{
         "抖音", "快手", "TikTok", "X（推特）", "YouTube", "Instagram",
         "B站", "小红书", "微信视频号", "微信公众号", "微博",
         "今日头条", "西瓜视频", "AcFun", "好看视频",
-        "最右", "皮皮虾", "皮皮搞笑", "微视", "豆包"
+        "最右", "皮皮虾", "皮皮搞笑", "微视", "豆包", "腾讯视频", "磁力下载"
     };
 
     /** 平台清单弹窗（跟随主题） */
@@ -3906,21 +5763,21 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
             if(!xhsLoginMode) return;
             String ck = CookieManager.getInstance().getCookie("https://www.xiaohongshu.com/");
             if(ck == null || ck.length() < 10){
-                Log.i("DYP", "XHS_CK_MGR empty");
+                DypLog.i("XHS_CK_MGR empty");
                 return;
             }
             boolean hasSession = ck.contains("web_session=");
             boolean hasA1 = ck.contains("a1=");
-            Log.i("DYP", "XHS_CK_MGR len=" + ck.length()
+            DypLog.i("XHS_CK_MGR len=" + ck.length()
                 + " session=" + hasSession + " a1=" + hasA1);
             if(!hasSession && !hasA1) return;
             int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_XHS, ck);
-            Log.i("DYP", "XHS_CK_SAVED items=" + n);
+            DypLog.i("XHS_CK_SAVED items=" + n);
             h.post(new Runnable(){ public void run(){
                 s("小红书 Cookie 已保存（" + n + " 项）");
                 buildSettingsPage();
             }});
-        }catch(Throwable t){ Log.i("DYP", "XHS_CK_MGR_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("XHS_CK_MGR_ERR " + t); }
     }
 
     void maybeGrabXhsCookie(String url, java.util.Map<String,String> headers){
@@ -3947,11 +5804,11 @@ Log.i("DYP", "CRASH_HANDLER_INSTALLED");
             }
             if(full.length() < 20) return;
             int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_XHS, full);
-            Log.i("DYP", "XHS_CK_GRAB len=" + full.length() + " saved=" + n);
+            DypLog.i("XHS_CK_GRAB len=" + full.length() + " saved=" + n);
             h.post(new Runnable(){ public void run(){
                 s("小红书 Cookie 已保存（" + n + " 项）");
             }});
-        }catch(Throwable t){ Log.i("DYP", "XHS_CK_GRAB_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("XHS_CK_GRAB_ERR " + t); }
     }
 
     /** 设置项图标映射：按标题关键字匹配，未命中给默认圆点 */
@@ -4054,6 +5911,11 @@ String settingIcon(String title){
             lp.bottomMargin = dp(8);
             row.setLayoutParams(lp);
 
+            // 缩略图：视频抽首帧，图片降采样
+            android.widget.ImageView thumb = makeThumbView(44);
+            row.addView(thumb);
+            loadThumb(thumb, f, 96, "视频");
+
             TextView name = new TextView(this);
             name.setText(f.getName());
             name.setTextSize(13);
@@ -4075,10 +5937,20 @@ String settingIcon(String title){
             row.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
                 // 历史页点击：视频直接播，图片弹大图
                 String name = f.getName().toLowerCase();
-                if(name.endsWith(".mp4") || name.endsWith(".m4a")){
+                if(name.endsWith(".mp4") || name.endsWith(".m4a")
+                        || name.endsWith(".mkv") || name.endsWith(".avi")
+                        || name.endsWith(".mov") || name.endsWith(".webm")
+                        || name.endsWith(".ts") || name.endsWith(".m4v")){
                     curPlay = "file://" + f.getAbsolutePath();
+                    curUrl = curPlay;
                     curImgs = "";
                     curId = f.getName();
+                    // 本地文件必须重建播放器（不能复用之前带代理/Referer 的实例）
+                    miniProxyKey = null;
+                    if(miniPlayer != null){
+                        try{ miniPlayer.release(); }catch(Throwable t2){}
+                        miniPlayer = null;
+                    }
                     switchTab(0);
                     actions.setVisibility(View.VISIBLE);
                     videoBox.setVisibility(View.VISIBLE);
@@ -4196,7 +6068,7 @@ String settingIcon(String title){
                 dyPr = it != null && it.getBooleanExtra("dyprobe", false);
                 dyUrl = it != null ? it.getStringExtra("dyurl") : null;
                 dyNoUifid = it != null && it.getBooleanExtra("nouifid", false);
-                if(dyNoUifid) Log.i("DYP", "DYPROF_DEBUG 强制不带 uifid");
+                if(dyNoUifid) DypLog.i("DYPROF_DEBUG 强制不带 uifid");
             }catch(Throwable t){}
             if(dyUrl != null && dyUrl.length() > 0){
                 startDyProbeUrl(dyUrl);
@@ -4223,13 +6095,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             try{
                 curResult = text;
                 renderCards(text);
-                Log.i("DYP", "O2_CARDS textLen=" + (text == null ? -1 : text.length()));
+                DypLog.i("O2_CARDS textLen=" + (text == null ? -1 : text.length()));
                 if(cover != null && cover.length() > 0) curCover = cover;
                 if(play != null && play.length() > 0) curPlay = play;
                 if(imgs != null && imgs.length() > 0) curImgs = imgs;
                 showMediaNow();
             }catch(Throwable t){
-                Log.i("DYP", "O2_ERR " + t);
+                DypLog.i("O2_ERR " + t);
             }
         }});
     }
@@ -4242,7 +6114,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 parseImgs();
                 hasImgs = imgUrls.size() > 0;
             }
-            Log.i("DYP", "SHOW_MEDIA imgs=" + imgUrls.size()
+            DypLog.i("SHOW_MEDIA imgs=" + imgUrls.size()
                 + " play=" + (curPlay == null ? -1 : curPlay.length())
                 + " cover=" + (curCover == null ? -1 : curCover.length()));
             if(hasImgs){
@@ -4270,7 +6142,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     if(curCover != null && curCover.length() > 0){
                         img.setVisibility(View.VISIBLE);
                         loadImage(curCover, img);
-                        Log.i("DYP", "SHOW_MEDIA 显示封面预览");
+                        DypLog.i("SHOW_MEDIA 显示封面预览");
                     } else {
                         img.setVisibility(View.GONE);
                     }
@@ -4278,7 +6150,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 maybeAutoAction();
             }
         }catch(Throwable t){
-            Log.i("DYP", "SHOW_MEDIA_ERR " + t);
+            DypLog.i("SHOW_MEDIA_ERR " + t);
         }
     }
 
@@ -4293,16 +6165,424 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     void progSet(final float ratio, final String label){
         int p = (int)(Math.max(0f, Math.min(1f, ratio)) * 1000);
         h.post(new Runnable(){ public void run(){
-            if(progressBar != null) progressBar.setProgress(p);
+            if(progressBar != null){
+                if(progressBar.isIndeterminate()) progressBar.setIndeterminate(false);
+                progressBar.setProgress(p);
+            }
             if(progressPct != null) progressPct.setText((p / 10) + "%");
             if(label != null && progressLabel != null) progressLabel.setText(label);
         }});
-        Log.i("DYP", "PROG " + (p / 10) + "% " + label);
+        DypLog.i("PROG " + (p / 10) + "% " + label);
         // 通知栏同步：让后台下载时进度条/文字都能看到实时状态
         try{
             DownloadService.updateProgress("DYParse 下载 " + (p / 10) + "%", label, p / 10);
         }catch(Throwable t){}
     }
+    /** 不确定态进度：转圈 + 不显示百分比（磁力获取元数据时用） */
+    void progBusy(final String label){
+        h.post(new Runnable(){ public void run(){
+            try{
+                if(progressBox != null) progressBox.setVisibility(View.VISIBLE);
+                if(progressBar != null){
+                    progressBar.setIndeterminate(true);
+                }
+                if(progressPct != null) progressPct.setText("--");
+                if(label != null && progressLabel != null) progressLabel.setText(label);
+            }catch(Throwable t){}
+        }});
+        DypLog.i("PROG_BUSY " + label);
+        try{ DownloadService.updateProgress("DYParse 下载", label, -1); }catch(Throwable t){}
+    }
+
+    /** 下载列表：新建一行（key 用任务序号） */
+    /** 单个下载(silent)的行 key 集合：这些行一律不进「下载」页 */
+    final java.util.Set<Integer> dlSilentKeys =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<Integer>());
+
+    void dlRowAdd(final int key, String fileName){
+        if(dlTaskList == null) return;
+        if(dlSilentKeys.contains(key)) return;
+        h.post(new Runnable(){ public void run(){
+            try{
+                if(dlRowName.containsKey(key)) return;
+                // 外层：竖排，一行 = 名称行 + 进度条
+                LinearLayout row = new LinearLayout(MainActivity.this);
+                row.setOrientation(LinearLayout.VERTICAL);
+                row.setPadding(0, dp(5), 0, dp(5));
+
+                LinearLayout line = new LinearLayout(MainActivity.this);
+                line.setOrientation(LinearLayout.HORIZONTAL);
+                line.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+                TextView name = new TextView(MainActivity.this);
+                name.setText(fileName == null ? "?" : fileName);
+                name.setTextSize(11);
+                name.setTextColor(curDark ? 0xFFD8DCE6 : 0xFF3A3F49);
+                name.setSingleLine(true);
+                name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+                LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
+                        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+                name.setLayoutParams(nlp);
+                line.addView(name);
+
+                TextView meta = new TextView(MainActivity.this);
+                meta.setText("等待…");
+                meta.setTextSize(11);
+                meta.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+                meta.setPadding(dp(8), 0, 0, 0);
+                line.addView(meta);
+                // 每行一个「继续」按钮：任务没下完时用户可手动继续（持久化的未完成任务）
+                TextView btnResume = new TextView(MainActivity.this);
+                btnResume.setText("继续");
+                btnResume.setTextSize(11);
+                btnResume.setTextColor(curDark ? 0xFF6FA8FF : 0xFF2F6FE4);
+                btnResume.setPadding(dp(10), dp(3), dp(6), dp(3));
+                btnResume.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                    DlTask t = dlRowResume.get(key);
+                    if(t == null){
+                        // 磁力（dlRowResume 里为 null）→ 用保存的磁力链接继续
+                        String m = loadBtTask();
+                        if(m != null && m.length() >= 8){
+                            DypLog.i("DL_ROW_RESUME_BT");
+                            showHintToast("继续磁力下载");
+                            startMagnetDownload(m);
+                        } else {
+                            showHintToast("该任务没有可恢复的信息");
+                        }
+                        return;
+                    }
+                    resumeOneTask(t);
+                }});
+                line.addView(btnResume);
+                // 每行「暂停」：暂停该任务（.part 保留，可再点继续）
+                TextView btnPause = new TextView(MainActivity.this);
+                btnPause.setText("暂停");
+                btnPause.setTextSize(11);
+                btnPause.setTextColor(curDark ? 0xFFB8BEC9 : 0xFF6B7280);
+                btnPause.setPadding(dp(8), dp(3), dp(6), dp(3));
+                btnPause.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                    try{
+                        DlTask t = dlRowResume.get(key);
+                        // 是否为磁力行：必须以 dlRowIsBt 为准。
+                        // 之前用 t == null 判断，普通视频行一旦拿不到 task（恢复行/
+                        // 映射没注册），就会误进 BT 分支 → 打 DL_ROW_PAUSE_BT，
+                        // 视频还在下，看着就是「暂停没反应」。
+                        boolean isBtRow = dlRowIsBt.containsKey(key)
+                                && Boolean.TRUE.equals(dlRowIsBt.get(key));
+                        if(t != null) {
+                            // 暂停：必须同时做三件事，否则「暂停」按钮无效
+                            // 1) 置取消标记 → InnerDownloader 读循环下一块就退出
+                            // 2) 从队列/在飞列表移除 → 调度器不再消费它
+                            // 3) 放进待恢复清单 → 用户可点「继续」接着下
+                            try{ InnerDownloader.cancel(t.url); }catch(Throwable te){}
+                            dlPaused.add(dlTaskKey(t));   // 记为「用户主动暂停」，不要当失败
+                            synchronized(downloadQueue){ downloadQueue.remove(t); }
+                            synchronized(dlInFlight){ dlInFlight.remove(t); }
+                            synchronized(dlFailed){ dlFailed.remove(t); dlFailed.add(t); }
+                            synchronized(dlSavedPending){ dlSavedPending.add(t); }
+                            saveDlTasks();
+                            DypLog.i("DL_ROW_PAUSE " + t.tag + " url=" + t.url);
+                        } else if(isBtRow) {
+                            // 磁力：关掉 BT 引擎（.torrent 与 .part 都保留在磁盘）
+                            DypLog.i("DL_ROW_PAUSE_BT");
+                            try{ BtDownloader.shutdown(); }catch(Throwable t2){}
+                            btRunning = false;
+                        } else {
+                            // 普通行但没映射（历史/恢复行）：也要给出可见反馈
+                            DypLog.i("DL_ROW_PAUSE_NO_TASK key=" + key);
+                        }
+                        dlRowUpdate(key, -1, "已暂停 · 点「继续」接着下");
+                        showHintToast(isBtRow ? "磁力已暂停" : "已暂停，点「继续」接着下");
+                        dlRefreshHead();
+                    }catch(Throwable e){ DypLog.i("DL_PAUSE_ERR " + e); }
+                }});
+                line.addView(btnPause);
+
+                // 每行「删除」：从列表移除，并问用户是否同时删本地文件
+                TextView btnDel = new TextView(MainActivity.this);
+                btnDel.setText("删除");
+                btnDel.setTextSize(11);
+                btnDel.setTextColor(curDark ? 0xFFFF8A8A : 0xFFD93B3B);
+                btnDel.setPadding(dp(8), dp(3), dp(2), dp(3));
+                btnDel.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+                    confirmDeleteDlRow(key);
+                }});
+                line.addView(btnDel);
+
+                row.addView(line);
+
+                ProgressBar pb = new ProgressBar(MainActivity.this, null,
+                        android.R.attr.progressBarStyleHorizontal);
+                pb.setMax(1000);
+                pb.setProgress(0);
+                LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, dp(3));
+                plp.topMargin = dp(3);
+                pb.setLayoutParams(plp);
+                try{
+                    pb.setProgressTintList(android.content.res.ColorStateList.valueOf(
+                            curDark ? 0xFF6FA8FF : 0xFF2F6FE4));
+                }catch(Throwable t){}
+                row.addView(pb);
+
+                dlRowName.put(key, name);
+                dlRowMeta.put(key, meta);
+                dlRowBar.put(key, pb);
+                dlRowOrder.add(key);
+                dlRowView.put(key, row);
+                dlTaskList.addView(row);
+
+                dlTaskList.setVisibility(View.VISIBLE);
+                // 注意：progressBox 属于「解析」页，不能因为下载页加了一行就顶起来。
+                // 否则开屏恢复未完成任务时，解析页会莫名冒出「准备中 0%」。
+                dlRefreshHead();
+                DypLog.i("DLROW_ADD key=" + key + " name=" + fileName
+                        + " rows=" + dlTaskList.getChildCount());
+            }catch(Throwable t){ DypLog.i("DLROW_ADD_ERR " + t); }
+        }});
+    }
+
+    /** 下载列表：更新某行（progress 0~1000，-1 表示不确定；meta 为右侧文字） */
+    void dlRowUpdate(final int key, final int progress, final String meta){
+        if(dlSilentKeys.contains(key)){
+            // silent：只更新解析页进度条，不进下载列表
+            if(progress >= 0) progSet(progress / 1000f, meta);
+            return;
+        }
+        h.post(new Runnable(){ public void run(){
+            try{
+                ProgressBar pb = dlRowBar.get(key);
+                if(pb != null && progress >= 0) pb.setProgress(progress);
+                TextView tv = dlRowMeta.get(key);
+                if(tv != null && meta != null) tv.setText(meta);
+            }catch(Throwable t){}
+        }});
+    }
+
+    /** 下载页某行「删除」：勾选框让用户选是否同时删本地文件（默认不勾） */
+    void confirmDeleteDlRow(final int key){
+        curDark = isDarkMode();
+        final boolean isBt = dlRowIsBt.containsKey(key)
+                ? Boolean.TRUE.equals(dlRowIsBt.get(key)) : false;
+        final String path = dlRowPath.get(key);
+        boolean hasPath = path != null && path.length() > 0;
+        String nm = "";
+        try{
+            TextView tv = dlRowName.get(key);
+            if(tv != null) nm = tv.getText().toString();
+        }catch(Throwable t){}
+
+        // 用显式容器装勾选框（不用双大括号初始化，也不靠 findViewById(android.R.id.custom)）
+        android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), dp(4));
+
+        TextView tvMsg = new TextView(this);
+        String msg = "要从下载列表移除这条任务吗？\n\n" + nm;
+        if(hasPath) msg += "\n\n本地位置：\n" + path;
+        tvMsg.setText(msg);
+        tvMsg.setTextSize(13);
+        tvMsg.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+        box.addView(tvMsg);
+
+        // 勾选框：☐ 默认不勾；点一下变 ☑
+        final boolean[] delFile = new boolean[]{ false };
+        final TextView cb = new TextView(this);
+        cb.setText("☐ 同时删除本地文件");
+        cb.setTextSize(14);
+        cb.setTextColor(curDark ? 0xFF8A8F9C : 0xFF6B7280);
+        cb.setPadding(0, dp(12), 0, dp(6));
+        cb.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            delFile[0] = !delFile[0];
+            cb.setText((delFile[0] ? "☑" : "☐") + " 同时删除本地文件");
+            cb.setTextColor(delFile[0] ? 0xFFFE2C55
+                    : (curDark ? 0xFF8A8F9C : 0xFF6B7280));
+        }});
+        box.addView(cb);
+
+        dypDlg()
+            .setTitle(isBt ? "删除磁力任务" : "删除下载任务")
+            .setView(box)
+            .setPositiveButton("删除", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    doDeleteDlRow(key, isBt, path, delFile[0]);
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /** 真正执行删除（keepFile=true 表示保留磁盘文件） */
+    void doDeleteDlRow(int key, boolean isBt, String path, boolean deleteFile){
+        try{
+            // 1) 从队列 / 待恢复清单里摘掉这条任务
+            DlTask t = dlRowResume.get(key);
+            if(t == null){
+                // 行存在但拿不到任务（历史行/静默行）：至少要能移除界面行，
+                // 并记一条日志便于定位，不能让「删除」变成无操作。
+                DypLog.i("DL_DEL_NO_TASK key=" + key + " 仅移除界面行");
+            }
+            if(t != null){
+                dlDeleted.add(dlTaskKey(t));
+                // 真正中断读循环：InnerDownloader 每读一块都会检查这个标记
+                try{ InnerDownloader.cancel(t.url); }catch(Throwable te){}
+                DypLog.i("DL_CANCEL_URL " + t.url);
+                synchronized(downloadQueue){ downloadQueue.remove(t); }
+                synchronized(dlInFlight){ dlInFlight.remove(t); }
+                synchronized(dlFailed){ dlFailed.remove(t); }
+                synchronized(dlSavedPending){ dlSavedPending.remove(t); }
+                saveDlTasks();
+                DypLog.i("DL_DEL_BLACKLIST " + dlTaskKey(t));
+            }
+            if(isBt){
+                // 磁力：停引擎 + 清任务记录
+                try{ BtDownloader.shutdown(); }catch(Throwable t2){}
+                btFinishHash(path);
+                clearBtTask();
+                btSavedMagnet = "";
+                // 列表页那条也删掉
+                try{
+                    final String lid = btListItemId;
+                    if(lid != null && lid.length() > 0){
+                        synchronized(batchCollected){
+                            for(int i = batchCollected.size() - 1; i >= 0; i--){
+                                ProfileParser.ProfileItem o = batchCollected.get(i);
+                                if(o != null && lid.equals(o.id)) batchCollected.remove(i);
+                            }
+                        }
+                        saveBatchList();
+                        renderBatchList();
+                    }
+                }catch(Throwable t2){ DypLog.i("DL_DEL_LIST_ERR " + t2); }
+            }
+            // 2) 删磁盘文件
+            boolean delOk = false;
+            if(deleteFile && path != null && path.length() > 0){
+                try{
+                    java.io.File f = new java.io.File(path);
+                    delOk = deleteRecursive(f);
+                    DypLog.i("DL_DEL_FILE " + path + " ok=" + delOk);
+                }catch(Throwable t2){ DypLog.i("DL_DEL_FILE_ERR " + t2); }
+            }
+            // 3) 移除界面那一行
+            removeDlRow(key);
+            DypLog.i("DL_ROW_DELETED key=" + key + " bt=" + isBt
+                    + " fileDel=" + deleteFile + " ok=" + delOk);
+            showHintToast(deleteFile
+                    ? (delOk ? "任务已删除，本地文件已清理" : "任务已删除（本地文件没删掉）")
+                    : "任务已从列表移除（本地文件保留）");
+        }catch(Throwable e){ DypLog.i("DL_ROW_DELETE_ERR " + e); }
+    }
+
+    /** 递归删除文件/目录 */
+    boolean deleteRecursive(java.io.File f){
+        try{
+            if(f == null || !f.exists()) return false;
+            if(f.isDirectory()){
+                java.io.File[] cs = f.listFiles();
+                if(cs != null){
+                    for(java.io.File c : cs) deleteRecursive(c);
+                }
+            }
+            return f.delete();
+        }catch(Throwable t){ return false; }
+    }
+
+    /** 从下载页移除一行（含记录表清理） */
+    void removeDlRow(final int key){
+        h.post(new Runnable(){ public void run(){
+            try{
+                android.view.View row = dlRowView.get(key);
+                if(row != null && dlTaskList != null) dlTaskList.removeView(row);
+                dlRowName.remove(key);
+                dlRowMeta.remove(key);
+                dlRowBar.remove(key);
+                dlRowView.remove(key);
+                dlRowOrder.remove(Integer.valueOf(key));   // ArrayList.remove(int) 是按索引，必须装箱
+                dlRowResume.remove(key);
+                dlRowPath.remove(key);
+                dlRowIsBt.remove(key);
+                dlRefreshHead();
+            }catch(Throwable t){ DypLog.i("DL_ROW_REMOVE_ERR " + t); }
+        }});
+    }
+
+    /** 下载列表：改行内文件名（拿到真实名字后刷新，比如去重后缀） */
+    void dlRowRename(final int key, final String fileName){
+        h.post(new Runnable(){ public void run(){
+            try{
+                TextView tv = dlRowName.get(key);
+                if(tv != null) tv.setText(fileName);
+            }catch(Throwable t){}
+        }});
+    }
+
+    /** 刷新下载页头部：任务数 / 标题 */
+    void dlRefreshHead(){
+        if(dlHead == null) return;
+        h.post(new Runnable(){ public void run(){
+            try{
+                int rows = dlTaskList == null ? 0 : dlTaskList.getChildCount();
+                // 磁力任务也算在跑（在下载页有行）
+                boolean running = dlRunning || btRunning;
+                if(dlHead != null){
+                    dlHead.setText(running ? ("正在进行 " + rows + " 个任务")
+                            : (rows > 0 ? ("本次共 " + rows + " 个任务") : "暂无下载任务"));
+                }
+                if(btnDlCancel != null){
+                    btnDlCancel.setVisibility(running ? View.VISIBLE : View.GONE);
+                }
+                if(dlTaskList != null){
+                    dlTaskList.setVisibility(rows > 0 ? View.VISIBLE : View.GONE);
+                }
+            }catch(Throwable t){}
+        }});
+    }
+
+    /** 下载页总进度：已完成 done / 总数 total，进行中 act 个 */
+    void dlSetOverall(final int done, final int total, final int act){
+        h.post(new Runnable(){ public void run(){
+            try{
+                if(dlTotalBar != null){
+                    int p = total > 0 ? (int)((double) done * 1000 / total) : 0;
+                    dlTotalBar.setProgress(p);
+                }
+                if(dlCount != null){
+                    dlCount.setText(total > 0 ? (done + "/" + total
+                            + (act > 0 ? ("  进行中" + act) : "")) : "");
+                }
+            }catch(Throwable t){}
+        }});
+    }
+
+    /** 刷新下载页头部：任务数 / 标题 */
+
+    /** 下载页总进度：已完成 done / 总数 total，进行中 act 个 */
+
+    /** 下载列表：清空所有行 */
+    void dlRowClear(){
+        h.post(new Runnable(){ public void run(){
+            try{
+                if(dlTaskList != null){
+                    dlTaskList.removeAllViews();
+                    dlTaskList.setVisibility(View.GONE);
+                }
+                DypLog.i("DLROW_CLEAR");
+                dlRowName.clear();
+                dlRowMeta.clear();
+                dlRowBar.clear();
+                dlRowView.clear();
+                dlRowOrder.clear();
+                // 关键：行被清掉了，映射也必须一起清。
+                // 否则新一轮的行复用同 key 时，暂停/继续按钮查到的是上一轮的旧任务，
+                // 表现为「点暂停没反应」（暂停了一个早就结束的对象）。
+                dlRowResume.clear();
+                dlRowPath.clear();
+                dlRowIsBt.clear();
+            }catch(Throwable t){}
+        }});
+    }
+
     void progHide(){
         h.post(new Runnable(){ public void run(){
             if(progressBox != null) progressBox.setVisibility(View.GONE);
@@ -4373,16 +6653,16 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         try{
             // detail 已经渲染过（含实况动轨），SSR 数据不完整，不要覆盖
             if(detailRendered){
-                Log.i("DYP", "SLIDES_IGNORE detail already rendered");
+                DypLog.i("SLIDES_IGNORE detail already rendered");
                 webDone = true;
                 return;
             }
-            Log.i("DYP", "SLIDES_JSON len=" + json.length());
+            DypLog.i("SLIDES_JSON len=" + json.length());
             String r = render(json);
-            Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+            DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
             o(r); s("完成(slides)");
             webDone = true;
-        }catch(Throwable t){ Log.i("DYP", "SLIDES_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("SLIDES_ERR " + t); }
     }
 
     // ===== 合集 =====
@@ -4410,7 +6690,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     volatile boolean bigParseAlready = false;
     /** 进入主页收集模式（从确认弹窗回调调用，原 PROFILE_AUTO 里的状态初始化） */
     void enterProfileMode(String u){
-        Log.i("DYP", "PROFILE_ENTER " + (u == null ? "" : u.substring(0, Math.min(120, u.length()))));
+        DypLog.i("PROFILE_ENTER " + (u == null ? "" : u.substring(0, Math.min(120, u.length()))));
         profileMode = true;
         dyProfileJumped = false;
         dyProfilePcUA = false;
@@ -4419,12 +6699,19 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         webDone = true;
         synchronized(profileCollected){ profileCollected.clear(); }
         profilePage = 0;
-        // 主页/合集解析：先自动清空列表（批量模式下不清，否则会把自己收集的结果清掉）
-        if(!batchCollectMode){
-            synchronized(batchCollected){ batchCollected.clear(); }
-            // 同步删掉落盘文件，否则重启后旧批量结果又冒出来
-            try{ java.io.File f = batchListFile(); if(f != null && f.exists()) f.delete(); }catch(Throwable t){}
-        }
+        // 【不要清「批量解析」的池】
+        //
+        // 以前这里会 batchCollected.clear() + 删 batch_list.tsv，
+        // 于是只要解析一次主页，「批量解析」子页签的内容就被清空。
+        //
+        // 四个子页签的数据池本来就是独立的：
+        //     itemsFromBatch / itemsFromSingle / itemsFromProfile / itemsFromMix
+        // 主页解析只该动自己的那份（profileCollected / profileSeen，下面已有），
+        // 不应该伸手去清别人的。
+        //
+        // 如果担心旧的主页结果混进来：profileCollected 和 profileSeen 已经在
+        // 上面 clear 了；itemsFromProfile 会在这次解析完成时被 LIST_POOL_SAVE 覆盖。
+        DypLog.i("PROFILE_KEEP_POOLS 保留批量/单条池不清空");
         synchronized(profileSeen){ profileSeen.clear(); }
         s("主页网页加载中，自动收集作品…");
         // 确认后主动驱动一次：确认期间页面发出的列表请求被跳过拦截了，
@@ -4435,13 +6722,36 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 if(!profileMode) return;
                 String sec = extractSecUid(uu2);
                 if(sec != null && sec.length() > 10){
-                    Log.i("DYP", "PROFILE_KICK_SIGNED 确认后主动翻页");
-                    new Thread(new Runnable(){ public void run(){
-                        try{ fetchAllDyProfilePages(uu2); }
-                        catch(Throwable t){ Log.i("DYP", "PROFILE_KICK_ERR " + t); }
-                    }}).start();
+                    // 【策略变更】以前这里直接让签名翻页接管，
+                    // 结果我们拼的 aweme/post 只拿到壳数据（play_addr 是背景音乐 mp3），
+                    // 真视频直链全被抖音剥离。
+                    //
+                    // 现在改回 WebView 优先：让抖音网页自己算签名、自己发请求，
+                    // 我们旁路拦截完整数据。只有在 WebView 收不到东西时，
+                    // 才退回签名翻页兜底。
+                    DypLog.i("PROFILE_WEB_FIRST 改为 WebView 优先收集");
+                    // 页面已经在加载了，这里只负责「启动自动滚动 + 兜底计时」
+                    h.postDelayed(new Runnable(){ public void run(){
+                        if(!profileMode) return;
+                        try{ startDyProfileScroll(); }catch(Throwable t){}
+                    }}, 600);
+                    // 兜底：12 秒后如果 WebView 一条都没收到，才启动签名翻页
+                    h.postDelayed(new Runnable(){ public void run(){
+                        if(!profileMode) return;
+                        int have;
+                        synchronized(profileCollected){ have = profileCollected.size(); }
+                        if(have >= 5){
+                            DypLog.i("PROFILE_WEB_OK WebView 已收集 " + have + " 条，无需签名兜底");
+                            return;
+                        }
+                        DypLog.i("PROFILE_WEB_FEW WebView 只有 " + have + " 条，启动签名翻页兜底");
+                        new Thread(new Runnable(){ public void run(){
+                            try{ fetchAllDyProfilePages(uu2); }
+                            catch(Throwable t){ DypLog.i("PROFILE_KICK_ERR " + t); }
+                        }}).start();
+                    }}, 12000);
                 }
-            }catch(Throwable t){ Log.i("DYP", "PROFILE_KICK_ERR2 " + t); }
+            }catch(Throwable t){ DypLog.i("PROFILE_KICK_ERR2 " + t); }
         }}, 1200);
     }
     final java.util.List<ProfileParser.ProfileItem> profileCollected =
@@ -4461,7 +6771,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
       +"||(b.indexOf('edge_owner_to_timeline_media')>=0)"
       +"||(b.indexOf('xdt_api__v1__feed__user_timeline_graphql_connection')>=0)"
       +"||(b.indexOf('xdt_shortcode_media')>=0)"
-      +"||(b.indexOf('\"shortcode\"')>=0&&b.indexOf('display_url')>=0);"
+      +"||(b.indexOf('\"shortcode\"')>=0&&b.indexOf('display_url')>=0)"
+      +"||(b.indexOf('itemList')>=0&&b.indexOf('video')>=0)"
+      +"||(b.indexOf('\"itemStruct\"')>=0)"
+      +"||(b.indexOf('\"aweme_detail\"')>=0)"
+      +"||(b.indexOf('timeline_v2')>=0)"
+      +"||(b.indexOf('\"legacy\"')>=0&&b.indexOf('extended_entities')>=0)"
+      +"||(b.indexOf('full_text')>=0&&b.indexOf('media_url')>=0);"
      +"if(hit)send(b);}catch(e){}}"
      +"var of=window.fetch;if(of){window.fetch=function(){var a=arguments;var url=(typeof a[0]==='string')?a[0]:(a[0]&&a[0].url);var pr=of.apply(this,a);try{pr.then(function(r){try{r.clone().text().then(function(t){rec(url,t);});}catch(e){}});}catch(e){}return pr;};}"
      +"var oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;"
@@ -4486,7 +6802,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
             in.close();
             return bo.toByteArray();
-        }catch(Throwable t){ Log.i("DYP", "HTTP_REF_ERR " + t); return null; }
+        }catch(Throwable t){ DypLog.i("HTTP_REF_ERR " + t); return null; }
     }
 
     /** 解析 /aweme/v1/mix/aweme/ 返回，抽出视频列表 */
@@ -4502,7 +6818,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(ck != null) uc.setRequestProperty("Cookie", ck);
             uc.setConnectTimeout(12000); uc.setReadTimeout(15000);
             int code = uc.getResponseCode();
-            Log.i("DYP", "MIX_HTTP " + code);
+            DypLog.i("MIX_HTTP " + code);
             if(code < 200 || code >= 300) return null;
             is = uc.getInputStream();
             java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
@@ -4512,10 +6828,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 got += n;
                 if(got > 20L * 1024 * 1024) break;
             }
-            Log.i("DYP", "MIX_READ " + got);
+            DypLog.i("MIX_READ " + got);
             return new String(bo.toByteArray(), "UTF-8");
         }catch(Throwable t){
-            Log.i("DYP", "MIX_FETCH_ERR " + t);
+            DypLog.i("MIX_FETCH_ERR " + t);
             return null;
         }finally{
             try{ if(is != null) is.close(); }catch(Throwable t){}
@@ -4541,10 +6857,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         // 从分享页 URL 里取 sec_uid（可能编码过）
         String secUid = extractSecUid(firstUrl);
         if(secUid == null || secUid.length() < 10){
-            Log.i("DYP", "DYPROF_NO_SECUID，回退单页");
+            DypLog.i("DYPROF_NO_SECUID，回退单页");
             // 已经翻完拿全的主页，不许再用「单页」结果把它覆盖掉
             if(dyProfileRenderLocked){
-                Log.i("DYP", "DYPROF_NO_SECUID_SKIP 结果已锁定，忽略");
+                DypLog.i("DYPROF_NO_SECUID_SKIP 结果已锁定，忽略");
                 profileFetching = false;
                 return;
             }
@@ -4554,7 +6870,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             scheduleProfileRender();
             return;
         }
-        Log.i("DYP", "DYPROF_SECUID " + secUid);
+        DypLog.i("DYPROF_SECUID " + secUid);
 
         String cookie = dyEffectiveCookie();
         boolean loggedIn = dyProfileCookiesLikelyLoggedIn();
@@ -4565,7 +6881,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         // msToken 最佳来源：WebView 自己发的这条请求 URL（firstUrl）里就带真值
         String msToken = pickMsTokenFromUrl(firstUrl);
         if(msToken.length() == 0) msToken = dyRealMsToken(cookie);
-        Log.i("DYP", "DYPROF_MSTOKEN_USED len=" + msToken.length());
+        DypLog.i("DYPROF_MSTOKEN_USED len=" + msToken.length());
         int page = 0;
         long cursor = 0L;
         int emptyStreak = 0;
@@ -4580,23 +6896,23 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             String signed = DyDetail.signPostQuery(query, cookie, uifid.length() > 0);
             String url = DyDetail.API_POST + "?" + signed;
             // 关键诊断：每页带上什么 uifid / msToken、cookie 多长、签名后 URL 多长
-            Log.i("DYP", "DYPROF_REQ page=" + page + " cursor=" + cursor
+            DypLog.i("DYPROF_REQ page=" + page + " cursor=" + cursor
                 + " uifidLen=" + uifid.length() + " msLen=" + msToken.length()
                 + " ckLen=" + (cookie == null ? 0 : cookie.length())
                 + " secsdk=" + (uifid.length() > 0 ? 1 : 0));
-            Log.i("DYP", "DYPROF_URL page=" + page + " cursor=" + cursor + " len=" + url.length());
+            DypLog.i("DYPROF_URL page=" + page + " cursor=" + cursor + " len=" + url.length());
             if(page <= 2){
-                Log.i("DYP", "DYPROF_FULLURL[" + page + "] " + url.substring(0, Math.min(260, url.length())));
+                DypLog.i("DYPROF_FULLURL[" + page + "] " + url.substring(0, Math.min(260, url.length())));
             }
             String body = null;
             for(int attempt = 1; attempt <= 3; attempt++){
                 body = fetchProfilePageRaw(url);
                 if(body != null && body.length() >= 60) break;
-                Log.i("DYP", "DYPROF_RETRY page=" + page + " attempt=" + attempt);
+                DypLog.i("DYPROF_RETRY page=" + page + " attempt=" + attempt);
                 try{ Thread.sleep(700L * attempt); }catch(Throwable t){}
             }
             if(body == null || body.length() < 60){
-                Log.i("DYP", "DYPROF_PAGE_EMPTY page=" + page);
+                DypLog.i("DYPROF_PAGE_EMPTY page=" + page);
                 DiagLog.w(DiagLog.M_PARSE, "主页第 " + page + " 页为空 | cursor=" + cursor
                     + " | 原因=" + (loggedIn
                         ? "已登录但仍拿不到更多，可能是该账号设置了作品可见范围"
@@ -4618,16 +6934,17 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 Map m = (Map) res;
                 Object listObj = m == null ? null : m.get("aweme_list");
                 List list = (listObj instanceof List) ? (List) listObj : null;
+                profileDbgLeft = 3;
                 added = appendDyProfileItems(list);
                 hasMore = truthy(m == null ? null : m.get("has_more"));
                 nextCursor = parseLong(m == null ? null : m.get("max_cursor"), -1L);
             }catch(Throwable t){
-                Log.i("DYP", "DYPROF_PAGE_PARSE_ERR " + t);
+                DypLog.i("DYPROF_PAGE_PARSE_ERR " + t);
                 break;
             }
             int total;
             synchronized(profileCollected){ total = profileCollected.size(); }
-            Log.i("DYP", "DYPROF_PAGE " + page + " added=" + added + " total=" + total
+            DypLog.i("DYPROF_PAGE " + page + " added=" + added + " total=" + total
                 + " hasMore=" + hasMore + " next=" + nextCursor);
             final int fPage = page; final int fTotal = total;
             h.post(new Runnable(){ public void run(){
@@ -4636,7 +6953,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(!hasMore) break;
             if(nextCursor <= 0 || added == 0){
                 if(++emptyStreak >= 2){
-                    Log.i("DYP", "DYPROF_STOP emptyStreak=" + emptyStreak);
+                    DypLog.i("DYPROF_STOP emptyStreak=" + emptyStreak);
                     break;
                 }
             } else {
@@ -4649,7 +6966,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         }
         int n;
         synchronized(profileCollected){ n = profileCollected.size(); }
-        Log.i("DYP", "DYPROF_DONE n=" + n + " pages=" + page);
+        DypLog.i("DYPROF_DONE n=" + n + " pages=" + page);
         // 记录已翻完的 sec_uid，页面再发同一主页请求时直接忽略（避免并发翻页互相覆盖）
         dyProfileDoneSecUid = secUid == null ? "" : secUid;
         // 翻页结束必须把 fetching 放开，否则下一次解析主页会被 !profileFetching 挡住
@@ -4672,7 +6989,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 web.setVisibility(View.GONE);
                 web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
             }
-            Log.i("DYP", "DYPROF_WEB_CLOSED 已收起主页网页，防止后续跳转覆盖结果");
+            DypLog.i("DYPROF_WEB_CLOSED 已收起主页网页，防止后续跳转覆盖结果");
         }catch(Throwable t){}
         scheduleProfileRender();
     }
@@ -4680,7 +6997,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     /** 抖音主页：注入滚动脚本，让页面自己加载更多（每次加载都会命中 PROFILE_HOOK_JS 的 fetch hook） */
     void startDyProfileScroll(){
         if(web == null) return;
-        Log.i("DYP", "DYPROF_SCROLL_START");
+        DypLog.i("DYPROF_SCROLL_START");
         // 抖音主页是内部滚动容器（body 高度恒为 1），必须找真正可滚的元素
         web.evaluateJavascript(
             "(function(){try{"
@@ -4781,7 +7098,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(cookie != null && cookie.indexOf("msToken=") >= 0){
                 String t = cookieValueOf(cookie, "msToken");
                 if(t != null && t.length() >= 60){
-                    Log.i("DYP", "DYPROF_MSTOKEN from_cookie len=" + t.length());
+                    DypLog.i("DYPROF_MSTOKEN from_cookie len=" + t.length());
                     return t;
                 }
             }
@@ -4791,12 +7108,12 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 if(cm != null && cm.indexOf("msToken=") >= 0){
                     String t2 = cookieValueOf(cm, "msToken");
                     if(t2 != null && t2.length() >= 60){
-                        Log.i("DYP", "DYPROF_MSTOKEN from_webview len=" + t2.length());
+                        DypLog.i("DYPROF_MSTOKEN from_webview len=" + t2.length());
                         return t2;
                     }
                 }
             }catch(Throwable t2){}
-            Log.i("DYP", "DYPROF_MSTOKEN none_use_fake");
+            DypLog.i("DYPROF_MSTOKEN none_use_fake");
         }catch(Throwable t){}
         return DyDetail.msTokenOf(cookie);
     }
@@ -4876,7 +7193,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 String v = kv.substring(e + 1);
                 try{ v = java.net.URLDecoder.decode(v, "UTF-8"); }catch(Throwable t){}
                 if(v != null && v.length() >= 60){
-                    Log.i("DYP", "DYPROF_MSTOKEN from_url len=" + v.length());
+                    DypLog.i("DYPROF_MSTOKEN from_url len=" + v.length());
                     return v;
                 }
             }
@@ -4909,7 +7226,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     ckb.append(need).append('=').append(ck.indexOf(need + "=") >= 0 ? "1" : "0").append(' ');
                 }
             }
-            Log.i("DYP", "DYPROF_CK " + ckb);
+            DypLog.i("DYPROF_CK " + ckb);
             java.net.HttpURLConnection uc = openConn(url);
             uc.setInstanceFollowRedirects(true);
             uc.setRequestProperty("User-Agent", DyDetail.UA);
@@ -4919,7 +7236,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(ck != null) uc.setRequestProperty("Cookie", ck);
             uc.setConnectTimeout(12000); uc.setReadTimeout(15000);
             int code = uc.getResponseCode();
-            Log.i("DYP", "DYPROF_HTTP " + code);
+            DypLog.i("DYPROF_HTTP " + code);
             if(code < 200 || code >= 300) return null;
             is = uc.getInputStream();
             java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
@@ -4929,12 +7246,12 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 got += n;
                 if(got > 20L * 1024 * 1024) break;
             }
-            Log.i("DYP", "DYPROF_READ " + got);
+            DypLog.i("DYPROF_READ " + got);
             String rb = new String(bo.toByteArray(), "UTF-8");
-            if(rb.length() < 60) Log.i("DYP", "DYPROF_SHORT[" + rb + "]");
+            if(rb.length() < 60) DypLog.i("DYPROF_SHORT[" + rb + "]");
             return rb;
         }catch(Throwable t){
-            Log.i("DYP", "DYPROF_FETCH_ERR " + t);
+            DypLog.i("DYPROF_FETCH_ERR " + t);
             return null;
         }finally{
             try{ if(is != null) is.close(); }catch(Throwable t){}
@@ -4942,6 +7259,66 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     }
 
     /** 把一页 aweme_list 追加进主页列表，返回本页新增条数 */
+    /** 主页结构诊断：只打前几条，避免刷屏 */
+    volatile int profileDbgLeft = 0;
+
+    /**
+     * 从 article_info 抽出 markdown 正文并落盘。
+     *
+     * 结构：
+     *   article_info.article_content = "{\"markdown\":\"...\",\"long_article_abstract\":\"...\"}"
+     *   → 是 JSON 字符串，要二次解开
+     */
+    String dyArticleMd(Object artObj){
+        try{
+            if(!(artObj instanceof Map)) return "";
+            Map am = (Map) artObj;
+            String content = gs(get(am, "article_content"));
+            if(content.length() == 0) return "";
+            Object c = new JP(content).parse();
+            if(!(c instanceof Map)) return content;
+            Map cm = (Map) c;
+            String md = gs(get(cm, "markdown"));
+            if(md.length() == 0) md = gs(get(cm, "long_article_abstract"));
+            return md;
+        }catch(Throwable t){
+            DypLog.i("DY_ARTICLE_MD_ERR " + t);
+            return "";
+        }
+    }
+
+    /** 把文章存成 .md 到「文章」目录，返回文件路径（失败返回 ""） */
+    String saveDyArticle(String id, String title, String md){
+        try{
+            if(md == null || md.length() == 0) return "";
+            String t = (title == null || title.trim().length() == 0) ? ("文章_" + id) : title.trim();
+            // 文件名去掉非法字符
+            t = t.replaceAll("[\\\\/:*?\"<>|\\r\\n\\t]", "_");
+            if(t.length() > 60) t = t.substring(0, 60);
+            java.io.File dir = new java.io.File(dlDirFor2("抖音", "文章"));
+            dir.mkdirs();
+            java.io.File f = new java.io.File(dir, "dy_" + id + "_" + t + ".md");
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
+            fo.write(md.getBytes("UTF-8"));
+            fo.close();
+            scanMedia(f);
+            DypLog.i("DY_ARTICLE_SAVED path=" + f.getAbsolutePath() + " len=" + md.length());
+            return f.getAbsolutePath();
+        }catch(Throwable t){
+            DypLog.i("DY_ARTICLE_SAVE_ERR " + t);
+            return "";
+        }
+    }
+
+    /** 该条图集是否含实况动轨 */
+    static boolean hasLiveDyn(ProfileParser.ProfileItem it){
+        if(it == null || it.dyns == null) return false;
+        for(String d : it.dyns){
+            if(d != null && d.length() > 0) return true;
+        }
+        return false;
+    }
+
     int appendDyProfileItems(List list){
         if(list == null) return 0;
         int added = 0;
@@ -4962,22 +7339,228 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             it.isImage = isImage;
             if(!isImage){
                 Object video = get(aw, "video");
+                // 【诊断】主页接口的 aweme 结构到底长什么样。
+                // 现在的现象是 PROF_ITEM_URL 一条都不打，
+                // 说明 video.play_addr / bit_rate / vid 全都没取到。
+                // 先看看 key 集合，判断是「video 字段没了」还是「结构变了」。
+                if(profileDbgLeft > 0){
+                    profileDbgLeft--;
+                    try{
+                        StringBuilder kb = new StringBuilder();
+                        for(Object k : aw.keySet()){
+                            if(k == null) continue;
+                            if(kb.length() > 0) kb.append(',');
+                            kb.append(k);
+                        }
+                        String vin = (video instanceof Map) ? "Map" : String.valueOf(video);
+                        String brInfo = "-";
+                        if(video instanceof Map){
+                            Object brs = ((Map) video).get("bit_rate");
+                            brInfo = (brs instanceof List)
+                                    ? ("List/" + ((List) brs).size()) : String.valueOf(brs);
+                        }
+                        DypLog.i("PROF_DBG id=" + awemeId + " isImg=" + isImage
+                                + " video=" + vin + " bit_rate=" + brInfo
+                                + " keys=[" + kb + "]");
+                    }catch(Throwable t){
+                        DypLog.i("PROF_DBG_ERR " + t);
+                    }
+                }
                 if(video instanceof Map){
-                    Object pa = get((Map) video, "play_addr");
-                    if(pa instanceof Map){
-                        String uu = firstUrl(get((Map) pa, "url_list"));
-                        if(uu.length() > 0 && !uu.equals("?")) it.directUrl = uu;
+                    Map vm = (Map) video;
+                    // 【优先 bit_rate 最高档，而不是 play_addr】
+                    //
+                    // 实测：主页列表的 video.play_addr.url_list[0] 不保证是视频轨。
+                    // 一批 4 条里 3 条拿到的是纯音频（文件头 ftypM4A / ID3），
+                    // 存成 .mp4 后相册能播但只有声音。
+                    //
+                    // bit_rate[] 里每一项都是已经编码好的视频档
+                    //（自带 bit_rate / play_addr），比顶层 play_addr 可靠，
+                    // 还能顺手挑到最高清晰度。
+                    String best = "";
+                    // 1) bit_rate 里码率最高的一档
+                    try{
+                        List brs = (List) get(vm, "bit_rate");
+                        if(brs != null && brs.size() > 0){
+                            Map bestMap = null; long bestBr = -1;
+                            for(int b = 0; b < brs.size(); b++){
+                                Object bo = brs.get(b);
+                                if(!(bo instanceof Map)) continue;
+                                Map bm = (Map) bo;
+                                long br = parseLong(get(bm, "bit_rate"), 0);
+                                if(br > bestBr){ bestBr = br; bestMap = bm; }
+                            }
+                            if(bestMap != null){
+                                Object bpa = get(bestMap, "play_addr");
+                                if(bpa instanceof Map){
+                                    String uu = firstUrl(get((Map) bpa, "url_list"));
+                                    if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                                    if(best.length() == 0){
+                                        String buri = gs(get((Map) bpa, "uri"));
+                                        if(buri.length() > 0) best = playUrl(buri);
+                                    }
+                                }
+                            }
+                        }
+                    }catch(Throwable t){}
+                    // 2) 退回 play_addr
+                    if(best.length() == 0){
+                        Object pa = get(vm, "play_addr");
+                        if(pa instanceof Map){
+                            String uu = firstUrl(get((Map) pa, "url_list"));
+                            if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                            if(best.length() == 0){
+                                String uri = gs(get((Map) pa, "uri"));
+                                if(uri.length() > 0) best = playUrl(uri);
+                            }
+                        }
+                    }
+                    // 3) 最后用 vid 拼播放地址
+                    if(best.length() == 0){
+                        String vid = gs(get(vm, "vid"));
+                        if(vid.length() > 0) best = playUrl(vid);
+                    }
+                    // 【关键】拿到的如果疑似音频，就别当成视频直链。
+                    //
+                    // 实测：部分作品在主页列表接口里，三级回退拿到的
+                    // 全是 douyinstatic.com 的 audio/mp4（背景音乐），
+                    // 不是视频流。这种条目如果直接入队，
+                    // 下下来的 .mp4 里只有音频，相册能播但没画面。
+                    //
+                    // 置空后，批量下载会发现 directUrl 为空，
+                    // 自动回落到 WebView 打开作品页解析 —— 那条路能拿到真视频。
+                    if(best.length() > 0 && !best.equals("?")){
+                        if(isLikelyAudioUrl(best)){
+                            DypLog.i("PROF_ITEM_AUDIO id=" + awemeId
+                                    + " 拿到的是音频地址，改为回落解析 url="
+                                    + best.substring(0, Math.min(80, best.length())));
+                            best = "";
+                        }
+                    }
+                    if(best.length() > 0){
+                        it.directUrl = best;
+                        DypLog.i("PROF_ITEM_URL id=" + awemeId
+                                + " url=" + best.substring(0, Math.min(80, best.length())));
+                    }
+                    // 记下视频时长（秒），0 说明可能拿到了非视频轨
+                    try{
+                        long dur = parseLong(get(vm, "duration"), 0);
+                        if(dur > 1000) dur = dur / 1000;   // 有的接口给的是毫秒
+                        it.durSec = dur;
+                    }catch(Throwable t){}
+                }
+            }
+            // ============ 图集：全量 imgs + 实况动轨 ============
+            //
+            // 老版本只取第一张塞进 directUrl，等于「图集当单文件」。
+            // 结果批量下载拿它当 mp4 下 → 失败；实况图根本没动轨信息。
+            int liveCnt = 0;
+            if(isImage){
+                try{
+                    it.imgs.clear();
+                    it.dyns.clear();
+                    for(Object imObj : (List) imgs){
+                        if(!(imObj instanceof Map)) continue;
+                        Map im = (Map) imObj;
+                        String iu = firstUrl(get(im, "url_list"));
+                        it.imgs.add((iu == null || iu.equals("?")) ? "" : iu);
+                        // 实况动轨：images[i].video.play_addr / download_addr
+                        String lv = "";
+                        Object lvo = get(im, "video");
+                        if(lvo instanceof Map){
+                            Object lpa = get((Map) lvo, "play_addr");
+                            if(lpa instanceof Map) lv = firstUrl(get((Map) lpa, "url_list"));
+                            if(lv.length() == 0){
+                                Object lda = get((Map) lvo, "download_addr");
+                                if(lda instanceof Map) lv = firstUrl(get((Map) lda, "url_list"));
+                            }
+                        }
+                        if(lv.length() == 0){
+                            Object lp = get(im, "live_photo");
+                            if(lp instanceof Map){
+                                Object lv2 = get((Map) lp, "video");
+                                if(lv2 instanceof Map){
+                                    Object lpa2 = get((Map) lv2, "play_addr");
+                                    if(lpa2 instanceof Map) lv = firstUrl(get((Map) lpa2, "url_list"));
+                                }
+                            }
+                        }
+                        if(lv.length() == 0){
+                            Object mp = get(im, "motion_photo");
+                            if(mp instanceof Map){
+                                Object mv3 = get((Map) mp, "video");
+                                if(mv3 instanceof Map){
+                                    Object lpa3 = get((Map) mv3, "play_addr");
+                                    if(lpa3 instanceof Map) lv = firstUrl(get((Map) lpa3, "url_list"));
+                                }
+                            }
+                        }
+                        if(lv == null || lv.equals("?")) lv = "";
+                        it.dyns.add(lv);
+                        if(lv.length() > 0) liveCnt++;
+                    }
+                    // 第一张可用图作为 directUrl / cover
+                    for(String iu : it.imgs){
+                        if(iu != null && iu.length() > 0 && !iu.equals("?")){
+                            if(it.directUrl.length() == 0) it.directUrl = iu;
+                            break;
+                        }
+                    }
+                    DypLog.i("PROF_IMGS id=" + awemeId + " n=" + it.imgs.size()
+                            + " live=" + liveCnt);
+                }catch(Throwable gt){
+                    DypLog.i("PROF_IMGS_ERR " + gt);
+                }
+            }
+            // ============ 解析阶段就把类型定死 ============
+            try{
+                // 【文章必须最先判】抖音文章也带 aweme_type=163 / media_type=43，
+                // 和音乐作品撞了。只有 article_info 能把它们区分开。
+                Object artObj = get(aw, "article_info");
+                if(artObj instanceof Map){
+                    it.kind = ProfileParser.KIND_ARTICLE;
+                    try{ it.articleTitle = gs(get((Map) artObj, "article_title")); }catch(Throwable t2){}
+                }else if(isImage){
+                    it.kind = (liveCnt > 0) ? ProfileParser.KIND_LIVE
+                                            : ProfileParser.KIND_IMAGE;
+                }else{
+                    long at = parseLong(get(aw, "aweme_type"), 0);
+                    long mt = parseLong(get(aw, "media_type"), 0);
+                    if(at == 163 || mt == 43){
+                        it.kind = ProfileParser.KIND_MUSIC;
+                    }else if(it.directUrl != null && it.directUrl.length() > 0){
+                        it.kind = ProfileParser.KIND_VIDEO;
+                    }
+                }
+            }catch(Throwable kt){}
+            DypLog.i("PROF_KIND id=" + awemeId + " kind=" + it.kind
+                    + "(" + it.kindLabel() + ")");
+            // 封面：视频取 video.cover，图集取第一张图
+            String cov = "";
+            if(isImage){
+                Object firstImg = ((List) imgs).get(0);
+                if(firstImg instanceof Map){
+                    cov = firstUrl(get((Map) firstImg, "url_list"));
+                }
+            }
+            if(cov.length() == 0 || cov.equals("?")){
+                Object video = get(aw, "video");
+                if(video instanceof Map){
+                    Object cv = get((Map) video, "cover");
+                    if(cv instanceof Map){
+                        String u2 = firstUrl(get((Map) cv, "url_list"));
+                        if(u2.length() > 0 && !u2.equals("?")) cov = u2;
+                    }
+                    if(cov.length() == 0 || cov.equals("?")){
+                        Object oc = get((Map) video, "origin_cover");
+                        if(oc instanceof Map){
+                            String u3 = firstUrl(get((Map) oc, "url_list"));
+                            if(u3.length() > 0 && !u3.equals("?")) cov = u3;
+                        }
                     }
                 }
             }
-            if(isImage && it.directUrl.length() == 0){
-                Object firstImg = ((List) imgs).get(0);
-                if(firstImg instanceof Map){
-                    Object ul = get((Map) firstImg, "url_list");
-                    String uu = firstUrl(ul);
-                    if(uu.length() > 0 && !uu.equals("?")) it.directUrl = uu;
-                }
-            }
+            if(cov.length() > 0 && !cov.equals("?")) it.cover = cov;
             it.url = "https://www.iesdouyin.com/share/video/" + awemeId + "/";
             synchronized(profileCollected){ profileCollected.add(it); }
             added++;
@@ -4996,17 +7579,17 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             page++;
             if(mixMode && page > 1){ /* 仍在合集抓取中，继续 */ }
             String url = withCursor(firstUrl, cursor);
-            Log.i("DYP", "MIX_PAGE " + page + " cursor=" + cursor);
+            DypLog.i("MIX_PAGE " + page + " cursor=" + cursor);
             // 网络抖动/DNS 失败重试 3 次，指数退避
             String body = null;
             for(int attempt = 1; attempt <= 3; attempt++){
                 body = fetchMixPageRaw(url);
                 if(body != null && body.length() >= 20) break;
-                Log.i("DYP", "MIX_RETRY page=" + page + " attempt=" + attempt);
+                DypLog.i("MIX_RETRY page=" + page + " attempt=" + attempt);
                 try{ Thread.sleep(600L * attempt); }catch(Throwable t){}
             }
             if(body == null || body.length() < 20){
-                Log.i("DYP", "MIX_PAGE_EMPTY page=" + page);
+                DypLog.i("MIX_PAGE_EMPTY page=" + page);
                 break;
             }
             int added;
@@ -5023,12 +7606,12 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 long cv = parseLong(get(m, "cursor"), -1);
                 nextCursor = (int)(cv > 0 ? cv : (cursor + (added > 0 ? added : 10)));
             }catch(Throwable t){
-                Log.i("DYP", "MIX_PAGE_PARSE_ERR " + t);
+                DypLog.i("MIX_PAGE_PARSE_ERR " + t);
                 break;
             }
             int total;
             synchronized(mixItems){ total = mixItems.size(); }
-            Log.i("DYP", "MIX_PAGE " + page + " added=" + added + " total=" + total + " hasMore=" + hasMore + " next=" + nextCursor);
+            DypLog.i("MIX_PAGE " + page + " added=" + added + " total=" + total + " hasMore=" + hasMore + " next=" + nextCursor);
             final int fPage = page;
             h.post(new Runnable(){ public void run(){
                 int tt; synchronized(mixItems){ tt = mixItems.size(); }
@@ -5038,7 +7621,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             if(added == 0){
                 // 可能是重复页（接口回退），连续两次才放弃
                 if(++emptyStreak >= 3){
-                    Log.i("DYP", "MIX_STOP emptyStreak=" + emptyStreak);
+                    DypLog.i("MIX_STOP emptyStreak=" + emptyStreak);
                     break;
                 }
                 try{ Thread.sleep(800); }catch(Throwable t){}
@@ -5050,10 +7633,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         }
         int n;
         synchronized(mixItems){ n = mixItems.size(); }
-        Log.i("DYP", "MIX_PARSED n=" + n + " pages=" + page);
+        DypLog.i("MIX_PARSED n=" + n + " pages=" + page);
         mixMode = true;
         webDone = true;
-        Log.i("DYP", "MIX_RENDER_START");
+        DypLog.i("MIX_RENDER_START");
         if(n == 0){ s("合集解析失败"); mixFetching = false; return; }
         renderMixList(n);
     }
@@ -5116,7 +7699,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     if("video/av01".equalsIgnoreCase(types[j])) return true;
                 }
             }
-        }catch(Throwable t){ Log.i("DYP", "AV1_CHECK_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("AV1_CHECK_ERR " + t); }
         return false;
     }
 
@@ -5129,13 +7712,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     static String pickOriginalQuality(String vid, String curUrl, long curSize){
         try{
             if(!hasAv1Decoder()){
-                Log.i("DYP", "ORIG_SKIP 设备无 AV1 解码器");
+                DypLog.i("ORIG_SKIP 设备无 AV1 解码器");
                 return "";
             }
             String o = playUrlOriginal(vid);
             if(o.length() == 0) return "";
             long s = InnerDownloader.probeSizeRange(o);
-            Log.i("DYP", "ORIG_PROBE size=" + s + " cur=" + curSize);
+            DypLog.i("ORIG_PROBE size=" + s + " cur=" + curSize);
             if(s <= 0) return "";
             if(curSize > 0 && s < curSize) return "";
             return o;
@@ -5295,7 +7878,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     renderCards(rt);
                     // 恢复操作栏，让用户能直接播放/下载首集
                     actions.setVisibility(View.VISIBLE);
-                    Log.i("DYP", "MIX_FILL_PARSE 首集 id=" + fid + " hasPlay=" + (fplay.length() > 0));
+                    DypLog.i("MIX_FILL_PARSE 首集 id=" + fid + " hasPlay=" + (fplay.length() > 0));
                 }
 
                 java.util.List<ProfileParser.ProfileItem> itemList =
@@ -5310,9 +7893,23 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     pi.title = mt + " 第" + (i + 1) + "集" + (d.length() > 0 ? "　" + d : "");
                     pi.url = it[2] != null ? it[2] : "";
                     pi.directUrl = it[2] != null ? it[2] : "";
+                    // 合集封面：mixItems 第 4 位
+                    if(it.length > 3 && it[3] != null && it[3].startsWith("http")) pi.cover = it[3];
                     itemList.add(pi);
                 }
                 final java.util.List<ProfileParser.ProfileItem> items = itemList;
+                // 合集结果也进「合集」子页签 + 落盘，
+                // 否则 App 一重启合集列表就没了（用户实测痛点）。
+                try{
+                    synchronized(itemsFromMix){
+                        itemsFromMix.clear();
+                        itemsFromMix.addAll(itemList);
+                    }
+                    saveListPools();
+                    DypLog.i("MIX_POOL_SAVE n=" + itemList.size());
+                }catch(Throwable t){
+                    DypLog.i("MIX_POOL_SAVE_ERR " + t);
+                }
 
                 listHead.setText("抖音合集 · 共 " + n + " 集 · 点「下载」下该集，或点右下「选择下载」批量选");
                 btnDlAll.setVisibility(View.VISIBLE);
@@ -5403,7 +8000,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 s("抖音合集 " + n + " 集已列到「列表」页");
                 showHintToast("合集 " + n + " 集，已放进「列表」页");
             }catch(Throwable t){
-                Log.i("DYP", "MIX_RENDER_ERR " + t);
+                DypLog.i("MIX_RENDER_ERR " + t);
             }
         }});
     }
@@ -5469,6 +8066,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 ProfileParser.ProfileItem it = items.get(i);
                 String u = (it.directUrl != null && it.directUrl.length() > 0) ? it.directUrl : it.url;
                 if(u == null || u.length() == 0) continue;
+                // 磁力条目：交给 BT 引擎，绝不能当普通视频下（magnet: 交给 HTTP 下载必然失败）
+                if(BtDownloader.isMagnet(u) || u.indexOf(".torrent") > 0){
+                    DypLog.i("DL_LIST_MAGNET " + u.substring(0, Math.min(60, u.length())));
+                    h.post(new Runnable(){ public void run(){ startMagnetDownload(u); }});
+                    cnt++;
+                    continue;
+                }
                 String nb = (titlePrefix.length() > 0 ? titlePrefix + "_" : "") + "第" + (i + 1) + "集";
                 if(dirOverride != null && dirOverride.length() > 0){
                     enqueueDownload(u, nb, "mp4", category, dirOverride);
@@ -5561,7 +8165,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     if(cnt == 0){ s("未选择任何集数"); return; }
                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
                     s("已加入下载：" + cnt + " 集");
-                    Log.i("DYP", "MIX_QUEUE n=" + cnt + " dir=" + mixDir);
+                    DypLog.i("MIX_QUEUE n=" + cnt + " dir=" + mixDir);
                 }
             })
             .setNegativeButton("取消", null)
@@ -5625,14 +8229,14 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             String r = httpGetText(u, ct, rt);
             if(r != null && r.length() > 0){
                 ghLastVia = "mirror:" + i;
-                Log.i("DYP", "GH_MIRROR_OK idx=" + i + " " + GH_MIRRORS[i]);
+                DypLog.i("GH_MIRROR_OK idx=" + i + " " + GH_MIRRORS[i]);
                 return r;
             }
-            Log.i("DYP", "GH_MIRROR_FAIL idx=" + i + " " + GH_MIRRORS[i]);
+            DypLog.i("GH_MIRROR_FAIL idx=" + i + " " + GH_MIRRORS[i]);
         }
         // 镜像全挂 → 回退直连（用户可能自己挂了代理）
         ghLastVia = "direct(fallback)";
-        Log.i("DYP", "GH_MIRROR_ALL_FAIL 回退直连");
+        DypLog.i("GH_MIRROR_ALL_FAIL 回退直连");
         return httpGetText(rawUrl, ct, rt);
     }
     /** 最近一次 ghGetText 走的方式（日志/UI 用） */
@@ -5646,9 +8250,106 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 
     /** 联网检查最新 Release，与当前 versionCode 比对 */
     // ===== 主题切换 =====
+
+
+    // ===== 主题三态：跟随系统 / 日间 / 夜间 =====
+    static final String KEY_THEME_MODE = "theme_mode";
+    static final String THEME_FOLLOW = "follow";
+    static final String THEME_LIGHT = "light";
+    static final String THEME_DARK = "dark";
+
+    /** 当前主题模式 */
+    String themeMode(){
+        String m = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_THEME_MODE, "");
+        if(THEME_LIGHT.equals(m) || THEME_DARK.equals(m) || THEME_FOLLOW.equals(m)) return m;
+        // 兼容旧版：只有布尔 KEY_DARK 时按它推断
+        return getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_DARK, false)
+                ? THEME_DARK : THEME_FOLLOW;
+    }
+
+    /** 系统当前是否深色 */
+    boolean systemDark(){
+        try{
+            int mode = getResources().getConfiguration().uiMode
+                    & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
+            return mode == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+        }catch(Throwable t){ return false; }
+    }
+
+    /** 最终生效的深色判断（供 applyTheme / 各 UI 使用） */
     boolean isDarkMode(){
-        try{ return getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_DARK, false); }
-        catch(Throwable t){ return false; }
+        String m = themeMode();
+        if(THEME_DARK.equals(m)) return true;
+        if(THEME_LIGHT.equals(m)) return false;
+        return systemDark();
+    }
+
+    /** 切换主题模式 */
+    void setThemeMode(String mode){
+        getSharedPreferences(SP, MODE_PRIVATE).edit()
+            .putString(KEY_THEME_MODE, mode)
+            .putBoolean(KEY_DARK, isDarkModeOf(mode))
+            .apply();
+        curDark = isDarkMode();
+        DypLog.i("THEME_MODE set=" + mode + " dark=" + curDark);
+        applyTheme(curDark);
+        refreshThemeDependents();
+    }
+
+    /** 不依赖当前状态地判断某个模式是不是深色（用于写兼容 key） */
+    boolean isDarkModeOf(String mode){
+        if(THEME_DARK.equals(mode)) return true;
+        if(THEME_LIGHT.equals(mode)) return false;
+        return systemDark();
+    }
+
+    /** 主题按钮文案 */
+    String themeButtonLabel(){
+        String m = themeMode();
+        if(THEME_DARK.equals(m)) return "夜";
+        if(THEME_LIGHT.equals(m)) return "日";
+        return "自动";
+    }
+
+    /** 设置页主题副标题 */
+    String themeModeLabel(){
+        String m = themeMode();
+        if(THEME_DARK.equals(m)) return "夜间模式 · 始终深色";
+        if(THEME_LIGHT.equals(m)) return "日间模式 · 始终浅色";
+        return "跟随系统 · 当前" + (systemDark() ? "深色" : "浅色");
+    }
+
+    /** 主题选择弹窗 */
+    void showThemeDialog(){
+        curDark = isDarkMode();
+        final String[] keys = { THEME_FOLLOW, THEME_LIGHT, THEME_DARK };
+        String[] items = {
+            "跟随系统 · 白天浅色、晚上深色（推荐）",
+            "日间模式 · 始终浅色",
+            "夜间模式 · 始终深色"
+        };
+        String cur = themeMode();
+        int sel = THEME_DARK.equals(cur) ? 2 : (THEME_LIGHT.equals(cur) ? 1 : 0);
+        dypDlg()
+            .setTitle("主题")
+            .setSingleChoiceItems(items, sel, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    setThemeMode(keys[which]);
+                    if(btnTheme != null) btnTheme.setText(themeButtonLabel());
+                    try{ dd.dismiss(); }catch(Throwable t){}
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 主题变化后重建依赖主题的界面 */
+    void refreshThemeDependents(){
+        try{
+            buildSettingsPage();
+            refreshHistory();
+            switchTab(settingsOrCurrentTab);
+        }catch(Throwable t){ DypLog.i("THEME_REFRESH_ERR " + t); }
     }
 
     void applyTheme(boolean dark){
@@ -5676,7 +8377,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         if(btnDl   != null){ btnDl.setBackground(makeRoundRect(alt, stroke, 12));   btnDl.setTextColor(textC); }
         if(btnAudio != null){ btnAudio.setBackground(makeRoundRect(alt, stroke, 12)); btnAudio.setTextColor(textC); }
         if(btnMusic != null){ btnMusic.setBackground(makeRoundRect(alt, stroke, 12)); btnMusic.setTextColor(textC); }
-        if(btnTheme != null){ btnTheme.setTextColor(subC); btnTheme.setText(dark ? "亮" : "暗"); }
+        if(btnTheme != null){ btnTheme.setTextColor(subC); btnTheme.setText(themeButtonLabel()); }
         if(img != null) img.setBackgroundColor(alt);
         if(curResult != null && curResult.length() > 0) renderCards(curResult);
     }
@@ -5838,10 +8539,10 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     String httpGetText(String url, int connectMs, int readMs){
         HttpURLConnection c = null;
         try{
-            if(SrvClient.isBuiltin(url)) Log.i("DYP", "SRV_PIN_HIT " + url.substring(0, Math.min(60, url.length())));
+            if(SrvClient.isBuiltin(url)) DypLog.i("SRV_PIN_HIT " + url.substring(0, Math.min(60, url.length())));
             c = openConnRetry(url);
             if(SrvClient.isBuiltin(url)){
-                Log.i("DYP", "SRV_HDR_TS=" + c.getRequestProperty("X-TS"));
+                DypLog.i("SRV_HDR_TS=" + c.getRequestProperty("X-TS"));
             }
             c.setInstanceFollowRedirects(true);
             c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13; DYParse) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36");
@@ -5857,7 +8558,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             in.close();
             return new String(bo.toByteArray(), "UTF-8");
         }catch(Throwable t){
-            Log.i("DYP", "HTTP_GET_ERR " + url + " " + t);
+            DypLog.i("HTTP_GET_ERR " + url + " " + t);
             return null;
         }finally{
             try{ if(c != null) c.disconnect(); }catch(Throwable t){}
@@ -5919,9 +8620,9 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                                 ed.putBoolean("force_" + nv, true);
                             }
                             ed.apply();
-                            Log.i("DYP", "UPDATE_FORCE_INFO force=" + fo + " min=" + mv);
+                            DypLog.i("UPDATE_FORCE_INFO force=" + fo + " min=" + mv);
                         }catch(Throwable t){}
-                        Log.i("DYP", "UPDATE_SRC selfhost tag=" + tag);
+                        DypLog.i("UPDATE_SRC selfhost tag=" + tag);
                     }
                 } else {
                     why.append("selfhost_fail ");
@@ -5958,9 +8659,9 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                         q = body.indexOf("browser_download_url", q + 1);
                     }
                 } else {
-                    Log.i("DYP", "UPDATE_SRC api_skip 已有更高版本 " + tag + " >= " + apiTag);
+                    DypLog.i("UPDATE_SRC api_skip 已有更高版本 " + tag + " >= " + apiTag);
                 }
-                Log.i("DYP", "UPDATE_SRC api(" + (useGitee ? "gitee" : "github") + ") tag=" + apiTag);
+                DypLog.i("UPDATE_SRC api(" + (useGitee ? "gitee" : "github") + ") tag=" + apiTag);
             } else {
                 why.append("api_fail ");
             }
@@ -5985,7 +8686,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                             String bd = pickReleaseBody(tp);
                             if(bd != null && bd.length() > 0) bodyTxt = bd;
                         }
-                        Log.i("DYP", "UPDATE_SRC web tag=" + tag + " apk=" + apkName);
+                        DypLog.i("UPDATE_SRC web tag=" + tag + " apk=" + apkName);
                     } else {
                         why.append("web_notag ");
                     }
@@ -6010,7 +8711,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                         apkName = apkUrl.substring(apkUrl.lastIndexOf('/') + 1);
                     }
                     html = home + "/releases";
-                    Log.i("DYP", "UPDATE_SRC static tag=" + tag);
+                    DypLog.i("UPDATE_SRC static tag=" + tag);
                 } else {
                     why.append("static_fail ");
                 }
@@ -6019,7 +8720,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             final String fTag = tag, fHtml = html, fName = name, fBody = bodyTxt;
             final String fApk = (apkUrl == null) ? "" : apkUrl;
             final String fApkName = (apkName == null) ? "" : apkName;
-            Log.i("DYP", "UPDATE_RESULT tag=" + fTag + " cur=" + curVer + " why=" + why.toString().trim());
+            DypLog.i("UPDATE_RESULT tag=" + fTag + " cur=" + curVer + " why=" + why.toString().trim());
 
             h.post(new Runnable(){ public void run(){
                 if(fTag == null || fTag.length() == 0){
@@ -6079,16 +8780,16 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             try{ if(untilS != null && untilS.length() > 0) until = (int) Double.parseDouble(untilS); }catch(Throwable t){}
             final int cur = curVersionCode();
             if(until > 0 && cur >= until){
-                Log.i("DYP", "UPGRADE_NOTICE skip cur=" + cur + " until=" + until);
+                DypLog.i("UPGRADE_NOTICE skip cur=" + cur + " until=" + until);
                 return;
             }
             // 同一个 versionCode 只弹一次
             final String spKey = "upg_notice_" + cur;
             if(getSharedPreferences(SP, MODE_PRIVATE).getBoolean(spKey, false)){
-                Log.i("DYP", "UPGRADE_NOTICE already_shown cur=" + cur);
+                DypLog.i("UPGRADE_NOTICE already_shown cur=" + cur);
                 return;
             }
-            Log.i("DYP", "UPGRADE_NOTICE show cur=" + cur + " until=" + until);
+            DypLog.i("UPGRADE_NOTICE show cur=" + cur + " until=" + until);
             h.post(new Runnable(){ public void run(){
                 try{
                     dypDlg()
@@ -6106,11 +8807,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                         .show();
                     getSharedPreferences(SP, MODE_PRIVATE).edit().putBoolean(spKey, true).apply();
                 }catch(Throwable t){
-                    Log.i("DYP", "UPGRADE_NOTICE_ERR " + t);
+                    DypLog.i("UPGRADE_NOTICE_ERR " + t);
                 }
             }});
         }catch(Throwable t){
-            Log.i("DYP", "UPGRADE_NOTICE_PARSE_ERR " + t);
+            DypLog.i("UPGRADE_NOTICE_PARSE_ERR " + t);
         }
     }
 
@@ -6394,7 +9095,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         if(!force && respectSnooze){
             int skip = getSharedPreferences(SP, MODE_PRIVATE).getInt(KEY_SKIP_VER, 0);
             if(newVer <= skip){
-                Log.i("DYP", "UPDATE_SKIP new=" + newVer + " skip=" + skip);
+                DypLog.i("UPDATE_SKIP new=" + newVer + " skip=" + skip);
                 return;
             }
         }
@@ -6440,7 +9141,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 public void onClick(android.content.DialogInterface d, int w){
                     getSharedPreferences(SP, MODE_PRIVATE).edit()
                         .putInt(KEY_SKIP_VER, newVer).apply();
-                    Log.i("DYP", "UPDATE_SNOOZE ver=" + newVer);
+                    DypLog.i("UPDATE_SNOOZE ver=" + newVer);
                     Toast.makeText(MainActivity.this,
                         "已设置：下个版本发布前不再提醒", Toast.LENGTH_SHORT).show();
                 }
@@ -6464,11 +9165,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             // 本地缓存的强制最低版本（上次成功拉取 version.json 时写入）
             int minVer = p.getInt(KEY_FORCE_MIN, 0);
             if(minVer > 0 && curVer < minVer){
-                Log.i("DYP", "UPDATE_FORCE by min_ver cur=" + curVer + " min=" + minVer);
+                DypLog.i("UPDATE_FORCE by min_ver cur=" + curVer + " min=" + minVer);
                 return true;
             }
             if(p.getBoolean("force_" + newVer, false)){
-                Log.i("DYP", "UPDATE_FORCE by flag ver=" + newVer);
+                DypLog.i("UPDATE_FORCE by flag ver=" + newVer);
                 return true;
             }
         }catch(Throwable t){}
@@ -6498,13 +9199,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     String test = mirrorify(rawApk, i);
                     if(InnerDownloader.headOk(test)){
                         good = test;
-                        Log.i("DYP", "APK_MIRROR_OK idx=" + i + " " + GH_MIRRORS[i]);
+                        DypLog.i("APK_MIRROR_OK idx=" + i + " " + GH_MIRRORS[i]);
                         break;
                     }
-                    Log.i("DYP", "APK_MIRROR_FAIL idx=" + i);
+                    DypLog.i("APK_MIRROR_FAIL idx=" + i);
                 }
                 final String use = (good != null) ? good : rawApk;
-                if(good == null) Log.i("DYP", "APK_MIRROR_ALL_FAIL 回退直连");
+                if(good == null) DypLog.i("APK_MIRROR_ALL_FAIL 回退直连");
                 h.post(new Runnable(){ public void run(){ doDownloadApk(use, fname, target); }});
             }}).start();
             return;
@@ -6525,7 +9226,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                             + (tot > 0 ? " / " + InnerDownloader.sizeText(tot) : ""));
                 }
                 @Override public void onDone(boolean ok2, File out, String msg){
-                    Log.i("DYP", "APK_DL ok=" + ok2 + " " + msg);
+                    DypLog.i("APK_DL ok=" + ok2 + " " + msg);
                 }
             });
 
@@ -6595,11 +9296,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             startActivity(it);
             s("已打开安装器");
         }catch(android.content.ActivityNotFoundException e){
-            Log.i("DYP", "INSTALL_NO_ACTIVITY " + e);
+            DypLog.i("INSTALL_NO_ACTIVITY " + e);
             s("没有可用的安装器");
             showHintToast("请到文件管理器手动安装 Download/Android/data/com.re.douyinparse/files/update.apk");
         }catch(Throwable t){
-            Log.i("DYP", "INSTALL_ERR " + t);
+            DypLog.i("INSTALL_ERR " + t);
             s("安装失败：" + t);
             showHintToast("可手动安装：Android/data/com.re.douyinparse/files/update.apk");
         }
@@ -6875,7 +9576,44 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v2.0.0】大版本：支持平台从 7 个扩到 20 个\n"
+            "【v2.1.1】YouTube 解析恢复，TikTok 实况图提示优化\n"
+             + "新增\n"
+             + "· YouTube 解析新增 Invidious 直连通道，不再依赖服务器，可拿 1080P/4K 原画\n"
+             + "· YouTube 解析新增本机 player.js 求解通道，作为 Invidious 失效时的第二道保障\n"
+             + "修复\n"
+             + "· YouTube 解析不了、一直转圈：服务器解析超时从 10 分钟收到 75 秒，失败立刻提示\n"
+             + "· YouTube 解析出来没画面：改为手机直连 Invidious 取流，带 Range 支持边下边播\n"
+             + "· TikTok 遇到私密/已删除作品时一直转圈：现在直接提示「作品不可用」\n"
+             + "· 应用图标丢失导致部分机型不显示图标\n"
+             + "说明\n"
+             + "· YouTube 的 Invidious 通道走公共实例，全部失效时会自动回退自建服务器\n"
+             + "· 服务器到期后 YouTube 解析仍可用，只是少了服务器这条兜底\n"
+             + "\n"
+            + "【v2.1.0】新增磁力下载，TikTok / X 主页解析重做\n"
+             + "新增\n"
+             + "· 支持磁力链接（magnet）与 .torrent 文件直接下载，带进度与节点信息\n"
+             + "· 解析页顶部支持平台数更新为 22 个，新增腾讯视频、磁力下载\n"
+             + "· TikTok 主页解析：直接抓主页作品列表，视频与图集都能收\n"
+             + "· TikTok 主页自动滚动加载，能翻出全部作品而非首屏\n"
+             + "· X（推特）主页解析：新增网页数据源，游客态即可拿到时间线\n"
+             + "· 设置页「支持的平台」清单同步更新\n"
+             + "优化\n"
+             + "· TikTok 批量下载改走本地直连，不再逐条空等服务器超时\n"
+             + "· 服务器不可达时自动回退本地，功能不中断\n"
+             + "· 主页列表作品 id 校验收紧，不再混入作者 id 之类的无效条目\n"
+             + "· 列表「解析看详情」改为回到解析页渲染，不再直接进下载\n"
+             + "· 列表「批量下载」按当前子页选数据（批量 / 单条 / 主页 / 合集）\n"
+             + "修复\n"
+             + "· 列表里的记录删不掉，删完再点一次又刷新出来\n"
+             + "· 实况图下载路径缺少平台目录，落到「动图」而不是「TikTok/动图」\n"
+             + "· TikTok 主页批量下载提示「成功入队 0/3 条」\n"
+             + "· 主页列表点「批量下载」提示列表是空的\n"
+             + "· 列表单条解析报「所有数据源都没拿到媒体」（改走列表已有直链）\n"
+             + "说明\n"
+             + "· 磁力下载为 P2P 分享，请只下载自己有权限获取的内容\n"
+             + "· TikTok / X 主页解析均为本地直连，不依赖服务器\n"
+             + "\n"
+             + "【v2.0.0】大版本：支持平台从 7 个扩到 20 个\n"
              + "新增\n"
              + "· 新增 13 个平台：小红书、微信视频号、微信公众号、微博、今日头条\n"
              + "· 西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包\n"
@@ -6903,12 +9641,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "· 从 App 复制直链到浏览器下载，拿到的只有 720P，不是 4K\n"
              + "\n"
              + "【历史版本】\n"
+             + "v2.0.1：修复若干稳定性问题，Cookie 保存路径调整\n"
              + "v1.3.7.5：支持抖音原画（最高 8K）、播放器控制栏自动隐藏、修复图文/实况图解析失败\n"
              + "v1.3.7.4：批量解析重构，静默执行、结果进列表、退出重进可恢复\n"
              + "· 后台保活设置、更新源切换、GitHub 镜像加速\n"
              + "v1.3.7.3：修复下载中断、优化封面预览、适配 Android 7~17\n"
              + "v1.3.7.2：修复实况图解析、优化访客凭据获取\n"
-            ;
+             ;
     }
     static String changelogOld(){
         return
@@ -7078,7 +9817,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             close();
             try{
                 URL u = new URL(ds.uri.toString());
-                conn = (java.net.HttpURLConnection) u.openConnection(proxy);
+                // proxy 为 null 时不能调 openConnection(null)（会 NPE）。
+                // 传 null 的语义是「跟随系统代理」，即让 TUN/VPN 接管。
+                conn = (proxy == null)
+                        ? (java.net.HttpURLConnection) u.openConnection()
+                        : (java.net.HttpURLConnection) u.openConnection(proxy);
                 conn.setInstanceFollowRedirects(true);
                 conn.setRequestProperty("User-Agent", ua);
                 conn.setRequestProperty("Referer", referer);
@@ -7162,7 +9905,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 if(j == null || j.indexOf("\"fail\"") >= 0){
                     j = httpGet("https://ipinfo.io/json");
                 }
-                Log.i("DYP", "NETCHECK_IP " + j);
+                DypLog.i("NETCHECK_IP " + j);
                 if(j != null){
                     Object o = new JP(j).parse();
                     if(o instanceof Map){
@@ -7259,7 +10002,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             }
 
             final String out = r.toString();
-            Log.i("DYP", "NETCHECK_BEGIN\n" + out + "\nNETCHECK_END");
+            DypLog.i("NETCHECK_BEGIN\n" + out + "\nNETCHECK_END");
             h.post(new Runnable(){ public void run(){
                 try{ dlg.setMessage(out); }catch(Throwable t){}
             }});
@@ -7340,10 +10083,9 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         et.setText(cur);
         et.setHint("粘贴 UIFID_TEMP 的值");
         et.setTextSize(13);
-        et.setTextColor(textDlg);
-        et.setHintTextColor(subDlg);
         et.setSingleLine(false);
         et.setMinLines(2);
+        styleInput(et);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(12);
@@ -7525,6 +10267,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         wrap.addView(tip);
 
         final EditText etSrv = new EditText(this);
+        styleInput(etSrv);
         // 用户没自填过（用内置）时不显示内置地址，只提示"已启用"；内置地址不暴露给用户
         String savedSrv = p.getString(KEY_DYP_SRV, "");
         if(savedSrv != null && savedSrv.length() > 0){
@@ -7687,19 +10430,19 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     class Bridge {
         @JavascriptInterface
         public void onSphTap(final String n){
-            Log.i("DYP", "SPH_TAP done=" + n);
+            DypLog.i("SPH_TAP done=" + n);
         }
         @JavascriptInterface
         public void onSphProbe(final String json){
-            Log.i("DYP", "SPH_PROBE " + (json == null ? "null" : json.substring(0, Math.min(600, json.length()))));
+            DypLog.i("SPH_PROBE " + (json == null ? "null" : json.substring(0, Math.min(600, json.length()))));
             h.post(new Runnable(){ public void run(){
-                try{ sphRender(json); }catch(Throwable t){ Log.i("DYP", "SPH_RENDER_ERR " + t); }
+                try{ sphRender(json); }catch(Throwable t){ DypLog.i("SPH_RENDER_ERR " + t); }
             }});
         }
         @JavascriptInterface
         public void onYtData(final String data){
             h.post(new Runnable(){ public void run(){
-                Log.i("DYP", "YT_BRIDGE " + (data == null ? "null" : data.substring(0, Math.min(120, data.length()))));
+                DypLog.i("YT_BRIDGE " + (data == null ? "null" : data.substring(0, Math.min(120, data.length()))));
                 if(data == null || data.length() < 10) return;
                 try{
                     String[] parts = data.split("@@YT@@", 7);
@@ -7728,12 +10471,12 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                         sb.append(",\"i_audio\":\"").append(YtParser.YtVideo.esc(aurl)).append("\"");
                     sb.append("}");
                     String rr = sb.toString();
-                    Log.i("DYP", "RESULT_BEGIN\n" + rr + "\nRESULT_END");
+                    DypLog.i("RESULT_BEGIN\n" + rr + "\nRESULT_END");
                     curAudio = aurl;
                     o(rr);
                     s("完成(YouTube)");
                     web.setVisibility(View.GONE);
-                }catch(Throwable t){ Log.i("DYP", "YT_BRIDGE_ERR " + t); }
+                }catch(Throwable t){ DypLog.i("YT_BRIDGE_ERR " + t); }
             }});
         }
         @JavascriptInterface
@@ -7741,18 +10484,18 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             h.post(new Runnable(){ public void run(){
                 // 主页收集模式：普通 inject 回包不渲染
                 if(profileMode){
-                    Log.i("DYP", "IGNORE_RESULT profile mode");
+                    DypLog.i("IGNORE_RESULT profile mode");
                     return;
                 }
                 // 限时日常（story）已弹专属提示，忽略 WebView 后到的回包
                 if(storyBlocked){
-                    Log.i("DYP", "IGNORE_RESULT story blocked");
+                    DypLog.i("IGNORE_RESULT story blocked");
                     return;
                 }
                 // detail 接口已成功渲染过：它的数据比 SSR 完整（含实况动轨），
                 // 不能被 WebView 的 SSR 结果覆盖，否则实况会退化成静态图。
                 if(detailRendered){
-                    Log.i("DYP", "IGNORE_RESULT detail already rendered");
+                    DypLog.i("IGNORE_RESULT detail already rendered");
                     webDone = true;
                     return;
                 }
@@ -7760,7 +10503,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 int mixN;
                 synchronized(mixItems){ mixN = mixItems.size(); }
                 if(mixN > 0 || mixMode){
-                    Log.i("DYP", "IGNORE_RESULT mix mode n=" + mixN);
+                    DypLog.i("IGNORE_RESULT mix mode n=" + mixN);
                     webDone = true;
                     return;
                 }
@@ -7775,18 +10518,18 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 try{
                     Object rr = new JP(json).parse();
                     String dc = gs(get(rr, "docCookie"));
-                    Log.i("DYP", "DOC_COOKIE len=" + dc.length() + " " + dc);
+                    DypLog.i("DOC_COOKIE len=" + dc.length() + " " + dc);
                     String ck = android.webkit.CookieManager.getInstance().getCookie("https://www.douyin.com/");
                     StringBuilder nm = new StringBuilder();
                     if(ck != null) for(String kv : ck.split(";")){ int e = kv.indexOf('='); if(e>0) nm.append(kv.substring(0,e).trim()).append(","); }
-                    Log.i("DYP", "CM_COOKIE_NAMES " + nm);
+                    DypLog.i("CM_COOKIE_NAMES " + nm);
                     String uf = DyDetail.cookieValue(ck, "UIFID");
                     if(uf.length() == 0) uf = DyDetail.cookieValue(ck, "uifid");
-                    Log.i("DYP", "UIFID_FROM_CM len=" + uf.length() + " head=" + (uf.length()>40?uf.substring(0,40):uf));
-                }catch(Throwable t){ Log.i("DYP", "COOKIE_PROBE_ERR " + t); }
+                    DypLog.i("UIFID_FROM_CM len=" + uf.length() + " head=" + (uf.length()>40?uf.substring(0,40):uf));
+                }catch(Throwable t){ DypLog.i("COOKIE_PROBE_ERR " + t); }
                 String r=render(jsonForRender);
-                Log.i("DYP","RESULT_BEGIN\n"+r+"\nRESULT_END");
-                Log.i("DYP","RAW_LEN="+json.length());
+                DypLog.i("RESULT_BEGIN\n"+r+"\nRESULT_END");
+                DypLog.i("RAW_LEN="+json.length());
                 // 失败则自动重试（最多 2 次）
                 boolean fail = r.indexOf("解析失败") >= 0 || r.indexOf("未能获取") >= 0;
                 // 合集页面走 mix 分支，不做普通重试
@@ -7795,7 +10538,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 if(fail && (mixMode
                         || (curUrl != null && (curUrl.indexOf("/mix/") >= 0 || curUrl.indexOf("/playlet/") >= 0))
                         || (curPage != null && (curPage.indexOf("/mix/") >= 0 || curPage.indexOf("/playlet/") >= 0)))){
-                    Log.i("DYP", "SKIP_RETRY mix page " + curPage);
+                    DypLog.i("SKIP_RETRY mix page " + curPage);
                     if(!mixMode){
                         // 合集接口还没回来，给点时间再判断
                         h.postDelayed(new Runnable(){ public void run(){
@@ -7807,24 +10550,116 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 if(fail && curRetry < 2){
                     curRetry++;
                     webDone = false;
-                    Log.i("DYP", "RETRY " + curRetry);
+                    DypLog.i("RETRY " + curRetry);
                     h.postDelayed(new Runnable(){ public void run(){ loadForParse(curUrl); } }, 1200);
                     return;
+                }
+                // 风控页：分两种，不能混
+                //
+                //  · 可挑战（滑块/验证码）→ 亮出 WebView + 操作条，让用户过
+                //  · 终态拒绝（抱歉出错）  → 亮出来也没用，页面上没东西可点，
+                //    用户只会以为 App 坏了。直接给恢复步骤。
+                boolean riskDead = isDyRiskDead(jsonForRender, curUrl);
+                if(riskDead){
+                    DypLog.i("DY_RISK_DEAD 抖音已终态拒绝（抱歉出错/请在抖音内观看）");
+                    curRiskBlocked = false;
+                    riskRetryUrl = "";
+                    riskAutoRetry = 0;
+                    riskLastRetryMs = 0L;
+                    h.post(new Runnable(){ public void run(){
+                        try{
+                            web.setVisibility(View.GONE);
+                            web.setLayoutParams(new LinearLayout.LayoutParams(1, 1));
+                            pageParse.setVisibility(View.VISIBLE);
+                        }catch(Throwable t){}
+                        showHintToast("抖音已拒绝本次请求（不是滑块问题），需要等一段时间");
+                        s("抖音已拒绝：等 10~15 分钟后重试，或换网络 / 重新登录");
+                        showDyRiskDeadDialog();
+                    }});
+                    return;
+                }
+                // 风控页：把 WebView 亮出来让用户自己过验证，别偷偷藏掉
+                boolean risk = isDyRiskPage(jsonForRender, curUrl);
+                if(risk){
+                    curRiskBlocked = true;
+                    riskRetryUrl = curUrl;
+                    DypLog.i("DY_RISK_BLOCK 检测到风控/验证页，显示页面等待用户手动通过");
+                    h.post(new Runnable(){ public void run(){
+                        try{
+                            // 关键：WebView 平时是 1x1 占位（为了不占布局），
+                            // 只 setVisibility(VISIBLE) 根本看不见！
+                            // 必须先把布局参数改成「铺满」，再显示。
+                            // 同时藏掉解析页，避免两个界面叠在一起看不清。
+                            pageParse.setVisibility(View.GONE);
+                            web.setLayoutParams(new LinearLayout.LayoutParams(
+                                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                            web.setVisibility(View.VISIBLE);
+                            web.bringToFront();
+                        }catch(Throwable t){}
+                        showRiskBar();
+                    }});
+                    showHintToast("抖音要求安全验证，请在页面里完成验证");
+                    s("需要安全验证，请完成验证后点按钮");
+                    // 风控时不要走后续的隐藏 / 重试逻辑
+                    return;
+                }
+                curRiskBlocked = false;
+                // 解析成功 → 风控已解除，把自动重试计数清零，下次风控重新计
+                if(!fail){
+                    riskAutoRetry = 0;
+                    riskLastRetryMs = 0L;
                 }
                 o(r);
                 s(fail ? "解析失败" : "完成");
                 appLog("解析", fail ? "✗ 失败 url=" + curUrl : "✓ 完成 id=" + curId);
                 // 主页列表「下载」入口：解析成功后自动把高清直链入下载队列
-                if(!fail && pendingAutoDlTag.length() > 0 && curPlay != null && curPlay.length() > 0){
-                    final String dl = curPlay;
-                    final String tag = pendingAutoDlTag;
-                    pendingAutoDlTag = "";
-                    pendingAutoDlIdx = -1;
-                    enqueueDownload(dl, tag, "mp4", "视频");
-                    showHintToast("已加入下载队列：" + tag);
-                    s("已加入下载队列：" + tag);
+                if(pendingAutoDlTag.length() > 0){
+                    if(!fail && curPlay != null && curPlay.length() > 0
+                            && rejectNonMediaUrl(curPlay).length() == 0){
+                        final String dl = curPlay;
+                        DypLog.i("BATCH_DL_ENQ url=" + dl);
+                        final String tag = pendingAutoDlTag;
+                        pendingAutoDlTag = "";
+                        pendingAutoDlIdx = -1;
+                        enqueueDownload(dl, tag, "mp4", "视频");
+                        showHintToast("已加入下载队列：" + tag);
+                        s("已加入下载队列：" + tag);
+                        batchDlOk++;
+                        // 直链有时效（约 5~10 分钟），不能等全部解析完再下。
+                        // 解析够 conc 条就启动队列，之后边解析边补充，
+                        // 既能并发拉满，又不会让早解析出的直链过期。
+                        if(!batchDlKicked && batchDlOk >= dlConcurrency()){
+                            batchDlKicked = true;
+                            int q;
+                            synchronized(downloadQueue){ q = downloadQueue.size(); }
+                            DypLog.i("BATCH_DL_EARLY_KICK ok=" + batchDlOk
+                                    + " queued=" + q + " conc=" + dlConcurrency());
+                            if(q > 0 && !dlRunning){
+                                dlRunning = true;
+                                runDownloadQueue();
+                            }
+                        }
+                    } else {
+                        DypLog.i("BATCH_DL_PARSE_FAIL idx=" + batchDlIndex);
+                        pendingAutoDlTag = "";
+                        pendingAutoDlIdx = -1;
+                    }
+                    if(batchDlIndex >= 0){
+                        batchDlIndex++;
+                        // 1200ms：太短会打断下一条解析，curPlay 会拿到上一条地址
+                        if(batchDlIndex >= batchDlTotal){
+                            kickBatchDownloads();
+                        }else{
+                            h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 1200);
+                        }
+                    }
                 }
-                web.setVisibility(View.GONE);
+                // 风控页不要藏：用户正在页面里手动过验证
+                if(curRiskBlocked){
+                    DypLog.i("DY_RISK_KEEP_VISIBLE 保持在验证页");
+                }else{
+                    web.setVisibility(View.GONE);
+                }
             }});
         }
 
@@ -7839,6 +10674,11 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         }
 
         /** JS 在页面里发 detail 请求拿到的响应（主页列表条目下载用） */
+        @JavascriptInterface
+        public void onBatchDetail(final String body){
+            onBatchDetailFromWeb(body);
+        }
+
         @JavascriptInterface
         public void onDetailData(final String body){
             final String b = body;
@@ -7858,6 +10698,21 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             || low.contains("bilibili.com/space/")){
             return true;
         }
+        // TikTok 用户主页（不带 /video/ /photo/）
+        if(low.contains("tiktok.com/@")){
+            if(low.contains("/video/") || low.contains("/photo/")) return false;
+            return true;
+        }
+        // X / Twitter 用户主页（不带 /status/ /photo/ 等作品路径）
+        if(low.contains("x.com/") || low.contains("twitter.com/")){
+            if(low.contains("/status") || low.contains("/photo/") || low.contains("/video/")
+                    || low.contains("/i/") || low.contains("/search") || low.contains("/home")){
+                return false;
+            }
+            return java.util.regex.Pattern
+                    .compile("(?:x|twitter)\\.com/[A-Za-z0-9_]{2,20}(?:[/?#]|$)")
+                    .matcher(low).find();
+        }
         // Instagram 用户主页（不带 /p/ /reel/ /stories/）
         if(low.contains("instagram.com/")){
             if(low.contains("/p/") || low.contains("/reel/") || low.contains("/reels/")
@@ -7876,14 +10731,23 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         if(!profileMode) return;
         // 确认框还没点确认：页面自己抓到的列表数据先丢掉，避免绕过确认直接出单页结果
         if(bigParsePending || !profileAutoConfirmed){
-            Log.i("DYP", "PROFILE_WEB_DROP 未确认主页解析，丢弃页面数据 len="
+            DypLog.i("PROFILE_WEB_DROP 未确认主页解析，丢弃页面数据 len="
                     + (body == null ? 0 : body.length()));
             return;
         }
-        // 抖音主页已由签名翻页接管，WebView 自己抓到的数据会重复混进来（数量虚高、易重复下载）
+        // 【策略变更】以前这里丢弃 WebView 抓到的 aweme_list（因为签名翻页接管了）。
+        // 但签名翻页拿到的 aweme/post 是壳数据（play_addr 全是背景音乐 mp3），
+        // 真视频直链只有 WebView 拿得到。所以现在反向：WebView 的数据优先收，
+        // 只有「签名翻页已经拿到了结果」并且「WebView 这份明显更少」时才丢弃。
         if(dyProfileSignedOwned && body != null && body.indexOf("aweme_list") >= 0){
-            Log.i("DYP", "DYPROF_WEB_DROP 签名翻页已接管，丢弃 WebView 抓到的列表 len=" + body.length());
-            return;
+            int have;
+            synchronized(profileCollected){ have = profileCollected.size(); }
+            // 签名翻页已经在跑、而且已经有结果了 → 这份重复，丢掉
+            if(have >= 5){
+                DypLog.i("DYPROF_WEB_DROP 签名翻页已出结果(" + have + ")，丢弃重复 len=" + body.length());
+                return;
+            }
+            DypLog.i("DYPROF_WEB_TAKE 签名翻页还没结果，先收 WebView 这份 len=" + body.length());
         }
         new Thread(new Runnable(){ public void run(){
             parseProfileBody(body);
@@ -7892,7 +10756,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 
     /** 主页收集诊断回包 */
     void onDiagFromWeb(final String msg){
-        Log.i("DYP", "PROFILE_DIAG " + msg);
+        DypLog.i("PROFILE_DIAG " + msg);
     }
 
     // ================= 主页 WebView 收集模式 =================
@@ -7902,7 +10766,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         try{
             java.util.Map<String, String> m = CookieStore.load(this, CookieStore.PLATFORM_INS);
             if(m.isEmpty()){
-                Log.i("DYP", "INS_CK_INJECT skip (empty)");
+                DypLog.i("INS_CK_INJECT skip (empty)");
                 return;
             }
             android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
@@ -7916,8 +10780,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 n++;
             }
             try{ cm.flush(); }catch(Throwable t){}
-            Log.i("DYP", "INS_CK_INJECT n=" + n);
-        }catch(Throwable t){ Log.i("DYP", "INS_CK_INJECT_ERR " + t); }
+            DypLog.i("INS_CK_INJECT n=" + n);
+        }catch(Throwable t){ DypLog.i("INS_CK_INJECT_ERR " + t); }
     }
 
     /** 启动主页收集：WebView 加载主页 + 注入 PROFILE_HOOK_JS + 自动滚动翻页 */
@@ -7936,6 +10800,47 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         setupWebView();
         web.setVisibility(View.VISIBLE);
         web.loadUrl(url);
+        // 【TikTok / 快手等】WebView 首屏只渲染前 20~40 条，不滚动就只能拿到这些。
+        // 抖音有专门的 startDyProfileScroll（走 enterProfileMode），这里给
+        // startProfileWebView 这条路补一个通用滚动，让页面自己加载更多。
+        // 抖音不会走到这里（它走 enterProfileMode），所以不会重复注入。
+        final String lowU = (url == null) ? "" : url.toLowerCase();
+        if(lowU.contains("tiktok.com") || lowU.contains("kuaishou.com")){
+            h.postDelayed(new Runnable(){ public void run(){
+                if(!profileMode) return;
+                startGenericProfileScroll();
+            }}, 3500);
+        }
+    }
+
+    /**
+     * 通用主页滚动（TikTok / 快手）：页面自己加载更多，PROFILE_HOOK_JS 的 fetch hook
+     * 会旁路截到新数据并交给 parseTtProfileJson / parseKsProfile。
+     * 连续 12 次高度不变就停，最多 120 轮（约 3 分钟）。
+     */
+    void startGenericProfileScroll(){
+        if(web == null) return;
+        DypLog.i("PROFILE_SCROLL_GEN_START");
+        web.evaluateJavascript(
+            "(function(){try{"
+            + "window.__dyStopScroll=false;"
+            + "if(window.__dyScrollTimer){clearInterval(window.__dyScrollTimer);}"
+            + "var n=0,lastH=0,same=0;"
+            + "window.__dyScrollTimer=setInterval(function(){"
+            + "  try{"
+            + "    if(window.__dyStopScroll){clearInterval(window.__dyScrollTimer);return;}"
+            + "    n++;"
+            + "    var e=document.scrollingElement||document.documentElement;"
+            + "    var h=e?e.scrollHeight:0;"
+            + "    if(e){e.scrollTop=e.scrollHeight;}"
+            + "    var li=document.querySelectorAll('[data-e2e=\"user-post-item\"],a[href*=\"/video/\"],a[href*=\"/photo/\"]');"
+            + "    try{window.DyBridge.onDiag(JSON.stringify({gen:n,h:h,items:li.length}));}catch(err){}"
+            + "    if(h===lastH){same++;}else{same=0;lastH=h;}"
+            + "    if(n>120){window.__dyStopScroll=true;clearInterval(window.__dyScrollTimer);}"
+            + "    if(same>12){window.__dyStopScroll=true;clearInterval(window.__dyScrollTimer);}"
+            + "  }catch(err){}"
+            + "},1600);"
+            + "}catch(e){}})()", null);
     }
 
     /** 停止收集（模式退出时调用；不 stopLoading——后面可能紧跟新的 loadUrl） */
@@ -7955,10 +10860,21 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     /** 解析完成后自动入下载队列（主页列表抖音条目） */
     String pendingAutoDlTag = "";
     int pendingAutoDlIdx = -1;
+    /** 主页批量下载队列（串行解析，避免 curPlay 互相覆盖） */
+    java.util.List<ProfileParser.ProfileItem> batchDlQueue = new java.util.ArrayList<ProfileParser.ProfileItem>();
+    int batchDlIndex = -1;
+    int batchDlTotal = 0;
+    int batchDlOk = 0;
+    /** 批量下载是否已首次启动下载队列（解析够 conc 条就启动，避免直链过期） */
+    boolean batchDlKicked = false;
+    /** 批量下载每条已重试次数（key=条目下标），超时后给一次重试机会 */
+    final java.util.Map<Integer, Integer> batchDlRetry =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<Integer, Integer>());
+
 
     /** 移动端 detail 补抓：PC detail 只给到 720P，移动端才下发 4K/8K 档。 */
     void fetchDetailMobile(final String awemeId){
-        if(web == null || !webReady){ Log.i("DYP", "MOB_SKIP not ready"); return; }
+        if(web == null || !webReady){ DypLog.i("MOB_SKIP not ready"); return; }
         if(awemeId == null || awemeId.length() == 0) return;
         // 关键：参数必须和页面环境（PC Chrome UA）完全一致，否则抖音风控
         // 直接返回 "Blocked by..." HTML 拦截页，JSON.parse 就报 SyntaxError。
@@ -7989,7 +10905,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         sb.append("}catch(e){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'p'+e}));}");
         sb.append("}).catch(function(e){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'f'+e}));});");
         sb.append("}catch(e){window.DyBridge.onDetailData(JSON.stringify({mob:1,err:'x'+e}));}})()");
-        Log.i("DYP", "DETAIL_MOBILE_START id=" + awemeId);
+        DypLog.i("DETAIL_MOBILE_START id=" + awemeId);
         web.evaluateJavascript(sb.toString(), null);
     }
     /** 解析 JS 回传的直链小 JSON（{vurl|iurl|err}），入下载队列 */
@@ -8009,13 +10925,13 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 // 补抓失败是内部行为，用户已经在看 720P 了，不该弹「解析失败」吓他
                 String mErr = gs(get(m, "err"));
                 if(mErr.length() > 0){
-                    Log.i("DYP", "DETAIL_MOBILE_ERR " + mErr.substring(0, Math.min(80, mErr.length())));
+                    DypLog.i("DETAIL_MOBILE_ERR " + mErr.substring(0, Math.min(80, mErr.length())));
                     return;
                 }
                 String mvurl = gs(get(m, "vurl"));
                 String mw = gs(get(m, "mw")), mh = gs(get(m, "mh"));
                 String gearN = gs(get(m, "gearN"));
-                Log.i("DYP", "DETAIL_MOBILE_OK " + mw + "x" + mh + " gears=" + gearN
+                DypLog.i("DETAIL_MOBILE_OK " + mw + "x" + mh + " gears=" + gearN
                     + " url=" + (mvurl.length() > 60 ? mvurl.substring(0, 60) : mvurl));
                 if(mvurl.length() > 0){
                     long nw = parseLong(mw, 0), nh = parseLong(mh, 0);
@@ -8025,7 +10941,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     }
                     long newShort = Math.min(nw, nh);
                     if(newShort > curShort){
-                        Log.i("DYP", "DETAIL_MOBILE_UPGRADE " + curShort + " -> " + newShort);
+                        DypLog.i("DETAIL_MOBILE_UPGRADE " + curShort + " -> " + newShort);
                         curPlay = mvurl;
                         startedUrl = "";
                         miniProxyKey = null;
@@ -8033,7 +10949,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                         final String tip = "已拿到 " + nw + "x" + nh + " 原画，可点播放";
                         h.post(new Runnable(){ public void run(){ showHintToast(tip); }});
                     } else {
-                        Log.i("DYP", "DETAIL_MOBILE_NO_GAIN cur=" + curShort + " new=" + newShort);
+                        DypLog.i("DETAIL_MOBILE_NO_GAIN cur=" + curShort + " new=" + newShort);
                     }
                 }
                 return;   // 移动端回包不走进下载队列逻辑
@@ -8042,7 +10958,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             String vurl = gs(get(m, "vurl"));
             String iurl = gs(get(m, "iurl"));
             if(err.length() > 0 && vurl.length() == 0 && iurl.length() == 0){
-                Log.i("DYP", "PROFILE_DETAIL_ERR " + err);
+                DypLog.i("PROFILE_DETAIL_ERR " + err);
                 h.post(new Runnable(){ public void run(){
                     s("解析失败，试试「解析看详情」：" + err.substring(0, Math.min(60, err.length())));
                     showHintToast("解析失败");
@@ -8066,7 +10982,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             }});
             pendingDetailId = "";
         }catch(Throwable t){
-            Log.i("DYP", "PROFILE_DETAIL_PARSE_ERR " + t);
+            DypLog.i("PROFILE_DETAIL_PARSE_ERR " + t);
         }
     }
 
@@ -8080,7 +10996,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 try{
                     if(root instanceof Map){
                         Map rm = (Map) root;
-                        Log.i("DYP", "PROFILE_PAGE_FIELDS has_more=" + rm.get("has_more")
+                        DypLog.i("PROFILE_PAGE_FIELDS has_more=" + rm.get("has_more")
                             + " max_cursor=" + rm.get("max_cursor")
                             + " cursor=" + rm.get("cursor")
                             + " min_cursor=" + rm.get("min_cursor")
@@ -8099,11 +11015,139 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     || body.indexOf("xdt_api__v1__feed__user_timeline_graphql_connection") >= 0
                     || body.indexOf("xdt_shortcode_media") >= 0){
                 parseInsProfileJson(root);
+            } else if(body.indexOf("itemList") >= 0 || body.indexOf("itemStruct") >= 0){
+                // TikTok 主页（web 端 __UNIVERSAL_DATA_FOR_REHYDRATION__ / API itemList）
+                parseTtProfileJson(root);
+            } else if(body.indexOf("timeline_v2") >= 0 || body.indexOf("full_text") >= 0
+                    || (body.indexOf("\"legacy\"") >= 0 && body.indexOf("extended_entities") >= 0)){
+                // X 主页（timeline v2 / graphql 用户时间线）
+                parseXProfileJson(root);
             } else {
-                Log.i("DYP", "PROFILE_UNKNOWN len=" + body.length());
+                DypLog.i("PROFILE_UNKNOWN len=" + body.length());
             }
         }catch(Throwable t){
-            Log.i("DYP", "PROFILE_PARSE_ERR " + t);
+            DypLog.i("PROFILE_PARSE_ERR " + t);
+        }
+    }
+
+    /** TikTok 主页：从 itemList / itemStruct 里抠作品 */
+    void parseTtProfileJson(Object root){
+        try{
+            int added = 0;
+            java.util.List<Map> items = new java.util.ArrayList<Map>();
+            collectTtItems(root, items, 0);
+            for(Map it : items){
+                String iid = gs(get(it, "id"));
+                if(iid == null || iid.length() < 8) continue;
+                synchronized(profileSeen){
+                    if(!profileSeen.add("tt_" + iid)) continue;
+                }
+                ProfileParser.ProfileItem pi = new ProfileParser.ProfileItem();
+                pi.id = iid;
+                pi.plat = "TikTok";
+                String desc = gs(get(it, "desc"));
+                pi.title = desc.length() > 0 ? desc : ("TikTok " + iid);
+                // 作者名优先
+                Object au = get(it, "author");
+                if(au instanceof Map){
+                    String nk = gs(get((Map) au, "uniqueId"));
+                    if(nk.length() > 0) pi.url = "https://www.tiktok.com/@" + nk + "/video/" + iid;
+                }
+                if(pi.url == null || pi.url.length() == 0)
+                    pi.url = "https://www.tiktok.com/@/video/" + iid;
+                // 封面：video.cover / dynamicCover
+                Object vd = get(it, "video");
+                if(vd instanceof Map){
+                    String cv = gs(get((Map) vd, "cover"));
+                    if(cv.length() == 0) cv = gs(get((Map) vd, "dynamicCover"));
+                    if(cv.length() == 0){
+                        Object co = get((Map) vd, "coverUrl");
+                        if(co != null) cv = String.valueOf(co);
+                    }
+                    if(cv.length() > 0 && cv.startsWith("http")) pi.cover = cv;
+                }
+                if(pi.cover.length() == 0){
+                    Object cvv = get(it, "covers");
+                    if(cvv instanceof List && !((List) cvv).isEmpty()){
+                        Object c0 = ((List) cvv).get(0);
+                        String u = c0 instanceof String ? (String) c0 : String.valueOf(c0);
+                        if(u.startsWith("http")) pi.cover = u;
+                    }
+                }
+                synchronized(profileCollected){ profileCollected.add(pi); }
+                added++;
+            }
+            DypLog.i("TT_PROFILE_JSON added=" + added + " total=" + profileCollected.size());
+            if(added > 0) h.post(profileRenderRunnable);
+        }catch(Throwable t){
+            DypLog.i("TT_PROFILE_JSON_ERR " + t);
+        }
+    }
+
+    /** 递归找 TikTok 作品项（有 id + desc/video 的对象） */
+    void collectTtItems(Object o, java.util.List<Map> out, int depth){
+        if(o == null || depth > 14) return;
+        if(o instanceof Map){
+            Map m = (Map) o;
+            Object id = m.get("id");
+            if(id != null && (m.containsKey("desc") || m.containsKey("video"))){
+                String sid = String.valueOf(id);
+                // TikTok 作品 id 为 18~19 位纯数字（如 7637720726061026578）。
+                // 以前门槛放到 8 位，会把 userId(32164118) 之类误当成作品，列表里冒出
+                // 「TikTok 32164118」这种没有封面没有直链的垃圾条目。
+                if(sid.length() >= 15 && sid.length() <= 25 && sid.matches("\\d+")) out.add(m);
+            }
+            for(Object v : m.values()) collectTtItems(v, out, depth + 1);
+        }else if(o instanceof List){
+            for(Object v : (List) o) collectTtItems(v, out, depth + 1);
+        }
+    }
+
+    /** X 主页：从 timeline_v2 / graphql 里抠推文 */
+    void parseXProfileJson(Object root){
+        try{
+            int added = 0;
+            java.util.List<Map> items = new java.util.ArrayList<Map>();
+            collectXTweets(root, items, 0);
+            for(Map tw : items){
+                String tid = gs(get(tw, "id_str"));
+                if(tid.length() == 0) tid = gs(get(tw, "rest_id"));
+                if(tid.length() < 6) continue;
+                synchronized(profileSeen){
+                    if(!profileSeen.add("x_" + tid)) continue;
+                }
+                ProfileParser.ProfileItem pi = new ProfileParser.ProfileItem();
+                pi.id = tid;
+                pi.plat = "X";
+                String txt = gs(get(tw, "full_text"));
+                if(txt.length() == 0) txt = gs(get(tw, "text"));
+                if(txt.length() > 60) txt = txt.substring(0, 60) + "…";
+                pi.title = txt.length() > 0 ? txt : ("X " + tid);
+                pi.url = "https://x.com/i/status/" + tid;
+                synchronized(profileCollected){ profileCollected.add(pi); }
+                added++;
+            }
+            DypLog.i("X_PROFILE_JSON added=" + added + " total=" + profileCollected.size());
+            if(added > 0) h.post(profileRenderRunnable);
+        }catch(Throwable t){
+            DypLog.i("X_PROFILE_JSON_ERR " + t);
+        }
+    }
+
+    /** 递归找 X 推文（legacy + full_text/id_str） */
+    void collectXTweets(Object o, java.util.List<Map> out, int depth){
+        if(o == null || depth > 16) return;
+        if(o instanceof Map){
+            Map m = (Map) o;
+            Object idStr = m.get("id_str");
+            if(idStr != null && (m.containsKey("full_text") || m.containsKey("extended_entities")
+                    || m.containsKey("text"))){
+                String sid = String.valueOf(idStr);
+                if(sid.length() >= 6 && sid.matches("\\d+")) out.add(m);
+            }
+            for(Object v : m.values()) collectXTweets(v, out, depth + 1);
+        }else if(o instanceof List){
+            for(Object v : (List) o) collectXTweets(v, out, depth + 1);
         }
     }
 
@@ -8122,13 +11166,15 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 it.id = code;
                 it.url = "https://www.instagram.com/p/" + code + "/";
                 it.title = "Instagram " + code;
+                // 封面：IG 官方缩略图端点
+                it.cover = "https://www.instagram.com/p/" + code + "/media/?size=m";
                 synchronized(profileCollected){ profileCollected.add(it); }
                 added++;
             }
-            Log.i("DYP", "INS_PROFILE_JSON added=" + added + " total=" + profileCollected.size());
+            DypLog.i("INS_PROFILE_JSON added=" + added + " total=" + profileCollected.size());
             if(added > 0) h.post(profileRenderRunnable);
         }catch(Throwable t){
-            Log.i("DYP", "INS_PROFILE_JSON_ERR " + t);
+            DypLog.i("INS_PROFILE_JSON_ERR " + t);
         }
     }
 
@@ -8168,32 +11214,170 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             Object imgs = get(aw, "images");
             boolean isImage = imgs instanceof List && !((List) imgs).isEmpty();
             it.isImage = isImage;
-            // 视频直链：video.play_addr.url_list 第一个
+            // 视频直链：与批量解析同一套标准（bit_rate 最高档 → play_addr → vid 拼接）
+            //
+            // 老版本这里只取 play_addr.url_list[0]，实测会拿到背景音乐轨
+            // （douyinstatic 的 .mp3），存成 .mp4 后只有声音没画面。
             if(!isImage){
                 Object video = get(aw, "video");
                 if(video instanceof Map){
-                    Object pa = get((Map) video, "play_addr");
-                    if(pa instanceof Map){
-                        String u = firstUrl(get((Map) pa, "url_list"));
-                        if(u.length() > 0 && !u.equals("?")) it.directUrl = u;
+                    Map vm = (Map) video;
+                    String best = "";
+                    // 1) bit_rate 里码率最高的一档
+                    try{
+                        List brs = (List) get(vm, "bit_rate");
+                        if(brs != null && brs.size() > 0){
+                            Map bestMap = null; long bestBr = -1;
+                            for(int b = 0; b < brs.size(); b++){
+                                Object bo = brs.get(b);
+                                if(!(bo instanceof Map)) continue;
+                                Map bm = (Map) bo;
+                                long br = parseLong(get(bm, "bit_rate"), 0);
+                                if(br > bestBr){ bestBr = br; bestMap = bm; }
+                            }
+                            if(bestMap != null){
+                                Object bpa = get(bestMap, "play_addr");
+                                if(bpa instanceof Map){
+                                    String uu = firstUrl(get((Map) bpa, "url_list"));
+                                    if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                                    if(best.length() == 0){
+                                        String buri = gs(get((Map) bpa, "uri"));
+                                        if(buri.length() > 0) best = playUrl(buri);
+                                    }
+                                }
+                            }
+                        }
+                    }catch(Throwable t){}
+                    // 2) 退回 play_addr
+                    if(best.length() == 0){
+                        Object pa = get(vm, "play_addr");
+                        if(pa instanceof Map){
+                            String uu = firstUrl(get((Map) pa, "url_list"));
+                            if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                            if(best.length() == 0){
+                                String puri = gs(get((Map) pa, "uri"));
+                                if(puri.length() > 0) best = playUrl(puri);
+                            }
+                        }
+                    }
+                    // 3) 最后用 vid 拼播放地址
+                    if(best.length() == 0){
+                        String vid = gs(get(vm, "vid"));
+                        if(vid.length() > 0) best = playUrl(vid);
+                    }
+                    // 疑似音频一律置空（批量下载会回落 detail 取真视频）
+                    if(best.length() > 0 && isLikelyAudioUrl(best)){
+                        DypLog.i("PROF_WEB_AUDIO id=" + awemeId + " 音频轨，置空 url="
+                                + best.substring(0, Math.min(80, best.length())));
+                        best = "";
+                    }
+                    if(best.length() > 0){
+                        it.directUrl = best;
+                        DypLog.i("PROF_WEB_URL id=" + awemeId + " url="
+                                + best.substring(0, Math.min(80, best.length())));
+                    }
+                    // 时长（0 说明可能不是视频轨）
+                    try{
+                        long dur = parseLong(get(vm, "duration"), 0);
+                        if(dur > 1000) dur = dur / 1000;
+                        it.durSec = dur;
+                    }catch(Throwable t){}
+                }
+            }
+            // 图集：第一张图直链 + 全量图片列表 + live 动轨
+            if(isImage){
+                java.util.List<String> imgUrls = new java.util.ArrayList<String>();
+                java.util.List<String> dynUrls = new java.util.ArrayList<String>();
+                try{
+                    for(Object imObj : (List) imgs){
+                        if(!(imObj instanceof Map)) continue;
+                        Map im = (Map) imObj;
+                        String u = firstUrl(get(im, "url_list"));
+                        if(u.length() > 0 && !u.equals("?")) imgUrls.add(u);
+                        // 实况动轨：video.play_addr / live_photo.video / motion_photo.video
+                        String lv = "";
+                        Object v0 = get(im, "video");
+                        if(v0 instanceof Map){
+                            Object lpa = get((Map) v0, "play_addr");
+                            if(lpa instanceof Map) lv = firstUrl(get((Map) lpa, "url_list"));
+                            if(lv.length() == 0){
+                                Object lda = get((Map) v0, "download_addr");
+                                if(lda instanceof Map) lv = firstUrl(get((Map) lda, "url_list"));
+                            }
+                        }
+                        if(lv.length() == 0){
+                            Object lp = get(im, "live_photo");
+                            if(lp instanceof Map){
+                                Object lv2 = get((Map) lp, "video");
+                                if(lv2 instanceof Map){
+                                    Object lpa2 = get((Map) lv2, "play_addr");
+                                    if(lpa2 instanceof Map) lv = firstUrl(get((Map) lpa2, "url_list"));
+                                    if(lv.length() == 0){
+                                        Object lda2 = get((Map) lv2, "download_addr");
+                                        if(lda2 instanceof Map) lv = firstUrl(get((Map) lda2, "url_list"));
+                                    }
+                                }
+                            }
+                        }
+                        if(lv.length() == 0){
+                            Object mp = get(im, "motion_photo");
+                            if(mp instanceof Map){
+                                Object mv3 = get((Map) mp, "video");
+                                if(mv3 instanceof Map){
+                                    Object lpa3 = get((Map) mv3, "play_addr");
+                                    if(lpa3 instanceof Map) lv = firstUrl(get((Map) lpa3, "url_list"));
+                                }
+                            }
+                        }
+                        dynUrls.add(lv == null ? "" : lv);
+                    }
+                }catch(Throwable gt){
+                    DypLog.i("PROF_WEB_IMGS_ERR " + gt);
+                }
+                if(!imgUrls.isEmpty()){
+                    it.directUrl = imgUrls.get(0);
+                    it.cover = imgUrls.get(0);
+                    // imgs / dyns 本身就是 List<String>，直接放进去
+                    try{
+                        it.imgs.clear();
+                        it.imgs.addAll(imgUrls);
+                    }catch(Throwable t){}
+                    int liveN = 0;
+                    try{
+                        it.dyns.clear();
+                        for(String u : dynUrls){
+                            it.dyns.add(u == null ? "" : u);
+                            if(u != null && u.length() > 0) liveN++;
+                        }
+                    }catch(Throwable t){}
+                    DypLog.i("PROF_WEB_IMGS id=" + awemeId + " n=" + imgUrls.size()
+                            + " live=" + liveN);
+                }
+            }
+            // ============ 解析阶段就把类型定死 ============
+            // 下载阶段不再靠猜：直接看 it.kind 分派。
+            try{
+                if(isImage){
+                    it.kind = hasLiveDyn(it) ? ProfileParser.KIND_LIVE
+                                             : ProfileParser.KIND_IMAGE;
+                }else{
+                    long at = parseLong(get(aw, "aweme_type"), 0);
+                    long mt = parseLong(get(aw, "media_type"), 0);
+                    if(at == 163 || mt == 43){
+                        it.kind = ProfileParser.KIND_MUSIC;
+                    }else if(it.directUrl != null && it.directUrl.length() > 0){
+                        it.kind = ProfileParser.KIND_VIDEO;
                     }
                 }
-            }
-            // 图集：第一张图直链
-            if(isImage && it.directUrl.length() == 0){
-                Object firstImg = ((List) imgs).get(0);
-                if(firstImg instanceof Map){
-                    Object ul = get((Map) firstImg, "url_list");
-                    String u = firstUrl(ul);
-                    if(u.length() > 0 && !u.equals("?")) it.directUrl = u;
-                }
-            }
+            }catch(Throwable kt){}
+            DypLog.i("PROF_KIND id=" + awemeId + " kind=" + it.kind
+                    + "(" + it.kindLabel() + ")");
             it.url = "https://www.iesdouyin.com/share/video/" + awemeId + "/";
             synchronized(profileCollected){ profileCollected.add(it); }
             added++;
         }
         if(added > 0){
-            Log.i("DYP", "DY_PROFILE +" + added + " total=" + profileCollected.size());
+            DypLog.i("DY_PROFILE +" + added + " total=" + profileCollected.size());
             scheduleProfileRender();
         }
     }
@@ -8226,12 +11410,26 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 if(mv.length() == 0) mv = gs(get((Map) photo, "photoUrl"));
                 if(mv.length() > 0) it.directUrl = mv;
             }
+            // 封面：photo.coverUrl / coverUrls / webpCoverUrls 三退
+            if(photo instanceof Map){
+                String cv = gs(get((Map) photo, "coverUrl"));
+                if(cv.length() == 0){
+                    Object cu = get((Map) photo, "coverUrls");
+                    if(cu instanceof List && !((List) cu).isEmpty()) cv = firstUrl(cu);
+                }
+                if(cv.length() == 0){
+                    Object wu = get((Map) photo, "webpCoverUrls");
+                    if(wu instanceof List && !((List) wu).isEmpty()) cv = firstUrl(wu);
+                }
+                if(cv.length() == 0) cv = gs(get((Map) photo, "cover"));
+                if(cv.length() > 0 && !cv.equals("?")) it.cover = cv;
+            }
             it.url = "https://www.kuaishou.com/short-video/" + photoId;
             synchronized(profileCollected){ profileCollected.add(it); }
             added++;
         }
         if(added > 0){
-            Log.i("DYP", "KS_PROFILE +" + added + " total=" + profileCollected.size());
+            DypLog.i("KS_PROFILE +" + added + " total=" + profileCollected.size());
             scheduleProfileRender();
         }
     }
@@ -8252,12 +11450,23 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
             it.id = bvid;
             it.title = gs(get(v, "title"));
+            // 封面：vlist[].pic（// 开头要补 https:），没有就按 bvid 拼
+            String pic = gs(get(v, "pic"));
+            if(pic.length() == 0){
+                Object vp = get(v, "pic");
+                if(vp != null) pic = String.valueOf(vp);
+            }
+            if(pic.startsWith("//")) pic = "https:" + pic;
+            if(pic.length() == 0 && bvid.length() > 0){
+                pic = "https://i0.hdslb.com/bfs/archive/" + bvid + ".jpg";
+            }
+            if(pic.length() > 0) it.cover = pic;
             it.url = "https://www.bilibili.com/video/" + bvid;
             synchronized(profileCollected){ profileCollected.add(it); }
             added++;
         }
         if(added > 0){
-            Log.i("DYP", "BILI_PROFILE +" + added + " total=" + profileCollected.size());
+            DypLog.i("BILI_PROFILE +" + added + " total=" + profileCollected.size());
             scheduleProfileRender();
         }
     }
@@ -8280,12 +11489,14 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             ProfileParser.ProfileItem it = new ProfileParser.ProfileItem();
             it.id = vid;
             it.title = title;
+            // 封面：YouTube 有固定缩略图地址，直接拼
+            if(vid.length() > 0) it.cover = "https://i.ytimg.com/vi/" + vid + "/mqdefault.jpg";
             it.url = "https://www.youtube.com/watch?v=" + vid;
             synchronized(profileCollected){ profileCollected.add(it); }
             added++;
         }
         if(added > 0){
-            Log.i("DYP", "YT_PROFILE +" + added + " total=" + profileCollected.size());
+            DypLog.i("YT_PROFILE +" + added + " total=" + profileCollected.size());
             scheduleProfileRender();
         }
     }
@@ -8359,7 +11570,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
         if(!profileMode) return;
         // 未确认主页解析前不渲染，避免确认框还在弹就已经出了 20 条单页结果
         if(bigParsePending || !profileAutoConfirmed){
-            Log.i("DYP", "PROFILE_RENDER_SKIP 未确认主页解析");
+            DypLog.i("PROFILE_RENDER_SKIP 未确认主页解析");
             return;
         }
         synchronized(profileCollected){
@@ -8379,7 +11590,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             try{
                 String r = parseTikTokByHttp(pageUrl);
                 if(r == null || r.length() == 0){
-                    Log.i("DYP", "TT_BG_EMPTY");
+                    DypLog.i("TT_BG_EMPTY");
                     // 兜底也失败，给个明确提示，别让用户停在"未能获取"
                     final StringBuilder eb = new StringBuilder();
                     eb.append("【解析失败】\n");
@@ -8396,14 +11607,14 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                     }});
                     return;
                 }
-                Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                 o(r);
                 s("完成(TikTok)");
                 webDone = true;
                 h.post(new Runnable(){ public void run(){
                     try{ web.setVisibility(View.GONE); }catch(Throwable t){}
                 }});
-            }catch(Throwable t){ Log.i("DYP", "TT_BG_ERR " + t); }
+            }catch(Throwable t){ DypLog.i("TT_BG_ERR " + t); }
         }}).start();
     }
 
@@ -8411,7 +11622,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     String parseTikTokByHttp(String pageUrl){
         try{
             TtParser.TtVideo v = TtParser.resolve(MainActivity.this, pageUrl, ttSession);
-            Log.i("DYP", "TT_RESULT tpl=" + v.template + " err=" + v.err
+            DypLog.i("TT_RESULT tpl=" + v.template + " err=" + v.err
                     + " ok=" + v.ok() + " id=" + v.id);
             if(!v.ok()){
                 if(v.err.length() > 0){
@@ -8423,7 +11634,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             curSession = ttSession;
             return buildTtResult(v);
         }catch(Throwable t){
-            Log.i("DYP", "TT_HTTP_ERR " + t);
+            DypLog.i("TT_HTTP_ERR " + t);
             return null;
         }
     }
@@ -8499,7 +11710,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
                 int code = c.getResponseCode();
                 String body = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
                 c.disconnect();
-                Log.i("DYP", "AIR_HTTP " + code + " len=" + (body == null ? 0 : body.length()));
+                DypLog.i("AIR_HTTP " + code + " len=" + (body == null ? 0 : body.length()));
                 if(code != 200 || body == null || body.length() == 0){
                     out = "机场流量：服务器无响应（TikTok 可开内置代理或走自己的网络）";
                 } else if(body.indexOf("\"ok\":true") < 0 && body.indexOf("\"ok\": true") < 0){
@@ -8527,7 +11738,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     out = b.toString();
                 }
             }catch(Throwable t){
-                Log.i("DYP", "AIR_EX " + t);
+                DypLog.i("AIR_EX " + t);
                 out = "机场流量：连接失败（TikTok 可开内置代理或走自己的网络）";
             }
             airCacheText = out;
@@ -8556,10 +11767,10 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             c.setReadTimeout(45000);
             int code = c.getResponseCode();
             String body = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
-            Log.i("DYP", "TT_SRV http=" + code + " len=" + (body == null ? 0 : body.length()));
+            DypLog.i("TT_SRV http=" + code + " len=" + (body == null ? 0 : body.length()));
             if(code != 200 || body == null || body.length() == 0) return null;
             if(body.indexOf("\"ok\":true") < 0 && body.indexOf("\"ok\": true") < 0){
-                Log.i("DYP", "TT_SRV_ERR " + str(jget(body, "err")));
+                DypLog.i("TT_SRV_ERR " + str(jget(body, "err")));
                 return null;
             }
             ttSrvRaw = body;
@@ -8627,6 +11838,25 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 }
                 curImgs = ib.toString();
                 curPlay = "";
+                // 实况图（live photo）：liveImages 是纯字符串数组，动态轨单独一列
+                String liveJson = jarr(body, "liveImages");
+                if(liveJson.length() == 0) liveJson = jobj(body, "liveImages");
+                String[] liveArr = strArr(liveJson);
+                DypLog.i("TT_LIVE_PARSE raw=" + liveJson.length() + " n=" + liveArr.length);
+                if(liveArr.length > 0){
+                    StringBuilder db = new StringBuilder();
+                    for(int i = 0; i < liveArr.length; i++){
+                        String u = liveArr[i];
+                        if(u.length() == 0) continue;
+                        if(!u.startsWith("http")) u = srvBase + u;
+                        if(db.length() > 0) db.append('|');
+                        db.append(u);
+                    }
+                    curDyn = db.toString();
+                    curIsLive = true;
+                    DypLog.i("TT_LIVE_FOUND live=" + liveArr.length
+                            + " img=" + curImgs.split("\\|").length);
+                }
             }
 
             final boolean hasVideo = !isImage && curPlay != null && curPlay.length() > 0;
@@ -8645,6 +11875,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             if(hasVideo) TtParser.Kv(b, "i_play", curPlay);
             // 图集与 BGM 必须放进 JSON：render() 会用 i_imgs / i_bgm 覆盖 curImgs / curBgm
             if(curImgs.length() > 0) TtParser.Kv(b, "i_imgs", curImgs);
+            if(curDyn != null && curDyn.length() > 0) TtParser.Kv(b, "i_dyn", curDyn);
+            if(curIsLive) TtParser.Kv(b, "i_live", "1");
             if(curBgm.length() > 0) TtParser.Kv(b, "i_bgm", curBgm);
             TtParser.Kv(b, "i_musicTitle", musicTitle);
             TtParser.Kv(b, "i_musicAuthor", musicAuthor);
@@ -8661,11 +11893,11 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             if(sh > 0){ if(st.length() > 0) st.append("  "); st.append("转 ").append(sh); }
             TtParser.Kv(b, "i_stats", st.toString());
             b.append('}');
-            Log.i("DYP", "TT_SRV_OK src=" + src + " type=" + type
+            DypLog.i("TT_SRV_OK src=" + src + " type=" + type
                     + " dlVideo=" + ttSrvVideoOk + " dlMusic=" + ttSrvMusicOk);
             return render(b.toString());
         }catch(Throwable t){
-            Log.i("DYP", "TT_SRV_EX " + t);
+            DypLog.i("TT_SRV_EX " + t);
             return null;
         }finally{
             try{ if(c != null) c.disconnect(); }catch(Throwable t){}
@@ -8695,6 +11927,38 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         return out.toArray(new String[0]);
     }
 
+    /** 解析纯字符串数组 ["http://a","http://b"]（liveImages 是这种格式） */
+    static String[] strArr(String arrJson){
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        if(arrJson == null) return new String[0];
+        int i = 0;
+        boolean inStr = false;
+        StringBuilder cur = new StringBuilder();
+        while(i < arrJson.length()){
+            char ch = arrJson.charAt(i);
+            if(inStr){
+                if(ch == '\\' && i + 1 < arrJson.length()){
+                    cur.append(arrJson.charAt(i + 1));
+                    i += 2;
+                    continue;
+                }
+                if(ch == '"'){
+                    inStr = false;
+                    String u = cur.toString();
+                    if(u.startsWith("http")) out.add(u);
+                    cur.setLength(0);
+                    i++;
+                    continue;
+                }
+                cur.append(ch);
+            }else{
+                if(ch == '"'){ inStr = true; cur.setLength(0); }
+            }
+            i++;
+        }
+        return out.toArray(new String[0]);
+    }
+
     /** 安全取字符串（jget 可能返回 null） */
     static String str(String s){ return s == null ? "" : s; }
 
@@ -8714,6 +11978,153 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             i++;
         }
         return json.substring(b, i);
+    }
+
+    /**
+     * 服务器补刀：图集作品的实况动轨（mp4 直链）。
+     *
+     * 为什么需要：
+     *   TikTok 网页端（api-data）只下发静态图，imagePost.images[i] 里没有 video 子对象，
+     *   整页 HTML 里一个 .mp4 都没有 —— 本地拿不到动轨。
+     *   服务器走 tikwm，返回里的 live_images 是与 images 一一对应的 mp4 直链。
+     *
+     * 为什么放在 MainActivity 而不是 TtParser：
+     *   自有服务器 /api/ 前缀有 HMAC 鉴权，必须用 openConn() 才会带签名。
+     *
+     * 失败一律返回空列表，调用方按「静态图集」继续，绝不阻塞主流程。
+     */
+    java.util.List<String> ttFetchLiveFromServer(String pageUrl){
+        // 第一优先：本机直连 tikwm（有代理时最快，不消耗服务器流量）
+        java.util.List<String> out = ttFetchLiveFromTikwm(pageUrl);
+        if(!out.isEmpty()){
+            DypLog.i("TT_LIVE_TIKWM ok n=" + out.size());
+            return out;
+        }
+        DypLog.i("TT_LIVE_TIKWM empty 转而请求服务器");
+        // 第二优先：自建服务器（服务器侧 tt_module 也接了 tikwm）
+        out = ttFetchLiveFromSrv(pageUrl);
+        return out;
+    }
+
+    /** 直连 tikwm 取 live_images（与 images 一一对应的 32 条动轨） */
+    java.util.List<String> ttFetchLiveFromTikwm(String pageUrl){
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        if(pageUrl == null || pageUrl.length() == 0) return out;
+        HttpURLConnection c = null;
+        java.io.InputStream in = null;
+        try{
+            String api = "https://www.tikwm.com/api/?hd=1&url="
+                    + java.net.URLEncoder.encode(pageUrl, "UTF-8");
+            DypLog.i("TT_LIVE_TIKWM_REQ " + api);
+            c = openConn(this, api);
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(20000);
+            c.setRequestProperty("User-Agent", InnerDownloader.MUA);
+            c.setRequestProperty("Accept", "application/json");
+            int code = c.getResponseCode();
+            if(code != 200){
+                DypLog.i("TT_LIVE_TIKWM http=" + code);
+                return out;
+            }
+            in = c.getInputStream();
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            int guard = 0;
+            while((n = in.read(buf)) > 0){
+                bo.write(buf, 0, n);
+                if(++guard > 2048) break;
+            }
+            String body = new String(bo.toByteArray(), "UTF-8");
+            String arr = jarr(body, "live_images");
+            if(arr.length() == 0) arr = jarr(body, "liveImages");
+            String[] items = strArr(arr);
+            for(String u : items){
+                if(u != null && u.length() > 0) out.add(u);
+                else out.add("");
+            }
+            DypLog.i("TT_LIVE_TIKWM got=" + out.size() + " arrLen=" + arr.length());
+        }catch(Throwable t){
+            DypLog.i("TT_LIVE_TIKWM_ERR " + t);
+        }finally{
+            try{ if(in != null) in.close(); }catch(Throwable t){}
+            try{ if(c != null) c.disconnect(); }catch(Throwable t){}
+        }
+        return out;
+    }
+
+    /** 走自建服务器 /api/tt 取 liveImages */
+    java.util.List<String> ttFetchLiveFromSrv(String pageUrl){
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        if(pageUrl == null || pageUrl.length() == 0) return out;
+        String srv = effSrv();
+        if(srv.length() == 0) return out;
+        HttpURLConnection c = null;
+        java.io.InputStream in = null;
+        try{
+            String api = srv + "/api/tt?url=" + java.net.URLEncoder.encode(pageUrl, "UTF-8");
+            c = openConn(this, api);
+            c.setConnectTimeout(12000);
+            c.setReadTimeout(25000);
+            int code = c.getResponseCode();
+            if(code != 200){
+                DypLog.i("TT_LIVE_SRV http=" + code);
+                return out;
+            }
+            in = c.getInputStream();
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            int guard = 0;
+            while((n = in.read(buf)) > 0){
+                bo.write(buf, 0, n);
+                if(++guard > 2048) break;   // 上限 16MB
+            }
+            String body = new String(bo.toByteArray(), "UTF-8");
+            String arr = jarr(body, "liveImages");
+            String[] items = strArr(arr);
+            for(String u : items){
+                if(u != null && u.length() > 0) out.add(u);
+                else out.add("");
+            }
+            DypLog.i("TT_LIVE_SRV got=" + out.size() + " arrLen=" + arr.length());
+        }catch(Throwable t){
+            DypLog.i("TT_LIVE_SRV_ERR " + t);
+        }finally{
+            try{ if(in != null) in.close(); }catch(Throwable t){}
+            try{ if(c != null) c.disconnect(); }catch(Throwable t){}
+        }
+        return out;
+    }
+
+    /** 从 JSON 里取数组子串：{"key":[...]} -> [...] */
+    static String jarr(String json, String key){
+        if(json == null) return "";
+        int p = json.indexOf("\"" + key + "\"");
+        if(p < 0) return "";
+        int c = json.indexOf(':', p);
+        if(c < 0) return "";
+        // 跳过空白，确认是数组
+        int b = c + 1;
+        while(b < json.length() && Character.isWhitespace(json.charAt(b))) b++;
+        if(b >= json.length() || json.charAt(b) != '[') return "";
+        int depth = 0;
+        boolean inStr = false;
+        for(int i = b; i < json.length(); i++){
+            char ch = json.charAt(i);
+            if(inStr){
+                if(ch == '\\'){ i++; continue; }
+                if(ch == '"') inStr = false;
+                continue;
+            }
+            if(ch == '"'){ inStr = true; continue; }
+            if(ch == '[') depth++;
+            else if(ch == ']'){
+                depth--;
+                if(depth == 0) return json.substring(b, i + 1);
+            }
+        }
+        return "";
     }
 
     /** 从 JSON 里取对象子串：{"key":{...}} -> {...} */
@@ -8821,7 +12232,36 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             curPlay = v.playUrl.length() > 0 ? v.playUrl : v.downloadUrl;
             curCover = v.cover;
             curImgs = "";
-            curMusic = "";   // TikTok 的 music.playUrl 是配乐片段，不是原声，不当音轨用
+            // TikTok 的 music.playUrl 是「作品所用那首完整音乐」的独立音轨（m4a/mp3），
+            // 不是视频片段；抖音的 music 才是试听片段。所以这里要把它当 BGM 保留。
+            // curMusic 语义是「整段视频音轨」（目前只有快手用），TikTok 走 curBgm。
+            curMusic = "";
+            curBgm = v.musicUrl == null ? "" : v.musicUrl;
+            curBgmTitle = v.musicTitle == null ? "" : v.musicTitle;
+            // 图集：v.images 拼成 | 分隔串（render() 靠 i_imgs 回填 curImgs）
+            if(v.images != null && !v.images.isEmpty()){
+                StringBuilder imb = new StringBuilder();
+                for(String u : v.images){
+                    if(u == null || u.length() == 0) continue;
+                    if(imb.length() > 0) imb.append('|');
+                    imb.append(u);
+                }
+                curImgs = imb.toString();
+            }
+            // 实况动轨：与 curImgs 一一对应（空位也要占，否则会错位）
+            curDyn = "";
+            curIsLive = false;
+            if(v.liveUrls != null && !v.liveUrls.isEmpty()){
+                StringBuilder db = new StringBuilder();
+                boolean any = false;
+                for(int i = 0; i < v.images.size(); i++){
+                    String d = (i < v.liveUrls.size() && v.liveUrls.get(i) != null) ? v.liveUrls.get(i) : "";
+                    if(i > 0) db.append('|');
+                    db.append(d);
+                    if(d.length() > 0) any = true;
+                }
+                if(any){ curDyn = db.toString(); curIsLive = true; }
+            }
             final boolean hasVideo = curPlay != null && curPlay.length() > 0;
             h.post(new Runnable(){ public void run(){
                 actions.setVisibility(View.VISIBLE);
@@ -8843,6 +12283,19 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             if(hasVideo) TtParser.Kv(b, "i_play", curPlay);
             TtParser.Kv(b, "i_musicTitle", v.musicTitle);
             TtParser.Kv(b, "i_musicAuthor", v.musicAuthor);
+            // 图集：必须放进 JSON，render() 靠 i_imgs 回填 curImgs。
+            // 少了这个 key，界面只会显示空白/单图，也不会有「下载全部图片」。
+            if(curImgs != null && curImgs.length() > 0) TtParser.Kv(b, "i_imgs", curImgs);
+            // 实况动轨：render() 靠 i_dyn / i_live 判断哪些图带 LIVE 角标
+            if(curDyn != null && curDyn.length() > 0) TtParser.Kv(b, "i_dyn", curDyn);
+            if(curIsLive) TtParser.Kv(b, "i_live", "1");
+            // BGM：必须放进 JSON —— render() 靠 i_bgm 回填 curBgm，
+            // 没有这个 key，BGM 按钮永远是 GONE，转 MP3 也只能从视频扒。
+            if(v.musicUrl != null && v.musicUrl.length() > 0){
+                TtParser.Kv(b, "i_bgm", v.musicUrl);
+                TtParser.Kv(b, "i_bgmTitle", v.musicTitle);
+                TtParser.Kv(b, "i_bgmAuthor", v.musicAuthor);
+            }
             StringBuilder st = new StringBuilder();
             if(v.playCount > 0) st.append("播 ").append(v.playCount);
             if(v.diggCount > 0){ if(st.length() > 0) st.append("  "); st.append("赞 ").append(v.diggCount); }
@@ -8853,7 +12306,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             String json = b.toString();
             return render(json);
         }catch(Throwable t){
-            Log.i("DYP", "TT_BUILD_ERR " + t);
+            DypLog.i("TT_BUILD_ERR " + t);
             return null;
         }
     }
@@ -8885,7 +12338,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         // 去掉跟踪参数，只保留干净的 /@user/video/id
         int q = real.indexOf('?');
         if(q > 0 && real.indexOf("/video/") > 0 && q > real.indexOf("/video/")) real = real.substring(0, q);
-        Log.i("DYP", "TT_NORMALIZED " + real);
+        DypLog.i("TT_NORMALIZED " + real);
         return real;
     }
 
@@ -8932,9 +12385,9 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             while((n = in.read(buf)) > 0) bo.write(buf, 0, n);
             in.close();
             String html = new String(bo.toByteArray(), "UTF-8");
-            Log.i("DYP", "TT_GET len=" + html.length() + " full=" + full + " hasApi=" + (html.indexOf("id=\"api-data\"") >= 0));
+            DypLog.i("TT_GET len=" + html.length() + " full=" + full + " hasApi=" + (html.indexOf("id=\"api-data\"") >= 0));
             return html;
-        }catch(Throwable t){ Log.i("DYP", "TT_GET_ERR " + t); return null; }
+        }catch(Throwable t){ DypLog.i("TT_GET_ERR " + t); return null; }
         finally{ try{ if(in != null) in.close(); }catch(Throwable t){} }
     }
 
@@ -8967,7 +12420,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 if(ii instanceof Map) item = ((Map)ii).get("itemStruct");
             }
             if(!(item instanceof Map)) item = findKey(root, "itemStruct");
-            if(!(item instanceof Map)){ Log.i("DYP", "TT_NO_ITEM"); return null; }
+            if(!(item instanceof Map)){ DypLog.i("TT_NO_ITEM"); return null; }
             Map it = (Map)item;
 
             String id = gs(get(it, "id"));
@@ -9023,8 +12476,151 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             b.append("\n【注意】TikTok 视频 CDN 有地区限制，直连下载可能 403。\n");
             b.append("　　　　打不开就开「设置 → 代理 → 内置代理」走服务器中转。");
             return b.toString();
-        }catch(Throwable t){ Log.i("DYP", "TT_BUILD_ERR " + t); return null; }
+        }catch(Throwable t){ DypLog.i("TT_BUILD_ERR " + t); return null; }
     }
+
+    /** 这个页面是不是抖音风控/验证码页（需要用户手动过验证） */
+    static boolean isDyRiskPage(String body, String url){
+        try{
+            String b = body == null ? "" : body;
+            String u = url == null ? "" : url.toLowerCase();
+            if(u.indexOf("verify") >= 0 || u.indexOf("captcha") >= 0
+                    || u.indexOf("secsdk") >= 0 || u.indexOf("argus") >= 0) return true;
+            if(b.indexOf("验证码中间页") >= 0) return true;
+            if(b.indexOf("请完成安全验证") >= 0) return true;
+            if(b.indexOf("拖动滑块") >= 0 || b.indexOf("滑动验证") >= 0) return true;
+            if(b.indexOf("抱歉出错") >= 0) return true;
+            if(b.indexOf("请尝试在抖音内观看") >= 0) return true;
+        }catch(Throwable t){}
+        return false;
+    }
+    /** 终态拒绝弹窗：不装样子，直接给能动作的步骤 */
+    void showDyRiskDeadDialog(){
+        try{
+            final android.app.AlertDialog.Builder b = dypDlg();
+            b.setTitle("抖音已拒绝访问");
+            b.setMessage(
+                "页面显示「抱歉出错了 / 请尝试在抖音内观看」，"
+                + "这是抖音直接拒绝，不是滑块验证 —— 所以重试也不会出滑块，"
+                + "这属于正常现象，不是你操作错了。\n\n"
+                + "恢复办法（按顺序试）：\n"
+                + "1. 先停 10~15 分钟不要解析。抖音的拒绝是按频率累计的，"
+                + "越点恢复越慢。\n"
+                + "2. 换网络：WiFi 和 5G 互换，出口 IP 变了风控等级也会变。\n"
+                + "3. 设置 →「抖音登录 / 风控处理」→ 清除登录 Cookie 后重新登录一次。"
+                + "旧的 Cookie 可能已被标记。\n"
+                + "4. 上述都试过还不行，就等半小时以上。\n\n"
+                + "提示：主页列表的批量下载已经改成直接用列表里的直链，"
+                + "不会再逐条打开分享页，以后触发风控的频率会明显下降。");
+            b.setPositiveButton("知道了", null);
+            b.setNeutralButton("去设置看登录", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    try{ switchTab(4); }catch(Throwable t){}
+                }
+            });
+            b.show();
+        }catch(Throwable t){ DypLog.i("RISK_DEAD_DLG_ERR " + t); }
+    }
+
+    /**
+     * 粗判一条直链是不是音频（而不是视频）。
+     *
+     * 抖音的 CDN 域名分工很明确：
+     *   视频流   v3-web.douyinvod.com / v5-dy.byteicdn.com / zjcdn ...
+     *   图片     p3-sign.douyinpic.com ...
+     *   音频/静态 sf6-cdn-tos.douyinstatic.com/obj/tos-cn-ve-2774 ...
+     *
+     * 实测：主页列表里部分作品的 play_addr 直接给的是
+     *   sf6-cdn-tos.douyinstatic.com/obj/tos-cn-ve-2774/xxx
+     * 响应 Content-Type: audio/mp4，
+     * 存成 .mp4 后相册能播但只有声音（用户反馈 4 条里 3 条中招）。
+     *
+     * 这里只做域名级粗判，用于「入队前决定要不要回落到 WebView 解析」。
+     * 真正的把关在 InnerDownloader 的 Content-Type 检查（已加 audio 拦截）。
+     */
+    static boolean isLikelyAudioUrl(String url){
+        if(url == null || url.length() == 0) return false;
+        String u = url.toLowerCase();
+        if(u.indexOf("douyinstatic") >= 0) return true;      // 抖音静态资源（音乐库）
+        if(u.indexOf("/music/") >= 0 || u.indexOf("music.mp3") >= 0) return true;
+        if(u.indexOf("audio/") >= 0) return true;
+        // 明确是视频 CDN 的一律放行，避免误杀
+        if(u.indexOf("douyinvod") >= 0 || u.indexOf("byteicdn") >= 0
+                || u.indexOf("zjcdn") >= 0 || u.indexOf("dycdn") >= 0) return false;
+        return false;
+    }
+
+    /**
+     * 判断是不是「终态拒绝」—— 抖音彻底不给机会了。
+     *
+     * 和 isDyRiskPage 的区别：
+     *   isDyRiskPage  = 任意风控/验证页（含可挑战的滑块）
+     *   isDyRiskDead  = 连挑战都不给的死页面
+     *
+     * 「抱歉出错了 / 请尝试在抖音内观看」这一档，抖音已经不会再下发滑块，
+     * 这时候把 WebView 亮出来让用户「完成验证」是骗人的 ——
+     * 页面上根本没有可操作的东西，用户点重试也不会好。
+     * 实测：用户报「这次又没有滑块验证了，我重试了也没有」就是这个。
+     *
+     * 对这种情况只能直说：等、换网络、换 Cookie。
+     */
+    static boolean isDyRiskDead(String body, String url){
+        try{
+            String b = body == null ? "" : body;
+            if(b.indexOf("抱歉出错") >= 0) return true;
+            if(b.indexOf("请尝试在抖音内观看") >= 0) return true;
+            if(b.indexOf("请稍后再试") >= 0 && b.indexOf("抖音") >= 0
+                    && b.indexOf("验证") < 0) return true;
+        }catch(Throwable t){}
+        return false;
+    }
+
+    /**
+     * 风控验证通过后，把抖音 Cookie 存到本地。
+     *
+     * 抖音的「已通过验证」是记在 Cookie 里的（ttwid / sessionid / 
+     * passport_csrf_token 等）。不落盘的话，每次解析都是干净会话，
+     * 表现就是「每条都要重新拖滑块」。
+     */
+    void saveDyCookieAfterVerify(){
+        try{
+            String ck = android.webkit.CookieManager.getInstance()
+                    .getCookie("https://www.douyin.com");
+            if(ck == null || ck.length() == 0){
+                DypLog.i("DY_RISK_NO_CK 验证后没拿到 Cookie");
+                return;
+            }
+            // 只要含关键项才存，避免把空壳 Cookie 覆盖掉之前有效的
+            boolean useful = ck.indexOf("ttwid=") >= 0
+                    || ck.indexOf("sessionid=") >= 0
+                    || ck.indexOf("passport_csrf_token") >= 0
+                    || ck.indexOf("msToken=") >= 0
+                    || ck.indexOf("odin_tt=") >= 0;
+            if(!useful){
+                DypLog.i("DY_RISK_CK_NOT_USEFUL len=" + ck.length());
+                return;
+            }
+            // 走项目统一的 CookieStore（Android/data/<包名>/files/cookies），
+            // 不是随便塞 SharedPreferences —— 启动时 restoreDyCookieToWebView()
+            // 和解析时 dyEffectiveCookie() 都是从这里读的。
+            int n = CookieStore.save(MainActivity.this, CookieStore.PLATFORM_DY, ck);
+            DypLog.i("DY_RISK_CK_SAVED n=" + n + " len=" + ck.length()
+                    + " hasTtwid=" + (ck.indexOf("ttwid=") >= 0)
+                    + " hasSid=" + (ck.indexOf("sessionid=") >= 0));
+        }catch(Throwable t){
+            DypLog.i("DY_RISK_CK_SAVE_ERR " + t);
+        }
+    }
+    /** 当前是否停在风控页（等待用户手动通过验证） */
+    volatile boolean curRiskBlocked = false;
+    /** 风控自动重试次数上限（防止无限重试把风控等级越打越高） */
+    volatile int riskAutoRetry = 0;
+    /** 上次风控自动重试的时间戳，用来做 8 秒节流 */
+    volatile long riskLastRetryMs = 0L;
+    /** 单轮自动重试上限（只兜网络抖动那种偶发，不做风控对抗） */
+    static final int RISK_MAX_RETRY = 1;
+    /** 风控解除后要重新解析的链接 */
+    String riskRetryUrl = "";
 
     String render(String json){
         Object res=new JP(json).parse();
@@ -9043,7 +12639,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             // 有清晰度档时，最高档优先（这才是真正的 4K 原画）
             String bestGear = gearUrl(0);
             if(bestGear.length() > 0){
-                Log.i("DYP", "PLAY_BEST_GEAR " + gearLabel(0) + " " + bestGear.substring(0, Math.min(70, bestGear.length())));
+                DypLog.i("PLAY_BEST_GEAR " + gearLabel(0) + " " + bestGear.substring(0, Math.min(70, bestGear.length())));
                 rawPlay = bestGear;
             }
             // ===== 原画优先（参考 JoeanAmier/TikTokDownloader）=====
@@ -9063,18 +12659,18 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     try{
                         final String orig = pickOriginalQuality(vUriBg, curPlay, 0);
                         if(orig.length() > 0){
-                            Log.i("DYP", "PLAY_ORIGINAL " + orig.substring(0, Math.min(70, orig.length())));
+                            DypLog.i("PLAY_ORIGINAL " + orig.substring(0, Math.min(70, orig.length())));
                             h.post(new Runnable(){ public void run(){
                                 if(orig.equals(curPlay)) return;
                                 curPlay = orig;
                                 curFallbackPlay = "";      // 原画成功就别再降级到 1080p
                                 startedUrl = "";           // 清掉「同一地址不重复起播」的锁
-                                Log.i("DYP", "PLAY_ORIGINAL_APPLIED");
+                                DypLog.i("PLAY_ORIGINAL_APPLIED");
                                 // 原画是 WebM/AV1，播放器必须重新初始化才能换解码器
                                 doPlay();
                             }});
                         }
-                    }catch(Throwable t){ Log.i("DYP", "ORIG_BG_ERR " + t); }
+                    }catch(Throwable t){ DypLog.i("ORIG_BG_ERR " + t); }
                 }}).start();
             }
             playFallbackDone = false;   // 新作品：允许再次降级
@@ -9085,15 +12681,15 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             if(curGears.size() > 0){
                 topShort = (int)Math.min(parseLong(curGears.get(0)[5], 0), parseLong(curGears.get(0)[6], 0));
             }
-            Log.i("DYP", "MOBILE_CHECK id=" + fid + " gears=" + curGears.size() + " topShort=" + topShort);
+            DypLog.i("MOBILE_CHECK id=" + fid + " gears=" + curGears.size() + " topShort=" + topShort);
             if(fid.length() > 0 && topShort < 1400){
                 // 延时等 WebView 页面稳定，再发移动端 detail
                 h.postDelayed(new Runnable(){ public void run(){
-                    try{ fetchDetailMobile(fid); }catch(Throwable t){ Log.i("DYP", "MOB_ERR " + t); }
+                    try{ fetchDetailMobile(fid); }catch(Throwable t){ DypLog.i("MOB_ERR " + t); }
                 }}, 2500);
             }
             if(curFallbackPlay.length() > 0){
-                Log.i("DYP", "PLAY_FALLBACK_SAVED " + curFallbackPlay.substring(0, Math.min(70, curFallbackPlay.length())));
+                DypLog.i("PLAY_FALLBACK_SAVED " + curFallbackPlay.substring(0, Math.min(70, curFallbackPlay.length())));
             }
             // YouTube direct：独立音轨（googlevideo itag 140 m4a），播放器合并、下载后本地 mux
             curAudio=gs(get(m,"i_audio"));
@@ -9106,20 +12702,34 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             final int myGen = ++renderGen;
             h.post(new Runnable(){ public void run(){
                 if(myGen != renderGen){
-                    Log.i("DYP", "RENDER_SKIP gen=" + myGen + " cur=" + renderGen);
+                    DypLog.i("RENDER_SKIP gen=" + myGen + " cur=" + renderGen);
                     return;
                 }
                 // 静默批量解析：数据已经由 collectBatchItem() 收好，
                 // 这里不再改界面，避免每条结果一闪就被下一条覆盖。
                 if(batchSilent && batchRunning){
-                    Log.i("DYP", "RENDER_SILENT skip 图集=" + isImg);
+                    DypLog.i("RENDER_SILENT skip 图集=" + isImg);
+                    // 【关键顺序】必须先 parseImgs() 把 curImgs 拆进 imgUrls，
+                    // 再 collectBatchItem()。
+                    //
+                    // 原来直接 collectBatchItem()，那时 imgUrls 还是空的，
+                    // 于是 hasImgs=false → it.isImage=false，
+                    // 图集条目被当成视频：批量下载拿图片地址去下「视频」，
+                    // 必然失败，表现就是「图文没下载」。
+                    try{
+                        parseImgs();
+                        DypLog.i("BATCH_PRE_IMGS n=" + imgUrls.size()
+                                + " curImgsLen=" + (curImgs == null ? 0 : curImgs.length()));
+                    }catch(Throwable t){
+                        DypLog.i("BATCH_PRE_IMGS_ERR " + t);
+                    }
                     collectBatchItem();
                     // 静默模式也要按设置自动下载（用户开了就下，不影响静默）
                     if(autoDlOn()){
                         boolean hasImgs2 = imgUrls != null && imgUrls.size() > 0;
                         boolean hasVideo2 = curPlay != null && curPlay.length() > 0;
                         if(!profileMode && (hasImgs2 || hasVideo2)){
-                            try{ doDownload(); Log.i("DYP", "AUTO_DL 静默触发"); }catch(Throwable t){}
+                            try{ doDownload(); DypLog.i("AUTO_DL 静默触发"); }catch(Throwable t){}
                         }
                     }
                     maybeClearInput();
@@ -9127,7 +12737,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     return;
                 }
                 if(isImg){
-                    Log.i("DYP", "RENDER_IMG_BRANCH curImgsLen=" + curImgs.length()
+                    DypLog.i("RENDER_IMG_BRANCH curImgsLen=" + curImgs.length()
                         + " imgUrlsBefore=" + imgUrls.size());
                     actions.setVisibility(View.VISIBLE);
                     video.setVisibility(View.GONE);
@@ -9136,14 +12746,29 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     // 切到图集时释放上一个视频的播放器，避免状态残留
                     try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
                     miniProxyKey = null;
+                    // 图集：隐藏视频专用按钮（播放/全屏/转MP3），只保留「下载」
+                    try{
+                        findViewById(R.id.btnPlay).setVisibility(View.GONE);
+                        findViewById(R.id.btnFull).setVisibility(View.GONE);
+                        findViewById(R.id.btnAudio).setVisibility(View.GONE);
+                    }catch(Throwable t){}
                     parseImgs(); imgIdx=0; imgZoomed=false;
-                    Log.i("DYP", "RENDER_IMG_PARSED imgUrls=" + imgUrls.size()
+                    DypLog.i("RENDER_IMG_PARSED imgUrls=" + imgUrls.size()
                         + " curShowImg=" + (curShowImg == null ? "" : curShowImg.substring(0, Math.min(60, curShowImg.length()))));
-                    if(imgUrls.size()>0){ curShowImg=imgUrls.get(0); loadImage(curShowImg, img); applyLiveBadge(0); }
+                    if(imgUrls.size()>0){
+                        curShowImg=imgUrls.get(0);
+                        DypLog.i("IMG_FIRST " + curShowImg.substring(0, Math.min(120, curShowImg.length()))
+                                + " dyn=" + dynUrls.size());
+                        loadImage(curShowImg, img);
+                        applyLiveBadge(0);
+                    }else{
+                        DypLog.i("IMG_EMPTY 没有解析出图片地址");
+                    }
                     Toast.makeText(MainActivity.this, imgTipText(), Toast.LENGTH_SHORT).show();
                     maybeAutoAction();   // 图集渲染完成后再判断（此时 imgUrls 已是本条数据）
                 } else {
-                    Log.i("DYP", "RENDER_VIDEO_BRANCH curPlayLen=" + (curPlay == null ? -1 : curPlay.length())
+                    DypLog.i("RENDER_VIDEO_BRANCH curPlayLen=" + (curPlay == null ? -1 : curPlay.length())
+                        + " host=" + (curPlay == null ? "null" : hostOf(curPlay))
                         + " coverLen=" + (curCover == null ? -1 : curCover.length()));
                     actions.setVisibility(View.VISIBLE);
                     // 切到视频时清掉图集状态
@@ -9161,10 +12786,10 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                         if(curCover != null && curCover.length() > 0){
                             img.setVisibility(View.VISIBLE);
                             loadImage(curCover, img);
-                            Log.i("DYP", "VIDEO_PREVIEW 显示封面预览 " + curCover.substring(0, Math.min(90, curCover.length())));
+                            DypLog.i("VIDEO_PREVIEW 显示封面预览 " + curCover.substring(0, Math.min(90, curCover.length())));
                         } else {
                             img.setVisibility(View.GONE);
-                            Log.i("DYP", "VIDEO_PREVIEW 无封面可用");
+                            DypLog.i("VIDEO_PREVIEW 无封面可用");
                         }
                     }
                     maybeAutoAction();   // 视频已起播/预览，再按设置自动下载（避免和 doPlay 抢资源）
@@ -9192,7 +12817,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                         }
                     }
                 }
-            }catch(Throwable t){ Log.i("DYP", "XV_MIX_ERR " + t); }
+            }catch(Throwable t){ DypLog.i("XV_MIX_ERR " + t); }
             h.post(new Runnable(){ public void run(){
                 if(btnMusic != null){
                     if(curBgm != null && curBgm.length() > 0){
@@ -9300,7 +12925,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     // 图片 + 动图一起存入 curImgs（不能分开赋值，会互相覆盖）
                     if(isImg2 || dynStr.length() > 0){
                         curImgs = (isImg2 ? imgs.toString() : "") + (dynStr.length() > 0 ? "|DYN|" + dynStr : "");
-                        Log.i("DYP", "SLIDES_DYN imgs=" + (isImg2 ? imgs.toString().split("[|]").length : 0) + " dyn=" + (dynStr.length() > 0 ? dynStr.split("[|]").length : 0));
+                        DypLog.i("SLIDES_DYN imgs=" + (isImg2 ? imgs.toString().split("[|]").length : 0) + " dyn=" + (dynStr.length() > 0 ? dynStr.split("[|]").length : 0));
                     }
                     curCover = firstUrl(get((Map)get(item,"video"), "cover"));
                     Map au = (Map)get(item,"author");
@@ -9325,7 +12950,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     return b.toString();
                 }
             }
-        }catch(Throwable t){ Log.i("DYP", "SLIDES_RENDER_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("SLIDES_RENDER_ERR " + t); }
 
         String detail=gs(get(m,"detail"));
         String dh=gs(get(m,"detailHead"));
@@ -9360,7 +12985,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         // 这里只标记，交给后台线程重新走一遍解析
         String hrefTt = gs(get(m,"href"));
         if(hrefTt.indexOf("tiktok.com") >= 0){
-            Log.i("DYP", "TT_NEED_BG_PARSE " + hrefTt);
+            DypLog.i("TT_NEED_BG_PARSE " + hrefTt);
             triggerTikTokBgParse(hrefTt);
         }
         StringBuilder b=new StringBuilder();
@@ -9368,14 +12993,20 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         String id   = gs(get(m,"id"));
         String body = gs(get(m,"bodyText"));
         // 判断是不是风控/无效页
-        boolean blocked = body.indexOf("抱歉出错") >= 0 || body.indexOf("请尝试在抖音内观看") >= 0;
+        boolean blocked = body.indexOf("抱歉出错") >= 0 || body.indexOf("请尝试在抖音内观看") >= 0
+                || body.indexOf("验证码中间页") >= 0 || body.indexOf("请完成安全验证") >= 0
+                || body.indexOf("拖动滑块") >= 0 || body.indexOf("滑动验证") >= 0;
         if(blocked){
-            b.append("【解析失败】\n");
-            b.append("抖音返回了限制页面，可能原因：\n");
-            b.append("1. 链接已过期或作品已删除\n");
-            b.append("2. 请求过于频繁，触发风控\n");
-            b.append("3. 该作品需在抖音 App 内观看\n\n");
-            b.append("建议：稍后重试，或换一条分享链接。");
+            b.append("【解析失败 · 抖音风控】\n\n");
+            b.append("抖音返回了限制页面，通常是「请求过于频繁」。\n");
+            b.append("这不是 App 的 bug，继续点解析只会让风控更久。\n\n");
+            b.append("怎么恢复：\n");
+            b.append("1. 先等 5~15 分钟不要解析（风控是按频率累加的）\n");
+            b.append("2. 在设置里打开「抖音登录」，用真实账号登录一次\n");
+            b.append("   （登录态能大幅降低风控强度）\n");
+            b.append("3. 也可以换网络（切 5G / 换 WiFi）后再试\n\n");
+            b.append("如果是单条链接报这个错，也可能是该作品已删除\n");
+            b.append("或本身需要在抖音 App 内观看。");
             return b.toString();
         }
         if(id.length() > 0){
@@ -9402,6 +13033,30 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
     }
     String extractUrl(String t){
         if(t == null) return null;
+        // 磁力链接：magnet:?xt=urn:btih:... 整段保留（不能被下面的 http 规则吃掉）
+        if(t.toLowerCase().startsWith("magnet:")){
+            int sp = t.indexOf(' ');
+            return sp > 0 ? t.substring(0, sp) : t;
+        }
+        // 整串输入就是一个本地 .torrent 文件（文件选择器 / 手动粘贴路径）
+        // 放在最前面，不依赖任何正则，最稳。
+        String tTrim = t.trim();
+        if(tTrim.toLowerCase().endsWith(".torrent")
+                && new java.io.File(tTrim).exists()){
+            return tTrim;
+        }
+        // .torrent 直链
+        Matcher mt = Pattern.compile("https?://[A-Za-z0-9_./?=&%#:+-]+\\.torrent").matcher(t);
+        if(mt.find()) return mt.group();
+        // 本地种子文件：/sdcard/.../x.torrent、/storage/emulated/0/.../x.torrent
+        // （文件选择器或手动粘贴路径时走这里，不能当普通链接丢掉）
+        // 文本里夹着本地种子路径（例如「下载了：/sdcard/x.torrent」）
+        Matcher ml = Pattern.compile("/(?:sdcard|storage|data|mnt)/[A-Za-z0-9_./ ()\\-\\u4e00-\\u9fa5]+?\\.torrent",
+                Pattern.CASE_INSENSITIVE).matcher(t);
+        if(ml.find()){
+            String hit = ml.group().trim();
+            if(new java.io.File(hit).exists()) return hit;
+        }
         // 优先匹配抖音域名（避免把口令里的其他链接当成目标）
         Matcher m = Pattern.compile("https?://(?:v\\.douyin\\.com|www\\.iesdouyin\\.com|www\\.douyin\\.com|iesdouyin\\.com|www\\.huoshan\\.com|v\\.huoshan\\.com)/[A-Za-z0-9_./-]*").matcher(t);
         if(m.find()) return m.group();
@@ -9473,7 +13128,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         if(!low.contains("b23.tv")) return url;
         try{
             java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                    new java.net.URL(url).openConnection(java.net.Proxy.NO_PROXY);
+                    new java.net.URL(url).openConnection();
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(8000);
             c.setReadTimeout(10000);
@@ -9484,12 +13139,12 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             try{ c.disconnect(); }catch(Throwable t){}
             if(code >= 300 && code < 400 && loc != null && loc.length() > 0){
                 if(loc.startsWith("/")) loc = "https://b23.tv" + loc;
-                Log.i("DYP", "B23_EXPAND " + url + " -> " + loc.substring(0, Math.min(120, loc.length())));
+                DypLog.i("B23_EXPAND " + url + " -> " + loc.substring(0, Math.min(120, loc.length())));
                 // 可能多跳，最多跟 3 次
                 if(loc.toLowerCase().contains("b23.tv")) return expandB23(loc);
                 return loc;
             }
-        }catch(Throwable t){ Log.i("DYP", "B23_EXPAND_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("B23_EXPAND_ERR " + t); }
         return url;
     }
 /** 批量解析结果收集到列表页（与主页/合集共用 listWrap，便于统一查看与下载） */
@@ -9572,18 +13227,18 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             .setMessage(msg.toString())
             .setPositiveButton("继续解析", new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int w){
-                    Log.i("DYP", "BIG_PARSE_CONFIRM go=" + kind + " autoDl=" + autoDl);
+                    DypLog.i("BIG_PARSE_CONFIRM go=" + kind + " autoDl=" + autoDl);
                     bigParsePending = false;
                     profileAutoConfirmed = true;   // 已确认，允许主页列表请求放行
                     mixFetchConfirmed = true;      // 合集同理
-                    try{ onGo.run(); }catch(Throwable t){ Log.i("DYP", "BIG_PARSE_GO_ERR " + t); }
+                    try{ onGo.run(); }catch(Throwable t){ DypLog.i("BIG_PARSE_GO_ERR " + t); }
                 }
             })
             .setNeutralButton(autoDl ? "关掉自动下载并继续" : "取消", autoDl
                 ? new android.content.DialogInterface.OnClickListener(){
                     public void onClick(android.content.DialogInterface d, int w){
                         setAutoFlag(KEY_AUTO_DL, false);
-                        Log.i("DYP", "BIG_PARSE_CONFIRM go=" + kind + " autoDl=已关闭");
+                        DypLog.i("BIG_PARSE_CONFIRM go=" + kind + " autoDl=已关闭");
                         showHintToast("已关闭自动下载");
                         bigParsePending = false;
                         profileAutoConfirmed = true;
@@ -9593,7 +13248,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                   }
                 : new android.content.DialogInterface.OnClickListener(){
                     public void onClick(android.content.DialogInterface d, int w){
-                        Log.i("DYP", "BIG_PARSE_CANCEL " + kind);
+                        DypLog.i("BIG_PARSE_CANCEL " + kind);
                         bigParsePending = false;
                         if(onCancel != null){ try{ onCancel.run(); }catch(Throwable t){} }
                     }
@@ -9601,14 +13256,14 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             .setNegativeButton(autoDl ? "取消" : null,
                 autoDl ? new android.content.DialogInterface.OnClickListener(){
                     public void onClick(android.content.DialogInterface d, int w){
-                        Log.i("DYP", "BIG_PARSE_CANCEL " + kind);
+                        DypLog.i("BIG_PARSE_CANCEL " + kind);
                         bigParsePending = false;
                         if(onCancel != null){ try{ onCancel.run(); }catch(Throwable t){} }
                     }
                   } : null)
             .setOnCancelListener(new android.content.DialogInterface.OnCancelListener(){
                 public void onCancel(android.content.DialogInterface d){
-                    Log.i("DYP", "BIG_PARSE_CANCEL_BACK " + kind);
+                    DypLog.i("BIG_PARSE_CANCEL_BACK " + kind);
                     bigParsePending = false;
                     if(onCancel != null){ try{ onCancel.run(); }catch(Throwable t){} }
                 }
@@ -9650,7 +13305,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     public void onClick(android.content.DialogInterface d, int w){
                         setAutoFlag(KEY_AUTO_DL, false);
                         showHintToast("已关闭自动下载");
-                        Log.i("DYP", "BATCH_AUTODL_OFF 已关掉自动下载再批量");
+                        DypLog.i("BATCH_AUTODL_OFF 已关掉自动下载再批量");
                         beginBatchParse(urls);
                     }
                   }
@@ -9670,8 +13325,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         batchCollectMode = true;
         // 注意：不清空 batchCollected —— 新一批结果追加到上一次后面
         if(btnClearList != null) btnClearList.setVisibility(View.VISIBLE);
-        Log.i("DYP", "BATCH_START n=" + n + " existing=" + batchCollected.size());
-        switchTab(1);   // 切到列表页等结果，不占着解析页防闪烁
+        DypLog.i("BATCH_START n=" + n + " existing=" + batchCollected.size());
+        // 不切页签：用户要求只有主页/合集解析才跳列表页
         runNextBatch();
     }
 
@@ -9698,7 +13353,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         if(idx >= snap.size()){ showHintToast("已经是最后一个"); return; }
         batchViewIndex = idx;
         String u = snap.get(idx);
-        Log.i("DYP", "BATCH_NAV -> " + (idx + 1) + "/" + snap.size() + " " + u);
+        DypLog.i("BATCH_NAV -> " + (idx + 1) + "/" + snap.size() + " " + u);
         s("查看第 " + (idx + 1) + "/" + snap.size() + " 条");
         input.setText(u);
         input.setSelection(u.length());
@@ -9738,12 +13393,11 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 batchRunning = false;
                 batchSilent = false;      // 静默模式结束，后续单条解析恢复正常渲染
                 final int done = batchIndex;
-                Log.i("DYP", "BATCH_DONE total=" + done);
+                DypLog.i("BATCH_DONE total=" + done);
                 h.post(new Runnable(){ public void run(){
-                    // 把收集到的结果渲染到列表页，并自动切过去方便查看
+                    // 渲染到列表页，但不自动切过去（用户要求只有主页/合集才跳）
                     renderBatchList();
                     saveBatchList();          // 落盘，退出重进可恢复
-                    switchTab(1);
                     int got;
                     synchronized(batchCollected){ got = batchCollected.size(); }
                     showHintToast("批量解析完成：本次 " + done + " 条，列表共 " + got + " 条");
@@ -9757,7 +13411,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         final String cur = u;
         batchViewIndex = batchIndex - 1;
         batchWaitDone = false;
-        Log.i("DYP", "BATCH_ITEM " + batchIndex + "/" + batchUrls.size() + " url=" + cur);
+        DypLog.i("BATCH_ITEM " + batchIndex + "/" + batchUrls.size() + " url=" + cur);
         h.post(new Runnable(){ public void run(){
             try{
                 s("批量解析 " + batchIndex + "/" + batchUrls.size() + " …");
@@ -9766,7 +13420,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 doParseResolved(cur);
                 updateParseNav();
             }catch(Throwable t){
-                Log.i("DYP", "BATCH_ITEM_ERR " + t);
+                DypLog.i("BATCH_ITEM_ERR " + t);
             }
         }});
         // 两条推进方式：
@@ -9778,7 +13432,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         batchAdvanceRunnable = new Runnable(){ public void run(){
             if(!batchRunning) return;
             if(batchIndex < (batchUrls == null ? 0 : batchUrls.size())){
-                Log.i("DYP", "BATCH_TIMEOUT_ADVANCE at " + batchIndex);
+                DypLog.i("BATCH_TIMEOUT_ADVANCE at " + batchIndex);
                 showHintToast("第 " + batchIndex + " 条超时，跳到下一条");
                 runNextBatch();
             }
@@ -9799,7 +13453,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         int total;
         synchronized(batchUrls){ total = batchUrls.size(); }
         final int curNo = batchIndex;
-        Log.i("DYP", "BATCH_ITEM_DONE " + curNo + "/" + total);
+        DypLog.i("BATCH_ITEM_DONE " + curNo + "/" + total);
         // 注意：最后一条也要走 runNextBatch()，那里的 batchIndex>=size 分支
         // 才会执行 BATCH_DONE + renderBatchList() 把结果渲染到列表页。
         // 之前这里 `if(curNo >= total) return;` 会让最后一条永远不渲染。
@@ -9831,7 +13485,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 miniTouch.setClickable(true);
                 miniTouch.setOnClickListener(new View.OnClickListener(){
                     public void onClick(View v){
-                        Log.i("DYP", "MINI_CLICK layer");
+                        DypLog.i("MINI_CLICK layer");
                         toggleMiniBar();
                     }
                 });
@@ -9842,7 +13496,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             videoBox.setFocusable(true);
             videoBox.setOnClickListener(new View.OnClickListener(){
                 public void onClick(View v){
-                    Log.i("DYP", "MINI_CLICK box");
+                    DypLog.i("MINI_CLICK box");
                     toggleMiniBar();
                 }
             });
@@ -9854,7 +13508,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                     video.setFocusable(true);
                     video.setOnClickListener(new View.OnClickListener(){
                         public void onClick(View v){
-                            Log.i("DYP", "MINI_CLICK video");
+                            DypLog.i("MINI_CLICK video");
                             toggleMiniBar();
                         }
                     });
@@ -9875,8 +13529,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                 public void onStartTrackingTouch(SeekBar sb){ miniBarGen++; }
                 public void onStopTrackingTouch(SeekBar sb){ pokeMiniBar(); }
             });
-            Log.i("DYP", "MINI_BAR_AUTOHIDE ready");
-        }catch(Throwable t){ Log.i("DYP", "MINI_BAR_INIT_ERR " + t); }
+            DypLog.i("MINI_BAR_AUTOHIDE ready");
+        }catch(Throwable t){ DypLog.i("MINI_BAR_INIT_ERR " + t); }
     }
 
 
@@ -9888,20 +13542,20 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             if(miniBar.getVisibility() != View.VISIBLE){
                 miniBar.setAlpha(1f);
                 miniBar.setVisibility(View.VISIBLE);
-                Log.i("DYP", "MINI_BAR_SHOW");
+                DypLog.i("MINI_BAR_SHOW");
             }
             miniBarShown = true;
             final int myGen = ++miniBarGen;
-            Log.i("DYP", "MINI_BAR_POKE gen=" + myGen);
+            DypLog.i("MINI_BAR_POKE gen=" + myGen);
             h.postDelayed(new Runnable(){ public void run(){
                 if(myGen != miniBarGen){
-                    Log.i("DYP", "MINI_BAR_TIMER_SKIP gen=" + myGen + " cur=" + miniBarGen);
+                    DypLog.i("MINI_BAR_TIMER_SKIP gen=" + myGen + " cur=" + miniBarGen);
                     return;                              // 期间又点过，重新计时
                 }
-                Log.i("DYP", "MINI_BAR_TIMER_FIRE gen=" + myGen);
+                DypLog.i("MINI_BAR_TIMER_FIRE gen=" + myGen);
                 hideMiniBar();
             }}, MINI_BAR_HIDE_MS);
-        }catch(Throwable t){ Log.i("DYP", "MINI_POKE_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("MINI_POKE_ERR " + t); }
     }
 
     /** 隐藏控制栏 */
@@ -9909,7 +13563,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         try{
             if(miniBar == null) return;
             if(miniBar.getVisibility() != View.VISIBLE){
-                Log.i("DYP", "MINI_BAR_ALREADY_HIDDEN");
+                DypLog.i("MINI_BAR_ALREADY_HIDDEN");
                 return;
             }
             miniBarShown = false;
@@ -9918,8 +13572,8 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
             // 之前就是靠动画才出现「有时不隐藏」的诡异现象）
             miniBar.setVisibility(View.GONE);
             miniBar.setAlpha(1f);
-            Log.i("DYP", "MINI_BAR_HIDE gen=" + miniBarGen);
-        }catch(Throwable t){ Log.i("DYP", "MINI_HIDE_ERR " + t); }
+            DypLog.i("MINI_BAR_HIDE gen=" + miniBarGen);
+        }catch(Throwable t){ DypLog.i("MINI_HIDE_ERR " + t); }
     }
 
     /** 切换显隐 */
@@ -9927,10 +13581,10 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
         try{
             if(miniBar == null) return;
             boolean vis = miniBar.getVisibility() == View.VISIBLE;
-            Log.i("DYP", "MINI_TOGGLE vis=" + vis);
+            DypLog.i("MINI_TOGGLE vis=" + vis);
             if(vis) hideMiniBar();
             else pokeMiniBar();
-        }catch(Throwable t){ Log.i("DYP", "MINI_TOGGLE_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("MINI_TOGGLE_ERR " + t); }
     }
 
     /** 用户贴了不支持的网址：说清楚支持哪些平台，不抛技术错误 */
@@ -9969,7 +13623,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                      url = conv;
                      input.setText(url);
                      input.setSelection(url.length());
-                     Log.i("DYP", "BILI_BARE_ID " + raw + " -> " + url);
+                     DypLog.i("BILI_BARE_ID " + raw + " -> " + url);
                  }
              }
          }
@@ -9979,17 +13633,25 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
              input.setSelection(url.length());
          }
          if(url==null){ s("未找到链接"); return; }
+         // 磁力链接 / 本地种子文件：直接交给 BT 引擎，不走平台解析
+         // （本地 .torrent 路径会被下面的 isSupportedParseUrl 当成「不支持的网址」拦掉）
+         if(BtDownloader.isMagnet(url)
+                 || (url.toLowerCase().endsWith(".torrent") && new java.io.File(url).exists())){
+             DypLog.i("PARSE_BT_DIRECT " + url.substring(0, Math.min(80, url.length())));
+             startMagnetDownload(url);
+             return;
+         }
          // ===== 平台前置校验 =====
          // 用户贴了不支持的网址（例如 GitHub 仓库）时，别丢进解析链路，
          // 否则会拿到 HTML 再当 JSON 解析，报 "Unexpected token 'B', Blocked by..." 这种莫名其妙的错。
          // 微信视频号：走 WebView（页面数据接口需要 JS 运行时）
          if(isSphUrl(url)){
-             Log.i("DYP", "SPH_PARSE " + url);
+             DypLog.i("SPH_PARSE " + url);
              startSphParse(url);
              return;
          }
          if(!isSupportedParseUrl(url)){
-             Log.i("DYP", "PARSE_UNSUPPORTED " + url);
+             DypLog.i("PARSE_UNSUPPORTED " + url);
              showUnsupportedUrlDialog(url);
              return;
          }
@@ -10019,7 +13681,7 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
                      if(exp != null && !exp.equals(shortUrl)){
                          input.setText(exp);
                          input.setSelection(exp.length());
-                         Log.i("DYP", "B23_RESOLVED " + exp.substring(0, Math.min(140, exp.length())));
+                         DypLog.i("B23_RESOLVED " + exp.substring(0, Math.min(140, exp.length())));
                      }
                      // 用展开后的链接继续走原来的解析流程
                      doParseResolved(exp != null ? exp : shortUrl);
@@ -10033,6 +13695,11 @@ long remain = parseLong(jnum(body, "remain_gb").replace(".", ""));
     /** 真正的解析流程（短链展开后调用，url 已是真实链接） */
     void doParseResolved(String url){
          if(url == null || url.length() == 0){ s("未找到链接"); return; }
+         // 磁力链接：不走平台解析，直接交给 BT 引擎
+         if(BtDownloader.isMagnet(url) || url.indexOf(".torrent") > 0){
+             startMagnetDownload(url);
+             return;
+         }
 webDone=false;
          storyBlocked=false;
          curRetry = 0;
@@ -10104,6 +13771,748 @@ webDone=false;
         try{ ((TextView)findViewById(R.id.liveBadge)).setVisibility(View.GONE); }catch(Throwable t){}
         loadForParse(url);
     }
+
+    // ===== 磁力下载 =====
+    /** 磁力任务在下载列表里的行号 */
+    /** 磁力任务在「下载」页的行 key：用独立号段，避免和普通下载的 idx(1,2,3…) 撞车导致进度条乱跳 */
+    int btRowKey = 900000;
+
+    /** 当前磁力/种子任务在「列表」页的条目 id（拿到元数据后按它更新标题） */
+    volatile String btListItemId = "";
+
+    /** true = 正在做「开屏恢复列表」：只渲染，不切页签、不写状态栏 */
+    volatile boolean restoringList = false;
+    /** App 启动时间（毫秒）。用来判断「这是不是启动期的渲染」。 */
+    volatile long appBootAt = 0L;
+
+    /** 下载页每行对应的本地目录/文件路径（删除时用） */
+    final java.util.Map<Integer, String> dlRowPath =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<Integer, String>());
+    /** 下载页每行是否是磁力任务 */
+    final java.util.Map<Integer, Boolean> dlRowIsBt =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<Integer, Boolean>());
+
+    /** 磁力：保存目录 = Download/DYParse/磁力/magnet_<hash前8位> */
+    java.io.File btSaveDir(String magnet){
+        String h = "";
+        try{
+            // 本地种子文件：从 .torrent 里读 infoHash，保证目录稳定可续传
+            if(magnet != null && magnet.toLowerCase().endsWith(".torrent")){
+                String[] ins = BtDownloader.inspectTorrent(new java.io.File(magnet));
+                if(ins != null && ins[0] != null && ins[0].length() >= 8){
+                    h = ins[0].substring(0, 8);
+                    DypLog.i("BT_SEEDDIR_BY_TORRENT " + h);
+                }
+            }
+            if(h.length() == 0){
+                int p = magnet.toLowerCase().indexOf("btih:");
+                if(p > 0) h = magnet.substring(p + 5, Math.min(magnet.length(), p + 5 + 8));
+            }
+        }catch(Throwable t){}
+        if(h.length() == 0) h = "unknown" + System.currentTimeMillis() % 100000;
+        java.io.File dir = new java.io.File(dlPlatDir("磁力"), "magnet_" + h.toUpperCase());
+        if(!dir.exists()) dir.mkdirs();
+        return dir;
+    }
+
+    /** 从磁力链接或本地 .torrent 算出 infoHash（大写 hex，取不到返回空串） */
+    String btHashOf(String src){
+        try{
+            if(src == null || src.length() == 0) return "";
+            if(src.toLowerCase().endsWith(".torrent")){
+                String[] ins = BtDownloader.inspectTorrent(new java.io.File(src));
+                if(ins != null && ins[0] != null) return ins[0].toUpperCase();
+                return "";
+            }
+            int p = src.toLowerCase().indexOf("btih:");
+            if(p < 0) return "";
+            String h = src.substring(p + 5);
+            int amp = h.indexOf('&');
+            if(amp >= 0) h = h.substring(0, amp);
+            // 去掉可能残留的空白
+            h = h.trim();
+            // 磁力链接可能被拼接过（&dn 被吃），只取前 40 位标准 BTIH-HEX 长度
+            if(h.length() > 40) h = h.substring(0, 40);
+            return h.length() >= 32 ? h.toUpperCase() : "";
+        }catch(Throwable t){ return ""; }
+    }
+
+    /** 磁力任务结束：从「正在跑」集合里摘掉，并同步 btRunning 总标志 */
+    void btFinishHash(String src){
+        try{
+            String h = btHashOf(src);
+            if(h.length() > 0) btRunningHashes.remove(h);
+            boolean any = false;
+            synchronized(btRunningHashes){ any = !btRunningHashes.isEmpty(); }
+            btRunning = any;
+            DypLog.i("BT_FINISH_HASH hash=" + h + " remain=" + btRunningHashes.size()
+                    + " btRunning=" + btRunning);
+        }catch(Throwable t){ DypLog.i("BT_FINISH_HASH_ERR " + t); }
+    }
+
+    /** 磁力/种子的友好显示名（本地种子用文件名，不用路径） */
+    String btDisplayName(String src){
+        try{
+            if(src == null || src.length() == 0) return "磁力任务";
+            if(src.toLowerCase().endsWith(".torrent")){
+                String nm = new java.io.File(src).getName();
+                return "种子 " + nm.replaceAll("(?i)\\.torrent$", "");
+            }
+            return "磁力 " + src.substring(0, Math.min(38, src.length()));
+        }catch(Throwable t){ return "磁力任务"; }
+    }
+
+    /** 选手机里的 .torrent 种子文件（SAF，无需存储权限） */
+    void pickTorrentFile(){
+        try{
+            android.content.Intent it = new android.content.Intent(
+                    android.content.Intent.ACTION_OPEN_DOCUMENT);
+            it.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+            it.setType("*/*");
+            it.putExtra(android.content.Intent.EXTRA_MIME_TYPES, new String[]{
+                    "application/x-bittorrent", "application/octet-stream", "*/*" });
+            startActivityForResult(it, REQ_TORRENT);
+            DypLog.i("TORRENT_PICK_OPEN");
+        }catch(Throwable t){
+            DypLog.i("TORRENT_PICK_ERR " + t);
+            showHintToast("无法打开文件选择器：" + t);
+        }
+    }
+
+    /** 选完种子文件：复制到私有目录 → 解析 infohash → 走磁力同一条下载链路 */
+    void loadTorrentFromUri(final android.net.Uri uri){
+        if(uri == null){ showHintToast("没有选到文件"); return; }
+        showHintToast("正在读取种子文件…");
+        new Thread(new Runnable(){ public void run(){
+            try{
+                java.io.InputStream is = getContentResolver().openInputStream(uri);
+                if(is == null){
+                    toastMain("打不开这个文件（可能没权限）");
+                    return;
+                }
+                java.io.File dir = new java.io.File(getExternalFilesDir(null), "torrents");
+                if(!dir.exists()) dir.mkdirs();
+                java.io.File dst = new java.io.File(dir,
+                        "seed_" + System.currentTimeMillis() + ".torrent");
+                java.io.FileOutputStream fo = new java.io.FileOutputStream(dst);
+                byte[] buf = new byte[65536];
+                int r; long tot = 0;
+                while((r = is.read(buf)) > 0){
+                    fo.write(buf, 0, r);
+                    tot += r;
+                    if(tot > 64L * 1024 * 1024) break;   // 种子文件不可能这么大，防呆
+                }
+                fo.close(); is.close();
+                DypLog.i("TORRENT_COPIED bytes=" + tot + " -> " + dst.getAbsolutePath());
+                if(tot < 100){
+                    try{ dst.delete(); }catch(Throwable t){}
+                    toastMain("这个文件太小，不像是种子文件");
+                    return;
+                }
+                final String[] ins = BtDownloader.inspectTorrent(dst);
+                if(ins == null || ins[0] == null || ins[0].length() < 8){
+                    toastMain("种子文件解析失败（文件可能损坏）");
+                    return;
+                }
+                final String hash = ins[0];
+                final String nm = ins[1];
+                DypLog.i("TORRENT_OK hash=" + hash + " name=" + nm);
+                h.post(new Runnable(){ public void run(){
+                    showHintToast("已读取种子：" + (nm.length() > 0 ? nm : hash.substring(0, 12)));
+                    startMagnetDownload(dst.getAbsolutePath());
+                }});
+            }catch(final Throwable t){
+                DypLog.i("TORRENT_LOAD_ERR " + t);
+                toastMain("读取种子失败：" + t);
+            }
+        }}).start();
+    }
+
+    /** 子线程里安全弹 toast */
+    void toastMain(final String msg){
+        try{ h.post(new Runnable(){ public void run(){ showHintToast(msg); }}); }catch(Throwable t){}
+    }
+
+    @Override protected void onActivityResult(int req, int res, android.content.Intent data){
+        super.onActivityResult(req, res, data);
+
+        // ---- 系统目录选择器 ----
+        if(req == REQ_DIR_TREE){
+            if(res != RESULT_OK || data == null || data.getData() == null){
+                DypLog.i("DIR_TREE_CANCEL");
+                return;
+            }
+            android.net.Uri tree = data.getData();
+            String path = treeUriToPath(tree);
+            DypLog.i("DIR_TREE_PICK uri=" + tree + " path=" + path);
+            if(path.length() == 0){
+                showHintToast("这个位置读不到真实路径，请换一个文件夹");
+                return;
+            }
+            // 持久化授权（下次进来还能写）
+            try{
+                getContentResolver().takePersistableUriPermission(tree,
+                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            }catch(Throwable t){}
+            String key = pendingDirKey;
+            if(key == null || key.length() == 0) return;
+            // 选的恰好是默认目录 → 存空值走默认
+            String v = path;
+            try{
+                if(pendingDirDef != null
+                        && new java.io.File(pendingDirDef).getAbsolutePath()
+                                .equals(new java.io.File(path).getAbsolutePath())){
+                    v = "";
+                }
+            }catch(Throwable t){}
+            getSharedPreferences(SP, MODE_PRIVATE).edit().putString(key, v).apply();
+            // 探测可写性，不可写就提醒
+            boolean writable = ScopedStore.canWriteDir(new java.io.File(path));
+            DypLog.i("DIR_TREE_SAVE key=" + key + " -> "
+                    + (v.length() == 0 ? "(默认)" : v) + " writable=" + writable);
+            buildSettingsPage();
+            showHintToast(v.length() == 0 ? "已恢复默认目录"
+                    : ("已选择：" + path + (writable ? "" : "（这个位置可能不可写）")));
+            pendingDirKey = null;
+            pendingDirDef = null;
+            return;
+        }
+
+        if(req != REQ_TORRENT) return;
+        try{
+            if(res != RESULT_OK || data == null || data.getData() == null){
+                DypLog.i("TORRENT_PICK_CANCEL");
+                return;
+            }
+            loadTorrentFromUri(data.getData());
+        }catch(Throwable t){
+            DypLog.i("TORRENT_RESULT_ERR " + t);
+        }
+    }
+
+    /** 磁力解析 + 下载主流程 */
+    void startMagnetDownload(final String magnet){
+        // 允许多个磁力同时下载：按 infoHash 判断这条是不是已经在跑
+        final String myHash = btHashOf(magnet);
+        if(myHash.length() > 0 && btRunningHashes.contains(myHash)){
+            showHintToast("这条磁力已经在下载了，可在「下载」页查看");
+            return;
+        }
+        if(myHash.length() > 0) btRunningHashes.add(myHash);
+        btRunning = true;
+        curUrl = magnet;
+        curId = "magnet";
+        curDesc = "磁力下载";
+        final java.io.File saveDir = btSaveDir(magnet);
+        DypLog.i("BT_CLICK " + magnet.substring(0, Math.min(90, magnet.length())));
+        saveBtTask(magnet);   // 落盘：中途退出/被杀，重开继续下
+        s("磁力任务已提交，正在获取种子信息…");
+        progShow();
+        progBusy("BT 引擎启动中…");
+        final int rowKey = ++btRowKey;
+        // 磁力任务正式进「下载」页（带平台目录归属），重启后能恢复
+        dlRowAdd(rowKey, "【磁力】" + btDisplayName(magnet));
+        dlRowUpdate(rowKey, -1, "获取种子信息…");
+        dlRowPath.put(rowKey, saveDir.getAbsolutePath());   // 删除时用
+        dlRowIsBt.put(rowKey, true);
+
+        // 立刻进「列表」页并落盘：拿不到种子元数据（低热度资源）时，
+        // 用户至少能在列表里看到这条任务，而不是完全查无此项。
+        try{
+            final String listId = "magnet_dl_" + saveDir.getName();
+            btListItemId = listId;
+            ProfileParser.ProfileItem bi = new ProfileParser.ProfileItem();
+            bi.id = listId;
+            bi.title = "【磁力】" + btDisplayName(magnet) + "  ·  正在获取种子信息…";
+            bi.url = magnet;
+            bi.isImage = false;
+            synchronized(batchCollected){
+                // 同一条（同 infohash）只保留一条，避免重复点击堆叠
+                for(int k = batchCollected.size() - 1; k >= 0; k--){
+                    ProfileParser.ProfileItem o = batchCollected.get(k);
+                    if(o != null && listId.equals(o.id)) batchCollected.remove(k);
+                }
+                batchCollected.add(0, bi);
+            }
+            saveBatchList();
+            DypLog.i("BT_LIST_ADDED_EARLY " + listId);
+            h.post(new Runnable(){ public void run(){
+                renderBatchList();
+            }});
+        }catch(Throwable t){ DypLog.i("BT_LIST_EARLY_ERR " + t); }
+        // 记录到下载页统计里（dlRefreshHead 用 dlTaskList 子 View 数，所以行加进去就够）
+
+        // 进度基线：总长会变（用户选文件/顺序下载生效后 wanted 会缩小），
+        // 变小就重置基线，否则进度会瞬间跳满；同时进度只增不减。
+        // 进度分母固定用「种子总长」（onMeta 给的 totalBytes，一次定死不再变），
+        // 这样进度只会平稳增长，不会因为 selected/wanted 变化而跳。
+        final long[] btTotal = new long[]{0};
+        final long[] btShown = new long[]{0};
+        final String[] btLastState = new String[]{""};
+        final long[] btLastStateTm = new long[]{0};
+        final int[] btLastPct = new int[]{-1};
+        final long[] btLastPctTm = new long[]{0};
+        BtDownloader.start(magnet, saveDir, new BtDownloader.SimpleCb(){
+            @Override public void onState(final String state){
+                // 状态只更新「文字」，绝不碰进度值/进度条（进度条交给 onProgress）。
+                // 但内容相同也要每 3 秒刷一次，否则 peers=0 时界面看起来像卡死。
+                if(state == null) return;
+                long nowMs = System.currentTimeMillis();
+                boolean same = state.equals(btLastState[0]);
+                if(same && (nowMs - btLastStateTm[0]) < 3000) return;
+                btLastState[0] = state;
+                btLastStateTm[0] = nowMs;
+                h.post(new Runnable(){ public void run(){
+                    if(progressLabel != null) progressLabel.setText(state);
+                    // 下载页那行也用 -1（不改进度条）只刷文字
+                    dlRowUpdate(rowKey, -1, state + (btShown[0] > 0
+                            ? "  " + InnerDownloader.sizeText(btShown[0]) : ""));
+                }});
+            }
+            @Override public void onMeta(java.util.List<String> files, java.util.List<Long> sizes,
+                                        long totalBytes){
+                DypLog.i("BT_META files=" + files.size() + " total="
+                        + InnerDownloader.sizeText(totalBytes));
+                // 分母定死：用种子声明的总长（之后不再改），进度自然只增不减
+                btTotal[0] = totalBytes > 0 ? totalBytes : 0;
+                btShown[0] = 0;
+                btLastPct[0] = -1;
+                h.post(new Runnable(){ public void run(){
+                    progSet(0f, "开始下载 " + files.size() + " 个文件  "
+                            + InnerDownloader.sizeText(totalBytes));
+                    dlRowUpdate(rowKey, 0, "开始下载");
+                    // 拿到元数据：更新「列表」页那条的标题（文件数 + 体积）
+                    try{
+                        final String listId = btListItemId != null && btListItemId.length() > 0
+                                ? btListItemId : ("magnet_dl_" + saveDir.getName());
+                        boolean hit = false;
+                        synchronized(batchCollected){
+                            for(ProfileParser.ProfileItem o : batchCollected){
+                                if(o != null && listId.equals(o.id)){
+                                    o.title = "【磁力】" + btDisplayName(magnet) + "  ("
+                                            + files.size() + " 个文件 "
+                                            + InnerDownloader.sizeText(totalBytes) + ")";
+                                    hit = true;
+                                }
+                            }
+                        }
+                        if(!hit){
+                            // 兜底：早前的条目丢了就补一条
+                            ProfileParser.ProfileItem bi = new ProfileParser.ProfileItem();
+                            bi.id = listId;
+                            bi.title = "【磁力】" + btDisplayName(magnet) + "  ("
+                                    + files.size() + " 个文件 "
+                                    + InnerDownloader.sizeText(totalBytes) + ")";
+                            bi.url = magnet;
+                            bi.isImage = false;
+                            synchronized(batchCollected){ batchCollected.add(0, bi); }
+                        }
+                        saveBatchList();
+                        renderBatchList();
+                        DypLog.i("BT_LIST_ADDED " + listId + " hit=" + hit);
+                    }catch(Throwable t){ DypLog.i("BT_LIST_ERR " + t); }
+                }});
+            }
+            @Override public void onProgress(long done, long total, long speedBps, int peers){
+                // 分母永远用种子总长（btTotal），忽略 wanted 抖动；
+                // 进度只增不减，且百分比没变就不刷 UI（不跳、不闪）。
+                long use = btTotal[0] > 0 ? btTotal[0] : total;
+                if(use <= 0) return;
+                long show = Math.max(btShown[0], Math.min(done, use));
+                btShown[0] = show;
+                final float r = (float)((double) show / use);
+                final int pct = (int)(r * 100);
+                final String meta = InnerDownloader.sizeText(show)
+                        + " / " + InnerDownloader.sizeText(use)
+                        + "  " + InnerDownloader.sizeText(speedBps) + "/s"
+                        + "  peers=" + peers;
+                // 百分比没变且 3 秒内刷过 → 跳过这次（避免抖动）；
+                // 但超过 3 秒必须刷，否则界面看起来卡死
+                long nowP = System.currentTimeMillis();
+                boolean samePct = (pct == btLastPct[0]);
+                if(samePct && (nowP - btLastPctTm[0]) < 3000) return;
+                btLastPct[0] = pct;
+                btLastPctTm[0] = nowP;
+                h.post(new Runnable(){ public void run(){
+                    progSet(r, meta);
+                    dlRowUpdate(rowKey, (int)(r * 1000), pct + "%  " + InnerDownloader.sizeText(show)
+                            + (speedBps > 0 ? "  " + InnerDownloader.sizeText(speedBps) + "/s" : ""));
+                }});
+            }
+            @Override public void onTorrentSaved(final java.io.File tp){
+                DypLog.i("BT_TORRENT_EXPORTED " + (tp == null ? "null" : tp.getAbsolutePath()));
+                if(tp != null && tp.exists()){
+                    h.post(new Runnable(){ public void run(){
+                        showHintToast("种子已保留：" + tp.getName());
+                    }});
+                }
+            }
+            @Override public void onStreamable(final java.io.File f){
+                DypLog.i("BT_STREAMABLE " + (f == null ? "null" : f.getAbsolutePath()));
+                if(f == null) return;
+                h.post(new Runnable(){ public void run(){
+                    try{
+                        showHintToast("已可边下边播：" + f.getName());
+                        // 关键：必须带 file:// 前缀，否则 doPlayInner 里
+                        // isLocalFile 判定失败 → 用 HTTP 数据源读本地文件 → 无画面无声音
+                        curPlay = "file://" + f.getAbsolutePath();
+                        curUrl = curPlay;
+                        curId = f.getName();
+                        curImgs = "";
+                        imgUrls.clear();
+                        img.setVisibility(View.GONE);
+                        videoBox.setVisibility(View.VISIBLE);
+                        actions.setVisibility(View.VISIBLE);
+                        miniProxyKey = null;   // 强制重建播放器（本地文件不用代理）
+                        if(miniPlayer != null){
+                            try{ miniPlayer.release(); }catch(Throwable t2){}
+                            miniPlayer = null;
+                        }
+                        doPlay();
+                        s("边下边播：" + f.getName() + "（文件还在下载，边下边读）");
+                    }catch(Throwable t){ DypLog.i("BT_STREAM_PLAY_ERR " + t); }
+                }});
+            }
+            @Override public void onDone(final java.io.File dir){
+                DypLog.i("BT_DONE " + (dir == null ? "null" : dir.getAbsolutePath()));
+                btRunning = false;
+                clearBtTask();
+                h.post(new Runnable(){ public void run(){
+                    progSet(1f, "磁力下载完成");
+                    dlRowUpdate(rowKey, 1000, "✓ 完成");
+                    s("磁力下载完成 → " + (dir == null ? saveDir.getAbsolutePath() : dir.getAbsolutePath()));
+                    showHintToast("磁力下载完成");
+                    h.postDelayed(new Runnable(){ public void run(){ progHide(); }}, 1500);
+                }});
+            }
+            @Override public void onError(final String msg){
+                DypLog.i("BT_ERR " + msg);
+                btFinishHash(magnet);
+                h.post(new Runnable(){ public void run(){
+                    progSet(0f, "磁力失败：" + msg);
+                    dlRowUpdate(rowKey, -1, "✗ " + msg);
+                    s("磁力失败：" + msg);
+                }});
+            }
+            @Override public int[] onSelectFiles(java.util.List<String> files,
+                                                 java.util.List<Long> sizes, long totalBytes){
+                // 单文件种子直接全下；多文件弹选择框（阻塞等用户选）
+                if(files == null || files.size() <= 1) return null;
+                final java.util.List<String> f2 = files;
+                final java.util.List<Long> s2 = sizes;
+                final long t2 = totalBytes;
+                final int[] result = new int[]{ -1 };
+                final java.util.concurrent.CountDownLatch latch =
+                        new java.util.concurrent.CountDownLatch(1);
+                h.post(new Runnable(){ public void run(){
+                    try{
+                        showBtFilePicker(f2, s2, t2, result, latch);
+                    }catch(Throwable t){
+                        DypLog.i("BT_PICK_ERR " + t);
+                        latch.countDown();
+                    }
+                }});
+                try{ latch.await(180, java.util.concurrent.TimeUnit.SECONDS); }catch(Throwable t){}
+                if(result[0] == -1) return new int[]{ -1 };   // 取消
+                if(result[0] == -2) return null;              // 全部
+                // 部分选择：从暂存里取索引
+                java.util.List<Integer> sel = btPickResult;
+                if(sel == null || sel.isEmpty()) return null;
+                int[] out = new int[sel.size()];
+                for(int i = 0; i < out.length; i++) out[i] = sel.get(i);
+                return out;
+            }
+        }, myHash);
+    }
+
+    /** 磁力文件选择弹窗（支持搜索 + 分类筛选 + 智能全选） */
+    void showBtFilePicker(final java.util.List<String> files, final java.util.List<Long> sizes,
+                          final long totalBytes, final int[] result,
+                          final java.util.concurrent.CountDownLatch latch){
+        curDark = isDarkMode();
+        final boolean[] checked = new boolean[files.size()];
+        for(int i = 0; i < checked.length; i++) checked[i] = true;
+        final String[] kinds = new String[files.size()];
+        final int[] kindCount = new int[6];   // 0视频 1音频 2图片 3文档 4压缩包 5其他
+        for(int i = 0; i < files.size(); i++){
+            kinds[i] = btFileKind(files.get(i));
+            if("视频".equals(kinds[i])) kindCount[0]++;
+            else if("音频".equals(kinds[i])) kindCount[1]++;
+            else if("图片".equals(kinds[i])) kindCount[2]++;
+            else if("文档".equals(kinds[i])) kindCount[3]++;
+            else if("压缩包/镜像".equals(kinds[i])) kindCount[4]++;
+            else kindCount[5]++;
+        }
+        final String[] kindNames = { "视频", "音频", "图片", "文档", "压缩包/镜像", "其他" };
+        final String[] icons = { "🎬", "🎵", "🖼", "📄", "📦", "📎" };
+        final int[] filterKind = new int[]{ -1 };
+        final String[] filterTxt = new String[]{ "" };
+        final java.util.List<Integer> shown = new java.util.ArrayList<Integer>();
+
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.setPadding(dp(12), dp(8), dp(12), dp(8));
+
+        TextView head = new TextView(this);
+        head.setText("共 " + files.size() + " 个文件 · " + InnerDownloader.sizeText(totalBytes)
+                + "\n已选 " + files.size() + " 个");
+        head.setTextSize(12);
+        head.setTextColor(curDark ? 0xFF8A8F9C : 0xFF9AA0AC);
+        root.addView(head);
+
+        // 分类 chip
+        android.widget.HorizontalScrollView hs = new android.widget.HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        android.widget.LinearLayout chipRow = new android.widget.LinearLayout(this);
+        chipRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        chipRow.setPadding(0, dp(8), 0, dp(8));
+        hs.addView(chipRow);
+        root.addView(hs);
+
+        final android.widget.EditText search = new android.widget.EditText(this);
+        search.setHint("搜索文件名…");
+        search.setSingleLine(true);
+        search.setTextSize(13);
+        search.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+        search.setBackgroundColor(curDark ? 0xFF1A1C22 : 0xFFFFFFFF);
+        root.addView(search, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final android.widget.ListView lv = new android.widget.ListView(this);
+        lv.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT, dp(340)));
+
+        final android.app.Dialog[] dlgRef = new android.app.Dialog[1];
+
+        final Runnable refresh = new Runnable(){ public void run(){
+            shown.clear();
+            for(int i = 0; i < files.size(); i++){
+                if(filterKind[0] >= 0 && !kindNames[filterKind[0]].equals(kinds[i])) continue;
+                if(filterTxt[0].length() > 0
+                        && !files.get(i).toLowerCase().contains(filterTxt[0].toLowerCase())) continue;
+                shown.add(i);
+            }
+            android.widget.BaseAdapter ad = new android.widget.BaseAdapter(){
+                public int getCount(){ return shown.size(); }
+                public Object getItem(int p){ return shown.get(p); }
+                public long getItemId(int p){ return p; }
+                public android.view.View getView(int p, android.view.View cv, android.view.ViewGroup vg){
+                    android.widget.LinearLayout row = new android.widget.LinearLayout(MainActivity.this);
+                    row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+                    row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+                    row.setPadding(dp(4), dp(8), dp(4), dp(8));
+                    int idx = shown.get(p);
+                    // 用醒目的 ☑ / ☐ 文字代替系统 CheckBox：
+                    // 系统 CheckBox 在某些 ROM 上勾选态对比度极低（用户反馈「对号不明显」）
+                    TextView cb = new TextView(MainActivity.this);
+                    boolean on = checked[idx];
+                    cb.setText(on ? "☑" : "☐");
+                    cb.setTextSize(22);
+                    cb.setTextColor(on ? 0xFFFE2C55
+                            : (curDark ? 0xFF6B7280 : 0xFFB0B6C0));
+                    cb.setWidth(dp(36));
+                    cb.setGravity(android.view.Gravity.CENTER);
+                    row.addView(cb);
+                    TextView ic = new TextView(MainActivity.this);
+                    ic.setText(icons[btKindIndex(kinds[idx])]);
+                    ic.setTextSize(16);
+                    ic.setPadding(0, 0, dp(6), 0);
+                    row.addView(ic);
+                    TextView nm = new TextView(MainActivity.this);
+                    nm.setText(files.get(idx) + "\n" + InnerDownloader.sizeText(sizes.get(idx))
+                            + " · " + kinds[idx]);
+                    nm.setTextSize(12);
+                    nm.setTextColor(curDark ? 0xFFE8EAF0 : 0xFF1A1C22);
+                    nm.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                            0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                    row.addView(nm);
+                    final int fIdx = idx;
+                    row.setOnClickListener(new android.view.View.OnClickListener(){
+                        public void onClick(android.view.View v){
+                            checked[fIdx] = !checked[fIdx];
+                            try{
+                                if(head != null){
+                                    int sel2 = 0;
+                                    for(int i = 0; i < checked.length; i++) if(checked[i]) sel2++;
+                                    head.setText("共 " + files.size() + " 个文件 · "
+                                            + InnerDownloader.sizeText(totalBytes)
+                                            + "\n已选 " + sel2 + " 个");
+                                }
+                                if(lv != null && lv.getAdapter() != null){
+                                    ((android.widget.BaseAdapter) lv.getAdapter()).notifyDataSetChanged();
+                                }
+                            }catch(Throwable t){
+                                DypLog.i("BT_PICK_TOGGLE_ERR " + t);
+                            }
+                        }
+                    });
+                    return row;
+                }
+            };
+            lv.setAdapter(ad);
+        }};
+
+        // chips
+        for(int k = -1; k < 6; k++){
+            final int fk = k;
+            TextView chip = new TextView(this);
+            String label = k < 0 ? "全部" : kindNames[k];
+            int cnt = k < 0 ? files.size() : kindCount[k];
+            chip.setText(label + " " + cnt);
+            chip.setTextSize(12);
+            chip.setPadding(dp(10), dp(5), dp(10), dp(5));
+            chip.setSingleLine(true);
+            boolean on = k < 0;
+            chip.setTextColor(on ? 0xFFFE2C55 : (cnt > 0 ? (curDark ? 0xFFE8EAF0 : 0xFF1A1C22) : 0xFF4A4F5A));
+            chip.setBackground(makeRoundRect(on ? 0x1AFE2C55 : 0x0DFFFFFF, 0, 8));
+            android.widget.LinearLayout.LayoutParams clp =
+                    new android.widget.LinearLayout.LayoutParams(
+                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+            clp.rightMargin = dp(6);
+            chip.setLayoutParams(clp);
+            chip.setOnClickListener(new android.view.View.OnClickListener(){
+                public void onClick(android.view.View v){
+                    filterKind[0] = fk;
+                    for(int i = 0; i < chipRow.getChildCount(); i++){
+                        android.view.View c = chipRow.getChildAt(i);
+                        boolean sel = (i - 1) == fk;
+                        c.setBackground(makeRoundRect(sel ? 0x1AFE2C55 : 0x0DFFFFFF, 0, 8));
+                    }
+                    refresh.run();
+                }
+            });
+            chipRow.addView(chip);
+        }
+
+        search.addTextChangedListener(new android.text.TextWatcher(){
+            public void beforeTextChanged(CharSequence s2, int a, int b, int c){}
+            public void onTextChanged(CharSequence s2, int a, int b, int c){
+                filterTxt[0] = s2 == null ? "" : s2.toString().trim();
+                refresh.run();
+            }
+            public void afterTextChanged(android.text.Editable e){}
+        });
+
+        root.addView(lv);
+        refresh.run();
+
+        android.app.AlertDialog dlgPick = dypDlg()
+            .setTitle("选择要下载的文件")
+            .setView(root)
+            .setPositiveButton("开始下载", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    // 把选中索引塞进 result：result[0]=0 表示有选择
+                    java.util.List<Integer> sel = new java.util.ArrayList<Integer>();
+                    for(int i = 0; i < checked.length; i++) if(checked[i]) sel.add(i);
+                    if(sel.size() == files.size()){
+                        result[0] = -2;   // 全选
+                    }else if(sel.isEmpty()){
+                        result[0] = -1;
+                        showHintToast("没有选中任何文件");
+                    }else{
+                        result[0] = 0;
+                        for(Integer si : sel) {
+                            // 复用 result 数组：第 0 位是标志，后面是索引
+                            // 因为 result 长度固定为 1，这里改用一个包装
+                        }
+                    }
+                    // 用静态暂存把索引带过去（result 只有 1 位）
+                    btPickResult = sel;
+                    btPickFlag = (sel.size() == files.size()) ? -2 : (sel.isEmpty() ? -1 : 0);
+                    result[0] = btPickFlag;
+                    latch.countDown();
+                }
+            })
+            .setNeutralButton("全选/反选", null)   // listener 在 onShow 里重新设（见下）
+            .setNegativeButton("取消下载", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    btPickFlag = -1;
+                    result[0] = -1;
+                    latch.countDown();
+                }
+            })
+            .setOnCancelListener(new android.content.DialogInterface.OnCancelListener(){
+                public void onCancel(android.content.DialogInterface dd){
+                    btPickFlag = -1;
+                    result[0] = -1;
+                    latch.countDown();
+                }
+            })
+            .create();
+
+        // 关键：AlertDialog 里点任何按钮（含 neutral）系统都会 dismiss，
+        // 在 setNeutralButton 的 onClick 里拦不住 —— 弹窗必然消失。
+        // 正解：弹窗显示后，把「全选/反选」按钮的 OnClickListener 换成自己的，
+        // 自己处理完就不触发系统的 dismiss。
+        dlgPick.setOnShowListener(new android.content.DialogInterface.OnShowListener(){
+            public void onShow(android.content.DialogInterface dd){
+                try{
+                    android.app.AlertDialog ad = (android.app.AlertDialog) dd;
+                    android.widget.Button bn = ad.getButton(android.app.AlertDialog.BUTTON_NEUTRAL);
+                    if(bn == null) return;
+                    bn.setOnClickListener(new android.view.View.OnClickListener(){
+                        public void onClick(android.view.View v){
+                            try{
+                                // 只翻转当前可见项（配合分类筛选/搜索）
+                                if(shown.isEmpty()) return;
+                                for(Integer i : shown) checked[i] = !checked[i];
+                                int sel = 0;
+                                for(int i = 0; i < checked.length; i++) if(checked[i]) sel++;
+                                if(head != null){
+                                    head.setText("共 " + files.size() + " 个文件 · "
+                                            + InnerDownloader.sizeText(totalBytes)
+                                            + "\n已选 " + sel + " 个");
+                                }
+                                if(lv != null && lv.getAdapter() != null){
+                                    ((android.widget.BaseAdapter) lv.getAdapter()).notifyDataSetChanged();
+                                }
+                                DypLog.i("BT_PICK_TOGGLE_ALL sel=" + sel
+                                        + " visible=" + shown.size());
+                            }catch(Throwable t){
+                                DypLog.i("BT_PICK_TOGGLE_ERR " + t);
+                            }
+                            // 注意：这里不 dismiss，弹窗保持打开
+                        }
+                    });
+                }catch(Throwable t){
+                    DypLog.i("BT_PICK_SHOW_ERR " + t);
+                }
+            }
+        });
+        dlgPick.show();
+    }
+
+    /** 文件类型判定 */
+    static String btFileKind(String name){
+        if(name == null) return "其他";
+        String n = name.toLowerCase();
+        if(n.matches(".*\\.(mp4|mkv|avi|mov|wmv|flv|webm|ts|m2ts|rmvb|mpg|mpeg|m4v)$")) return "视频";
+        if(n.matches(".*\\.(mp3|flac|aac|wav|ogg|m4a|wma|ape|opus)$")) return "音频";
+        if(n.matches(".*\\.(jpg|jpeg|png|gif|bmp|webp|heic|tif|tiff)$")) return "图片";
+        if(n.matches(".*\\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|epub|mobi|azw3)$")) return "文档";
+        if(n.matches(".*\\.(zip|rar|7z|tar|gz|bz2|xz|iso|img|dmg)$")) return "压缩包/镜像";
+        return "其他";
+    }
+    static int btKindIndex(String kind){
+        if("视频".equals(kind)) return 0;
+        if("音频".equals(kind)) return 1;
+        if("图片".equals(kind)) return 2;
+        if("文档".equals(kind)) return 3;
+        if("压缩包/镜像".equals(kind)) return 4;
+        return 5;
+    }
+
+    /** 磁力任务运行标志（兼容旧逻辑：只要还有磁力在跑就是 true） */
+    volatile boolean btRunning = false;
+    /** 正在跑的磁力任务 infoHash 集合（支持多个磁力同时下载） */
+    final java.util.Set<String> btRunningHashes =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    /** 磁力文件选择结果暂存 */
+    volatile java.util.List<Integer> btPickResult = null;
+    volatile int btPickFlag = -1;
 
     int curRetry = 0;
     String curUrl = "";
@@ -10268,7 +14677,7 @@ webDone=false;
                     }});
                     return;
                 }
-                Log.i("DYP", "SPH_DIRECT shortUri=" + su);
+                DypLog.i("SPH_DIRECT shortUri=" + su);
                 // ===== 元宝通道（借鉴 ucmao/media-parser _parse_with_yuanbao）=====
                 // 有 Cookie 时：元宝 get_parse_result 换 token+eid → get_feed_info 带 token 拿 videoUrl
                 String ckYb = ybCookie();
@@ -10293,7 +14702,7 @@ webDone=false;
                         yos.write(ybBody.getBytes("UTF-8"));
                         yos.close();
                         int ybCode = yc.getResponseCode();
-                        Log.i("DYP", "SPH_YB_CODE " + ybCode);
+                        DypLog.i("SPH_YB_CODE " + ybCode);
                         if(ybCode == 200 || ybCode == 201){
                             StringBuilder ysb = new StringBuilder();
                             java.io.BufferedReader ybr = new java.io.BufferedReader(
@@ -10305,8 +14714,8 @@ webDone=false;
                             Map ybM = (Map)new JP(ybJson).parse();
                             Map ybData = (Map)get(ybM, "data");
                             String playable = ybData != null ? gs(get(ybData, "playable_url")) : "";
-                            Log.i("DYP", "SPH_YB_PLAYABLE_FULL " + playable);
-                            Log.i("DYP", "SPH_YB_PLAYABLE len=" + playable.length());
+                            DypLog.i("SPH_YB_PLAYABLE_FULL " + playable);
+                            DypLog.i("SPH_YB_PLAYABLE len=" + playable.length());
                             if(playable.length() > 0){
                                 // playable_url 里提取 token 与 eid
                                 String tok = "", eid = "";
@@ -10318,7 +14727,7 @@ webDone=false;
                                 if(em.find()){
                                     eid = em.group(1);
                                     try{ eid = java.net.URLDecoder.decode(eid, "UTF-8"); }catch(Throwable t){}
-                                    Log.i("DYP", "SPH_EID_DEC " + eid);
+                                    DypLog.i("SPH_EID_DEC " + eid);
                                 }
                                 if(tok.length() > 0 && eid.length() > 0){
                                     // 用元宝 token 打 get_feed_info（POST + exportId）
@@ -10335,37 +14744,37 @@ webDone=false;
                                             .compile("entry_card_type=(\\d+)").matcher(playable);
                                         if(ecm.find()) ybEntryCard = ecm.group(1);
                                     }catch(Throwable t){}
-                                    Log.i("DYP", "SPH_YB_SCENE appid=" + ybAppid
+                                    DypLog.i("SPH_YB_SCENE appid=" + ybAppid
                                         + " entryScene=" + ybEntryScene + " card=" + ybEntryCard);
                                     final String feedJson = sphFeedInfoWithToken(su, tok, eid,
                                         ybAppid, ybEntryScene, ybEntryCard);
                                     if(feedJson != null && feedJson.length() > 0){
-                                        Log.i("DYP", "SPH_YB_FEED len=" + feedJson.length());
+                                        DypLog.i("SPH_YB_FEED len=" + feedJson.length());
                                         // 先试着渲染；失败（如「此内容暂时无法播放」）就继续走匿名回退
                                         boolean[] ybOk = new boolean[]{ false };
                                         final java.util.concurrent.CountDownLatch latch =
                                             new java.util.concurrent.CountDownLatch(1);
                                         h.post(new Runnable(){ public void run(){
                                             try{ ybOk[0] = sphRenderJson(feedJson); }
-                                            catch(Throwable t){ Log.i("DYP", "SPH_JSON_ERR " + t); }
+                                            catch(Throwable t){ DypLog.i("SPH_JSON_ERR " + t); }
                                             latch.countDown();
                                         }});
                                         try{ latch.await(3, java.util.concurrent.TimeUnit.SECONDS); }catch(Throwable t){}
                                         if(ybOk[0]){
-                                            Log.i("DYP", "SPH_YB_RENDERED ok");
+                                            DypLog.i("SPH_YB_RENDERED ok");
                                             sphParsing = false;
                                             return;
                                         }
-                                        Log.i("DYP", "SPH_YB_RENDER_FAIL → 匿名回退");
+                                        DypLog.i("SPH_YB_RENDER_FAIL → 匿名回退");
                                     }
                                 } else {
-                                    Log.i("DYP", "SPH_YB_NO_TOKEN");
+                                    DypLog.i("SPH_YB_NO_TOKEN");
                                 }
                             }
                         }
-                        Log.i("DYP", "SPH_YB_FALLBACK 匿名回退");
+                        DypLog.i("SPH_YB_FALLBACK 匿名回退");
                     }catch(Throwable yt){
-                        Log.i("DYP", "SPH_YB_ERR " + yt + " → 匿名回退");
+                        DypLog.i("SPH_YB_ERR " + yt + " → 匿名回退");
                     }
                 }
                 // ===== 匿名模式（无 Cookie 或元宝失败）=====
@@ -10390,7 +14799,7 @@ webDone=false;
                 os.write(body.getBytes("UTF-8"));
                 os.close();
                 int code = uc.getResponseCode();
-                Log.i("DYP", "SPH_DIRECT_CODE " + code);
+                DypLog.i("SPH_DIRECT_CODE " + code);
                 // 微信这个接口正常响应就是 201 Created + JSON body
                 if(code < 200 || code >= 300){
                     h.post(new Runnable(){ public void run(){
@@ -10406,13 +14815,13 @@ webDone=false;
                 while((line = br.readLine()) != null) sb.append(line);
                 br.close();
                 final String json = sb.toString();
-                Log.i("DYP", "SPH_DIRECT_BODY len=" + json.length());
+                DypLog.i("SPH_DIRECT_BODY len=" + json.length());
                 h.post(new Runnable(){ public void run(){
-                    try{ sphRenderJson(json); }catch(Throwable t){ Log.i("DYP", "SPH_JSON_ERR " + t); }
+                    try{ sphRenderJson(json); }catch(Throwable t){ DypLog.i("SPH_JSON_ERR " + t); }
                     sphParsing = false;
                 }});
             }catch(final Throwable t){
-                Log.i("DYP", "SPH_DIRECT_ERR " + t);
+                DypLog.i("SPH_DIRECT_ERR " + t);
                 h.post(new Runnable(){ public void run(){
                     sphParsing = false;
                     s("视频号解析失败 " + t);
@@ -10442,7 +14851,7 @@ webDone=false;
             uc.setRequestProperty("User-Agent",
                 "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
             int code = uc.getResponseCode();
-            Log.i("DYP", "SPH_FEED_CODE " + code);
+            DypLog.i("SPH_FEED_CODE " + code);
             if(code != 200) return null;
             StringBuilder sb = new StringBuilder();
             java.io.BufferedReader br = new java.io.BufferedReader(
@@ -10452,7 +14861,7 @@ webDone=false;
             br.close();
             return sb.toString();
         }catch(Throwable t){
-            Log.i("DYP", "SPH_FEED_ERR " + t);
+            DypLog.i("SPH_FEED_ERR " + t);
             return null;
         }finally{
             try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
@@ -10466,7 +14875,7 @@ webDone=false;
             String bodyText = gs(get(m, "bodyText"));
             String title = gs(get(m, "title"));
             if(bodyText == null || bodyText.length() == 0){
-                Log.i("DYP", "SPH_RENDER empty body");
+                DypLog.i("SPH_RENDER empty body");
                 sphParsing = false;
                 s("视频号页面未返回内容，请稍后重试");
                 return;
@@ -10513,7 +14922,7 @@ webDone=false;
             b.append("\n【说明】微信未对第三方开放视频号视频流。\n");
             b.append("视频号链接只能在微信内观看；本条封面图可长按复制直链下载。\n");
             String r = b.toString();
-            Log.i("DYP", "SPH_RESULT\n" + r);
+            DypLog.i("SPH_RESULT\n" + r);
             webDone = true;
             o(r);
             s("完成(视频号) · 详情见文本");
@@ -10526,7 +14935,7 @@ webDone=false;
             }catch(Throwable t){}
             sphParsing = false;
         }catch(Throwable t){
-            Log.i("DYP", "SPH_RENDER_ERR2 " + t);
+            DypLog.i("SPH_RENDER_ERR2 " + t);
             sphParsing = false;
             s("视频号解析失败 " + t);
         }
@@ -10566,7 +14975,7 @@ webDone=false;
             os.write(body.getBytes("UTF-8"));
             os.close();
             int code = uc.getResponseCode();
-            Log.i("DYP", "SPH_TOKEN_FEED_CODE " + code);
+            DypLog.i("SPH_TOKEN_FEED_CODE " + code);
             if(code < 200 || code >= 300) return null;
             StringBuilder sb = new StringBuilder();
             java.io.BufferedReader br = new java.io.BufferedReader(
@@ -10575,10 +14984,10 @@ webDone=false;
             while((line = br.readLine()) != null) sb.append(line);
             br.close();
             String ret = sb.toString();
-            if(ret.length() < 500) Log.i("DYP", "SPH_TOKEN_FEED_BODY " + ret);
+            if(ret.length() < 500) DypLog.i("SPH_TOKEN_FEED_BODY " + ret);
             return ret;
         }catch(Throwable t){
-            Log.i("DYP", "SPH_TOKEN_FEED_ERR " + t);
+            DypLog.i("SPH_TOKEN_FEED_ERR " + t);
             return null;
         }finally{
             try{ if(uc != null) uc.disconnect(); }catch(Throwable t){}
@@ -10725,7 +15134,7 @@ webDone=false;
                 android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
                 android.view.Gravity.BOTTOM);
             vg.addView(bar, flp);
-        }catch(Throwable t){ Log.i("DYP", "YB_BAR_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("YB_BAR_ERR " + t); }
     }
     void ybLoginBarHide(){
         try{
@@ -10757,7 +15166,7 @@ webDone=false;
             if(hu.length() == 0 || ht.length() == 0) return false;
             ybCookieSave("hy_user=" + hu + "; hy_token=" + ht);
             ybLoginMode = false;
-            Log.i("DYP", "YB_LOGIN_OK hy_user=" + hu.length() + " hy_token=" + ht.length());
+            DypLog.i("YB_LOGIN_OK hy_user=" + hu.length() + " hy_token=" + ht.length());
             s("元宝登录成功，已保存凭据");
             // 与抖音/YouTube 登录一致的收尾：退出登录页、回解析页
             try{
@@ -10769,7 +15178,7 @@ webDone=false;
             buildSettingsPage();
             return true;
         }catch(Throwable t){
-            Log.i("DYP", "YB_LOGIN_ERR " + t);
+            DypLog.i("YB_LOGIN_ERR " + t);
             return false;
         }
     }
@@ -10782,7 +15191,7 @@ webDone=false;
             long ec = parseLong(ecO, -1);
             if(ec != 0 && ecO != null){
                 s("视频号接口返回 " + gs(get(root, "errMsg")));
-                Log.i("DYP", "SPH_JSON errCode=" + ec);
+                DypLog.i("SPH_JSON errCode=" + ec);
                 return false;
             }
             Map data = (Map)get(root, "data");
@@ -10827,7 +15236,7 @@ webDone=false;
             String bgm = "";
             Map bg = (Map)get(fi, "bgmInfo");
             if(bg != null) bgm = gs(get(bg, "bgmUrl"));
-            Log.i("DYP", "SPH_JSON_OK author=" + author + " vlen=" + videoUrl.length()
+            DypLog.i("SPH_JSON_OK author=" + author + " vlen=" + videoUrl.length()
                 + " imgs=" + imgs.size() + " bgm=" + (bgm.length() > 0 ? "1" : "0")
                 + " desc=" + desc.substring(0, Math.min(30, desc.length())));
             // ===== 渲染 =====
@@ -10866,7 +15275,7 @@ webDone=false;
             }
             if(bgm.length() > 0) b.append("【背景音乐】").append(bgm).append("\n");
             String r = b.toString();
-            Log.i("DYP", "SPH_RESULT2\n" + r);
+            DypLog.i("SPH_RESULT2\n" + r);
             webDone = true;
             o(r);
             s("完成(视频号)");
@@ -10883,7 +15292,7 @@ webDone=false;
                 }});
             }
         }catch(Throwable t){
-            Log.i("DYP", "SPH_RENDER_JSON_ERR " + t);
+            DypLog.i("SPH_RENDER_JSON_ERR " + t);
             s("视频号结果解析失败 " + t);
             return false;
 
@@ -10898,9 +15307,9 @@ webDone=false;
     void sphHandleFeed(String body){
         try{
             Map m = (Map)new JP(body).parse();
-            Log.i("DYP", "SPH_FEED_KEYS " + (m == null ? "null" : m.keySet().toString()));
+            DypLog.i("SPH_FEED_KEYS " + (m == null ? "null" : m.keySet().toString()));
         }catch(Throwable t){
-            Log.i("DYP", "SPH_FEED_PARSE_ERR " + t);
+            DypLog.i("SPH_FEED_PARSE_ERR " + t);
         }
     }
 
@@ -10917,8 +15326,8 @@ webDone=false;
                 + "DyBridge.onSphTap(''+n);"
                 + "})()";
             web.evaluateJavascript(tapJs, null);
-            Log.i("DYP", "SPH_TAP_SENT");
-        }catch(Throwable t){ Log.i("DYP", "SPH_TAP_ERR " + t); }
+            DypLog.i("SPH_TAP_SENT");
+        }catch(Throwable t){ DypLog.i("SPH_TAP_ERR " + t); }
         try{
             String js =
                 "(function(){var out={};"
@@ -10932,12 +15341,29 @@ webDone=false;
                 + "DyBridge.onSphProbe(JSON.stringify(out));"
                 + "})()";
             web.evaluateJavascript(js, null);
-            Log.i("DYP", "SPH_PROBE_SENT");
-        }catch(Throwable t){ Log.i("DYP", "SPH_PROBE_ERR " + t); }
+            DypLog.i("SPH_PROBE_SENT");
+        }catch(Throwable t){ DypLog.i("SPH_PROBE_ERR " + t); }
     }
 
     void loadForParse(final String url){
+        // 双保险：磁力绝不进 WebView（否则 ERR_UNKNOWN_URL_SCHEME）
+        if(url != null && (BtDownloader.isMagnet(url) || url.indexOf(".torrent") > 0)){
+            DypLog.i("LOADFOR_MAGNET_TO_BT");
+            startMagnetDownload(url);
+            return;
+        }
         curUrl = url;
+        // 抖音类链接：解析前先把登录 Cookie 灌进 WebView。
+        // 不灌的话解析走匿名会话，风控会一直找上门（用户明明登录过了）。
+        try{
+            String lu = url == null ? "" : url.toLowerCase();
+            if(lu.indexOf("douyin.com") >= 0 || lu.indexOf("iesdouyin.com") >= 0
+                    || lu.indexOf("amemv.com") >= 0){
+                injectDyCookieBeforeParse();
+            }
+        }catch(Throwable t){
+            DypLog.i("DY_CK_INJECT_WRAP_ERR " + t);
+        }
         // 新解析开始：复位各平台「已回退」标志，否则第二次解析不会触发回退
         ytSrvFallbackDone = false;
         xSrvFallbackDone = false;
@@ -10951,14 +15377,14 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final MiscParser.Item it = MiscParser.resolve(url);
-                Log.i("DYP", "MISC_DONE plat=" + it.platform + " err=" + it.err
+                DypLog.i("MISC_DONE plat=" + it.platform + " err=" + it.err
                     + " ok=" + it.ok + " v=" + it.hasVideo() + " gears=" + it.gears.size());
                 h.post(new Runnable(){ public void run(){
                     if(it.ok){
                         webDone = true;
                         String r = MiscParser.toText(it);
                         String[] md = MiscParser.toMedia(it);
-                        Log.i("DYP", "MISC_RESULT_BEGIN\n" + r + "\nMISC_RESULT_END");
+                        DypLog.i("MISC_RESULT_BEGIN\n" + r + "\nMISC_RESULT_END");
                         o2(r, md[0], md[1], md[2]);
                         s("完成(" + it.platform + ")");
                     } else {
@@ -10975,7 +15401,7 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final ToutiaoParser.TtItem it = ToutiaoParser.resolve(url);
-                Log.i("DYP", "TT_DONE err=" + it.err + " ok=" + it.ok
+                DypLog.i("TT_DONE err=" + it.err + " ok=" + it.ok
                     + " v=" + it.hasVideo() + " gears=" + it.gears.size()
                     + " imgs=" + it.images.size());
                 h.post(new Runnable(){ public void run(){
@@ -10983,7 +15409,7 @@ webDone=false;
                         webDone = true;
                         String r = ToutiaoParser.toText(it);
                         String[] md = ToutiaoParser.toMedia(it);
-                        Log.i("DYP", "TT_RESULT_BEGIN\n" + r + "\nTT_RESULT_END");
+                        DypLog.i("TT_RESULT_BEGIN\n" + r + "\nTT_RESULT_END");
                         o2(r, md[0], md[1], md[2]);
                         s("完成(头条)" + (it.hasVideo() ? " 视频" : "")
                             + (it.images.size() > 0 ? " " + it.images.size() + " 张图" : ""));
@@ -10995,13 +15421,52 @@ webDone=false;
             }}).start();
             return;
         }
+        // 腾讯视频：vv.video.qq.com/getinfo（免 Cookie）
+        if(TxParser.isTxUrl(url)){
+            s("解析腾讯视频...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final TxParser.TxVideo it = TxParser.parse(url);
+                DypLog.i("TX_DONE ok=" + it.ok + " vid=" + it.vid
+                    + " gears=" + it.gears.size() + " err=" + it.err);
+                h.post(new Runnable(){ public void run(){
+                    if(it.ok){
+                        webDone = true;
+                        curId = it.vid;
+                        curDesc = it.title;
+                        curCover = it.cover;
+                        curPlay = it.playUrl;
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("【平台】腾讯视频\n");
+                        sb.append("【标题】").append(it.title).append("\n");
+                        if(it.durSec > 0) sb.append("【时长】").append((long)it.durSec).append("s\n");
+                        if(it.fileSize > 0) sb.append("【大小】")
+                            .append(InnerDownloader.sizeText(it.fileSize)).append("\n");
+                        sb.append("【清晰度】").append(it.gears.size()).append(" 档\n");
+                        for(int i = 0; i < it.gears.size(); i++){
+                            String[] g = it.gears.get(i);
+                            sb.append("  ").append(g[0]).append(": ")
+                              .append(InnerDownloader.sizeText(parseLong(g[2]))).append("\n");
+                        }
+                        sb.append("【直链】").append(it.playUrl).append("\n");
+                        o2(sb.toString(), "", it.playUrl, it.cover);
+                        s("完成(腾讯视频) " + it.gears.size() + " 档清晰度");
+                        DypLog.i("TX_URL_OK size=" + it.fileSize + " td=" + it.durSec);
+                    } else {
+                        s("腾讯视频解析失败：" + (it.err.length() > 0 ? it.err : "无内容"));
+                        showHintToast("腾讯视频解析失败，会员/付费内容只能拿试看片段");
+                    }
+                }});
+            }}).start();
+            return;
+        }
         // 公众号：SSR 页面直接抽变量（免 Cookie/免服务器），借鉴 media-parser 的 wechat_mp 方案
         if(WxMpParser.isWxMpUrl(url)){
             s("解析公众号文章...");
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final WxMpParser.MpArticle a = WxMpParser.resolve(url);
-                Log.i("DYP", "WXMP_BEGIN err=" + a.err + " ok=" + a.ok
+                DypLog.i("WXMP_BEGIN err=" + a.err + " ok=" + a.ok
                     + " imgs=" + a.images.size() + " vids=" + a.videos.size()
                     + " audio=" + a.hasAudio() + " title=" + a.title);
                 h.post(new Runnable(){ public void run(){
@@ -11009,7 +15474,7 @@ webDone=false;
                         webDone = true;
                         String r = WxMpParser.toText(a);
                         String[] md = WxMpParser.toMedia(a);
-                        Log.i("DYP", "WXMP_RESULT_BEGIN\n" + r + "\nWXMP_RESULT_END");
+                        DypLog.i("WXMP_RESULT_BEGIN\n" + r + "\nWXMP_RESULT_END");
                         o2(r, md[0], md[1], md[2]);
                         s("完成(公众号)" + (a.hasVideo() ? " 视频" : "")
                             + (a.images.size() > 0 ? " " + a.images.size() + " 张图" : "")
@@ -11028,14 +15493,14 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final DoubaoParser.DbItem it = DoubaoParser.resolve(url);
-                Log.i("DYP", "DB_DONE err=" + it.err + " ok=" + it.ok
+                DypLog.i("DB_DONE err=" + it.err + " ok=" + it.ok
                     + " v=" + it.hasVideo() + " imgs=" + it.images.size());
                 h.post(new Runnable(){ public void run(){
                     if(it.ok){
                         webDone = true;
                         String r = DoubaoParser.toText(it);
                         String[] md = DoubaoParser.toMedia(it);
-                        Log.i("DYP", "DB_RESULT_BEGIN\n" + r + "\nDB_RESULT_END");
+                        DypLog.i("DB_RESULT_BEGIN\n" + r + "\nDB_RESULT_END");
                         o2(r, md[0], md[1], md[2]);
                         s("完成(豆包)" + (it.hasVideo() ? " 视频" : "")
                             + (it.images.size() > 0 ? " " + it.images.size() + " 张图" : ""));
@@ -11054,14 +15519,14 @@ webDone=false;
             new Thread(new Runnable(){ public void run(){
                 final XhsParser.XhsNote n = XhsParser.resolve(url,
                     CookieStore.xhsCookieString(MainActivity.this));
-                Log.i("DYP", "XHS_DONE err=" + n.err + " ok=" + n.ok
+                DypLog.i("XHS_DONE err=" + n.err + " ok=" + n.ok
                     + " v=" + n.hasVideo() + " imgs=" + n.images.size());
                 h.post(new Runnable(){ public void run(){
                     if(n.ok){
                         webDone = true;
                         String r = XhsParser.toText(n);
                         String[] md = XhsParser.toMedia(n);
-                        Log.i("DYP", "XHS_RESULT_BEGIN\n" + r + "\nXHS_RESULT_END");
+                        DypLog.i("XHS_RESULT_BEGIN\n" + r + "\nXHS_RESULT_END");
                         o2(r, md[0], md[1], md[2]);
                         s("完成(小红书)" + (n.hasVideo() ? " 视频" : "")
                             + (n.images.size() > 0 ? " " + n.images.size() + " 张图" : ""));
@@ -11079,7 +15544,7 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final WeiboParser.WbVideo v = WeiboParser.resolve(url);
-                Log.i("DYP", "WB_RESULT err=" + v.err + " ok=" + v.ok
+                DypLog.i("WB_RESULT err=" + v.err + " ok=" + v.ok
                     + " v=" + v.hasVideo() + " imgs=" + v.images.size()
                     + " live=" + v.livePhotos.size() + " gears=" + v.gears.size());
                 h.post(new Runnable(){ public void run(){
@@ -11087,7 +15552,7 @@ webDone=false;
                         webDone = true;
                         String r = WeiboParser.toText(v);
                         String[] md = WeiboParser.toMedia(v);
-                        Log.i("DYP", "WB_RESULT_BEGIN\n" + r + "\nWB_RESULT_END");
+                        DypLog.i("WB_RESULT_BEGIN\n" + r + "\nWB_RESULT_END");
                         o2(r, md[0], md[1], md[2]);
                         s("完成(微博)" + (v.hasVideo() ? " 视频" : "")
                             + (v.hasImages() ? " " + v.images.size() + " 张图" : ""));
@@ -11106,14 +15571,14 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final BiliParser.BiliVideo v = BiliParser.resolve(MainActivity.this, url, 1);
-                Log.i("DYP", "BILI_RESULT err=" + v.err + " ok=" + v.ok()
+                DypLog.i("BILI_RESULT err=" + v.err + " ok=" + v.ok()
                         + " pages=" + v.pages.size());
                 curBili = v;
                 h.post(new Runnable(){ public void run(){
                     if(v.ok()){
                         webDone = true;
                         String r = render(BiliParser.toResultJson(v));
-                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                         o(r);
                         if(v.hasPages()){
                             boolean isSeason = v.seasonId > 0;
@@ -11134,6 +15599,12 @@ webDone=false;
                                 // 合集里每集是独立视频，必须用该集自己的 aid
                                 String epAid = (p.aid != null && p.aid.length() > 0) ? p.aid : v.aid;
                                 it.url = "bili://play/" + epAid + "/" + p.cid;
+                                // 分P封面：按 bvid 拼 B 站官方封面地址
+                                if(curBili != null && curBili.bvid != null
+                                        && curBili.bvid.length() > 0){
+                                    it.cover = "https://i0.hdslb.com/bfs/archive/"
+                                            + curBili.bvid + ".jpg";
+                                }
                                 items.add(it);
                             }
                             showBiliPages(items);
@@ -11157,6 +15628,35 @@ webDone=false;
         // 主页列表：B 站空间（本地 wbi）/ YouTube @频道 / TikTok @用户 / X 用户名主页
         if(isProfileUrl(url)){
             final String biliMid = extractBiliMid(url);
+            // X（Twitter）主页：本地直连 syndication（无服务器，吃手机代理），
+            // 敏感账号 syndication 返回空 → 回退 WebView 收集
+            if(XParser.isXUrl(url)){
+                s("解析 X 主页...");
+                web.setVisibility(View.GONE);
+                final String xName = xScreenName(url);
+                new Thread(new Runnable(){ public void run(){
+                    final java.util.List<ProfileParser.ProfileItem> xlist =
+                            (xName.length() > 0 ? ProfileParser.resolveXProfile(MainActivity.this, xName) : null);
+                    final String xerr = ProfileParser.lastErr;
+                    h.post(new Runnable(){ public void run(){
+                        if(xlist != null && !xlist.isEmpty()){
+                            webDone = true;
+                            try{
+                                showProfileList(xlist);
+                                switchTab(1);
+                            }catch(Throwable t){ DypLog.i("X_SHOW_ERR " + t); }
+                            s("完成(X 主页) " + xlist.size() + " 条");
+                        } else {
+                            // 回退 WebView 收集（登录态 / 敏感账号）
+                            DypLog.i("X_PROFILE_WEBVIEW_FALLBACK " + xerr);
+                            s("X 主页改网页收集…（敏感账号需登录）");
+                            injectXCookiesToWebView();
+                            startProfileWebView(url);
+                        }
+                    }});
+                }}).start();
+                return;
+            }
             // Instagram 主页：优先本地 API（带 Cookie），失败回退 WebView 收集
             if(InsParser.isInsUrl(url)){
                 s("解析 Instagram 主页...");
@@ -11171,7 +15671,7 @@ webDone=false;
                             s("完成(IG 主页) " + list.size() + " 条");
                         } else {
                             // 回退 WebView 收集
-                            Log.i("DYP", "INS_PROFILE_WEBVIEW_FALLBACK " + err);
+                            DypLog.i("INS_PROFILE_WEBVIEW_FALLBACK " + err);
                             s("IG 接口受限，改用网页收集…");
                             profileMode = true;
                             webDone = false;
@@ -11215,7 +15715,7 @@ webDone=false;
                             showProfileList(items);
                         } else {
                             // wbi 直连被风控：回退 WebView 主页方案
-                            Log.i("DYP", "BILI_SPACE_412 fallback webview");
+                            DypLog.i("BILI_SPACE_412 fallback webview");
                             startProfileWebView(url);
                         }
                     }});
@@ -11228,20 +15728,29 @@ webDone=false;
                 startProfileWebView(url);
                 return;
             }
+            // TikTok 主页：走 WebView（页面自己出数据，吃手机代理直连；
+            // tikwm/tikwm 主页接口被 Cloudflare 拦，拿不到列表）
+            // X 主页在上面的 isProfileUrl 分支里本地 syndication 解析
+            if(lower.contains("tiktok.com/@")){
+                DypLog.i("PROFILE_TT_WEBVIEW " + (url == null ? "" : url));
+                injectXCookiesToWebView();
+                startProfileWebView(url);
+                return;
+            }
             s("解析主页列表...");
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final java.util.List<ProfileParser.ProfileItem> list = ProfileParser.resolveProfile(MainActivity.this, url);
                 final String err = ProfileParser.lastErr;
                 h.post(new Runnable(){ public void run(){
-                    Log.i("DYP", "PROFILE_LIST size=" + (list != null ? list.size() : -1) + " err=" + err);
+                    DypLog.i("PROFILE_LIST size=" + (list != null ? list.size() : -1) + " err=" + err);
                     if(list != null && !list.isEmpty()){
                         webDone = true;
                         try{
                             showProfileList(list);
                             switchTab(1); // 切到列表页签
                         }catch(Throwable t){
-                            Log.i("DYP", "SHOW_PROFILE_ERR " + t);
+                            DypLog.i("SHOW_PROFILE_ERR " + t);
                             s("列表渲染失败");
                         }
                     } else {
@@ -11258,7 +15767,7 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final YtParser.YtVideo v = YtParser.resolve(MainActivity.this, url);
-                Log.i("DYP", "YT_RESULT err=" + v.err + " ok=" + v.ok()
+                DypLog.i("YT_RESULT err=" + v.err + " ok=" + v.ok()
                         + " id=" + v.id + " items=" + v.items.size());
                 h.post(new Runnable(){ public void run(){
                     if(v.isPlaylist()){
@@ -11277,7 +15786,7 @@ webDone=false;
                             ytDirectAudio = "";
                         }
                         String r = render(v.toResultJson());
-                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                         o(r);
                         s("完成(YouTube)");
                         // 主页列表「下载」入口：解析成功后自动入下载队列
@@ -11322,14 +15831,14 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final InsParser.InsMedia v = InsParser.resolve(MainActivity.this, url, true);
-                Log.i("DYP", "INS_RESULT err=" + v.err + " ok=" + v.ok()
+                DypLog.i("INS_RESULT err=" + v.err + " ok=" + v.ok()
                         + " code=" + v.code + " kind=" + v.kind + " local=" + v.local
                         + " video=" + v.isVideo + " srvOn=" + srvOk);
                 h.post(new Runnable(){ public void run(){
                     if(v.ok()){
                         webDone = true;
                         String r = render(InsParser.toResultJson(v));
-                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                         o(r);
                         if(v.isVideo){
                             s("完成(IG 视频)" + (v.local ? " · 本地直连" : " · 服务器中转"));
@@ -11348,13 +15857,14 @@ webDone=false;
             }}).start();
             return;
         }
-        // X（Twitter）：纯 HTTP，fxtwitter + syndication 双源，不需要 WebView
-        if(XParser.isXUrl(url)){
+        // X（Twitter）：主页优先走 WebView（上面 isProfileUrl 已拦），
+        // 单推文继续走 fxtwitter + syndication 双源
+        if(XParser.isXUrl(url) && !isProfileUrl(url)){
             s("解析 X...");
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final XParser.XVideo v = XParser.resolve(MainActivity.this, url);
-                Log.i("DYP", "X_RESULT err=" + v.err + " ok=" + v.ok()
+                DypLog.i("X_RESULT err=" + v.err + " ok=" + v.ok()
                         + " id=" + v.id + " videos=" + v.videos.size() + " imgs=" + v.images.size());
                 h.post(new Runnable(){ public void run(){
                     if(v.ok()){
@@ -11362,7 +15872,7 @@ webDone=false;
                         xSrvUsable = v.serverUsable;
                         xSrvReason = v.serverReason;
                         String r = render(v.toResultJson());
-                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                         o(r);
                         if(v.hasVideo()){
                             if(v.videos.size() > 1)
@@ -11388,7 +15898,7 @@ webDone=false;
                                 if(r != null && r.length() > 0){
                                     webDone = true;
                                     String rj = render(r);
-                                    Log.i("DYP", "RESULT_BEGIN\n" + rj + "\nRESULT_END");
+                                    DypLog.i("RESULT_BEGIN\n" + rj + "\nRESULT_END");
                                     o(rj);
                                     s("完成(外链视频)");
                                 } else {
@@ -11410,13 +15920,13 @@ webDone=false;
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
                 final KsParser.KsVideo v = KsParser.resolve(MainActivity.this, url);
-                Log.i("DYP", "KS_RESULT err=" + v.err + " ok=" + v.ok()
+                DypLog.i("KS_RESULT err=" + v.err + " ok=" + v.ok()
                         + " id=" + v.photoId + " imgs=" + v.images.size());
                 h.post(new Runnable(){ public void run(){
                     if(v.ok()){
                         webDone = true;
                         String r = render(v.toResultJson());
-                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                         o(r);
                         if(v.isHeji){
                             // 合集分享：网页端只有被分享那一集，没有列表
@@ -11431,7 +15941,7 @@ webDone=false;
                         }
                     } else {
                         // 直连失败再退回 WebView 兜底
-                        Log.i("DYP", "KS_FALLBACK_WEBVIEW " + v.err);
+                        DypLog.i("KS_FALLBACK_WEBVIEW " + v.err);
                         // 主页短链：先试壳页列表解析（fw/user 页里带分享预览作品）
                         if(ProfileParser.isProfileUrl(url)
                                 || (url != null && url.contains("kuaishou.com"))){
@@ -11457,7 +15967,7 @@ webDone=false;
                             }
                             // 壳页也没列表：快手主页匿名拿不到完整作品列表（滑块验证码），
                             // 直接告知，不再进 WebView 死循环
-                            Log.i("DYP", "KS_PROFILE_EMPTY");
+                            DypLog.i("KS_PROFILE_EMPTY");
                             h.post(new Runnable(){ public void run(){
                                 webDone = true;
                                 s("快手主页解析失败：快手对匿名访问主页要求滑块验证，"
@@ -11495,19 +16005,22 @@ webDone=false;
             s("解析 TikTok...");
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
-                // ---- 第一层：服务器 ----
-                String srvR = parseTikTokByServer(url);
+                // ---- 第一层：服务器（串行，避免双份请求把代理链路堵死）----
+                String srvR = null;
+                try{ srvR = parseTikTokByServer(url); }catch(Throwable t){
+                    DypLog.i("TT_SRV_THROW " + t);
+                }
                 if(srvR != null){
-                    Log.i("DYP", "RESULT_BEGIN\n" + srvR + "\nRESULT_END");
+                    DypLog.i("RESULT_BEGIN\n" + srvR + "\nRESULT_END");
                     final String r = srvR;
                     h.post(new Runnable(){ public void run(){
                         o(r);
-                        s("完成(TikTok·加速)");
+                        s("完成(TikTok)");
                     }});
                     webDone = true;
                     return;
                 }
-                Log.i("DYP", "TT_SRV_MISS 回退本地");
+                DypLog.i("TT_SRV_MISS 回退本地");
                 // 明确告知走了本地路径：服务器不可达时也能用，只是 TikTok
                 // 的 CDN 需要代理才能直连（这是平台限制，不是服务器限制）。
                 if(effSrv().length() == 0){
@@ -11516,14 +16029,38 @@ webDone=false;
                 // ---- 第二层：本地直连（需代理） ----
                 TtParser.Session sess = new TtParser.Session();
                 final TtParser.TtVideo v = TtParser.resolve(MainActivity.this, url, sess);
-                Log.i("DYP", "TT_RESULT tpl=" + v.template + " err=" + v.err
+                DypLog.i("TT_RESULT tpl=" + v.template + " err=" + v.err
                         + " ok=" + v.ok() + " id=" + v.id + " imgs=" + v.images.size());
                 if(v.ok()) curSession = sess;
+                // 图集但没动轨 → 向服务器补一次（实况动轨只有服务器那侧拿得到）
+                if(v.ok() && !v.images.isEmpty() && !v.isLive){
+                    try{
+                        if(effSrv().length() > 0){
+                            DypLog.i("TT_LIVE_PATCH try imgs=" + v.images.size());
+                            java.util.List<String> live = ttFetchLiveFromServer(v.pageUrl);
+                            if(!live.isEmpty()){
+                                v.liveUrls.clear();
+                                boolean any = false;
+                                for(int i = 0; i < v.images.size(); i++){
+                                    String d = (i < live.size() && live.get(i) != null) ? live.get(i) : "";
+                                    v.liveUrls.add(d);
+                                    if(d.length() > 0) any = true;
+                                }
+                                v.isLive = any;
+                                DypLog.i("TT_LIVE_PATCH ok n=" + live.size() + " any=" + any);
+                            }else{
+                                DypLog.i("TT_LIVE_PATCH empty 按静态图集处理");
+                            }
+                        }else{
+                            DypLog.i("TT_LIVE_PATCH no-srv 跳过");
+                        }
+                    }catch(Throwable t){ DypLog.i("TT_LIVE_PATCH_ERR " + t); }
+                }
                 h.post(new Runnable(){ public void run(){
                     if(v.ok()){
                         webDone = true;
                         String r = buildTtResult(v);
-                        Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                        DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                         if(r != null){
                             o(r);
                             s("完成(TikTok·本地)");
@@ -11532,7 +16069,7 @@ webDone=false;
                         }
                     } else {
                         // 纯 HTTP 失败，退回 WebView（页面里的 inject 也能读到 hydration JSON）
-                        Log.i("DYP", "TT_FALLBACK_WEBVIEW " + v.err);
+                        DypLog.i("TT_FALLBACK_WEBVIEW " + v.err);
                         s("TikTok 直连失败，改用网页模式...");
                         setupWebView();
                         web.setVisibility(View.VISIBLE);
@@ -11560,25 +16097,25 @@ webDone=false;
                 try{
                     final String real = normalizeTikTokUrl(url);
                     if(real != null && real.indexOf("tiktok.com/@") >= 0 && real.indexOf("/video/") > 0){
-                        Log.i("DYP", "TT_SHORT_TO_FULL " + real);
+                        DypLog.i("TT_SHORT_TO_FULL " + real);
                         h.post(new Runnable(){ public void run(){
                             try{
                                 if(webDone || mixMode) return;
                                 // 直接把 WebView 换成完整链接，同时同步 curUrl 供重试使用
                                 curUrl = real;
-                                Log.i("DYP", "TT_LOAD_FULL " + real);
+                                DypLog.i("TT_LOAD_FULL " + real);
                                 web.loadUrl(real);
                             }catch(Throwable t){}
                         }});
                     }
-                }catch(Throwable t){ Log.i("DYP", "TT_SHORT_ERR " + t); }
+                }catch(Throwable t){ DypLog.i("TT_SHORT_ERR " + t); }
             }}).start();
         } else if(isShort){
             new Thread(new Runnable(){ public void run(){
                 try{
                     final String real = resolveShortUrl(MainActivity.this, url);
                     if(real != null && real.length() > 0 && real.indexOf("iesdouyin.com") >= 0){
-                        Log.i("DYP", "SHORT_RESOLVED " + real.substring(0, Math.min(160, real.length())));
+                        DypLog.i("SHORT_RESOLVED " + real.substring(0, Math.min(160, real.length())));
                         // 先试签名 detail 接口（实况动轨只在这里下发）
                         final String awemeId = DyDetail.extractAwemeId(real);
                         if(awemeId.length() > 0){
@@ -11589,13 +16126,13 @@ webDone=false;
                                 if(webDone || mixMode) return;
                                 String cur = web.getUrl();
                                 if(cur != null && cur.indexOf("v.douyin.com") >= 0){
-                                    Log.i("DYP", "SHORT_REDIRECT load real");
+                                    DypLog.i("SHORT_REDIRECT load real");
                                     web.loadUrl(real);
                                 }
                             }catch(Throwable t){}
                         }}, 2500);
                     }
-                }catch(Throwable t){ Log.i("DYP", "SHORT_ERR " + t); }
+                }catch(Throwable t){ DypLog.i("SHORT_ERR " + t); }
             }}).start();
         }
     }
@@ -11688,7 +16225,7 @@ webDone=false;
                     int dot = tplv.lastIndexOf('.');
                     if(dot > colon) ext = tplv.substring(dot);        // 保留原扩展名
                     String nu = head + fam + ext + tail;
-                    Log.i("DYP", "IMG_TPL " + tplv + " -> " + fam + ext);
+                    DypLog.i("IMG_TPL " + tplv + " -> " + fam + ext);
                     return nu;
                 }
             }
@@ -11727,10 +16264,10 @@ webDone=false;
                     gs(get(em, "u"))
                 });
             }
-            Log.i("DYP", "GEARS_PARSED n=" + curGears.size()
+            DypLog.i("GEARS_PARSED n=" + curGears.size()
                 + (curGears.size() > 0 ? " best=" + gearLabel(0) : ""));
         }catch(Throwable t){
-            Log.i("DYP", "GEARS_PARSE_ERR " + t);
+            DypLog.i("GEARS_PARSE_ERR " + t);
         }
     }
 
@@ -11817,7 +16354,7 @@ webDone=false;
                         fk.append(k).append('=').append(String.valueOf(vv).length() > 40 ? "LONG" : vv).append(',');
                     }
                 }
-                Log.i("DYP", "GEAR_KEYS " + fk);
+                DypLog.i("GEAR_KEYS " + fk);
             }
             java.util.List<String> rows = new java.util.ArrayList<String>();
             java.util.List<long[]> keys = new java.util.ArrayList<long[]>();
@@ -11890,10 +16427,10 @@ webDone=false;
                 if(i > 0) dbg.append(" | ");
                 dbg.append(i).append(':').append(shortGear(rows.get(idx[i])));
             }
-            Log.i("DYP", "GEARS_N=" + rows.size() + " -> " + dbg);
+            DypLog.i("GEARS_N=" + rows.size() + " -> " + dbg);
             return res;
         }catch(Throwable t){
-            Log.i("DYP", "GEARS_ERR " + t);
+            DypLog.i("GEARS_ERR " + t);
             return "";
         }
     }
@@ -11925,7 +16462,7 @@ webDone=false;
                 String gears = buildGearsJson(vd);
                 if(gears.length() > 0){
                     b.append("\"i_gears\":").append(gears).append(",");
-                    Log.i("DYP", "DETAIL_GEARS " + gears.length() + " bytes");
+                    DypLog.i("DETAIL_GEARS " + gears.length() + " bytes");
                 }
                 Object dur = get(vd, "duration");
                 putQ(b, "i_dur", dur == null ? "" : String.valueOf(dur));
@@ -11986,7 +16523,7 @@ webDone=false;
                     }
                     dynS.append(lv);
                 }
-                Log.i("DYP", "DETAIL_IMGS n=" + seq + " live=" + hasLive);
+                DypLog.i("DETAIL_IMGS n=" + seq + " live=" + hasLive);
             }
             putQ(b, "i_imgs", imgS.toString());
             putQ(b, "i_dyn", dynS.toString());
@@ -12015,7 +16552,7 @@ webDone=false;
             b.append("\"i_ok\":1}");
             return b.toString();
         }catch(Throwable t){
-            Log.i("DYP", "DETAIL2RESULT_ERR " + t);
+            DypLog.i("DETAIL2RESULT_ERR " + t);
             return null;
         }
     }
@@ -12056,10 +16593,10 @@ webDone=false;
             s("首次解析：正在后台准备实况图凭据（约 5-10 秒）…");
             autoFetchDyUifid(new Runnable(){ public void run(){
                 if(dyHasUifid()){
-                    Log.i("DYP", "DY_AUTO_READY 本次解析可直接用本地签名");
+                    DypLog.i("DY_AUTO_READY 本次解析可直接用本地签名");
                     s("凭据就绪，实况图可本地解析");
                 } else {
-                    Log.i("DYP", "DY_AUTO_MISS 本次仍走服务器/静态图");
+                    DypLog.i("DY_AUTO_MISS 本次仍走服务器/静态图");
                 }
             }});
         }
@@ -12077,7 +16614,7 @@ webDone=false;
                 String tw0 = DyDetail.registerTtwid();
                 if(tw0.length() > 0) ck0 = ck0 + "; " + tw0;
                 r = DyDetail.fetch(awemeId, ck0, 2);
-                Log.i("DYP", "DYDETAIL local-first " + r);
+                DypLog.i("DYDETAIL local-first " + r);
                 if(!r.ok) r = null;   // 本地失败再走服务器兜底
             }
             // ---- 路径 1：自建服务器中转 ----
@@ -12091,7 +16628,7 @@ webDone=false;
                        && js.indexOf("\"aweme_detail\":null") < 0) break;
                     if(js != null && js.indexOf("story_25_filter") >= 0) break;
                     if(attempt < 2){
-                        Log.i("DYP", "DYDETAIL srv retry " + (attempt + 1));
+                        DypLog.i("DYDETAIL srv retry " + (attempt + 1));
                         try{ Thread.sleep(700 + attempt * 500); }catch(Throwable t){}
                     }
                 }
@@ -12117,9 +16654,9 @@ webDone=false;
                     r = new DyDetail.Result();
                     r.ok = true;
                     r.body = js;
-                    Log.i("DYP", "DYDETAIL srv ok len=" + js.length());
+                    DypLog.i("DYDETAIL srv ok len=" + js.length());
                 } else {
-                    Log.i("DYP", "DYDETAIL srv fail, fallback local");
+                    DypLog.i("DYDETAIL srv fail, fallback local");
                 }
             }
             // ---- 路径 2：本地签名（用户自填 UIFID_TEMP） ----
@@ -12133,7 +16670,7 @@ webDone=false;
                 String tw = DyDetail.registerTtwid();
                 if(tw.length() > 0) ck = ck.length() > 0 ? ck + "; " + tw : tw;
                 r = DyDetail.fetch(awemeId, ck, 2);
-                Log.i("DYP", "DYDETAIL local " + r);
+                DypLog.i("DYDETAIL local " + r);
             }
             if(r == null || !r.ok) return;
             // detail 返回的 aweme_detail 转成 render 消息
@@ -12147,8 +16684,8 @@ webDone=false;
                 if(out != null && out.length() > 0 && out.indexOf("解析失败") < 0){
                     webDone = true;
                     detailRendered = true;      // 标记：后续 SSR 回包一律忽略
-                    Log.i("DYP", "DETAIL_RENDERED ok");
-                    Log.i("DYP", "RESULT_BEGIN\n" + out + "\nRESULT_END");
+                    DypLog.i("DETAIL_RENDERED ok");
+                    DypLog.i("RESULT_BEGIN\n" + out + "\nRESULT_END");
                     o(out);
                     s("完成(detail)");
                 }
@@ -12179,7 +16716,7 @@ webDone=false;
                     return c.getURL().toString();
                 }
             }
-        }catch(Throwable t){ Log.i("DYP", "SHORT_RESOLVE_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("SHORT_RESOLVE_ERR " + t); }
         return null;
     }
 
@@ -12190,7 +16727,7 @@ webDone=false;
         }catch(java.net.UnknownHostException e){
             String ip = ipv4Host(new URL(url).getHost());
             if(ip == null) throw e;
-            Log.i("DYP", "IPV4_FALLBACK_STATIC " + url.substring(0, Math.min(70, url.length())));
+            DypLog.i("IPV4_FALLBACK_STATIC " + url.substring(0, Math.min(70, url.length())));
             URL u3 = new URL(forceIPv4(url));
             Proxy px = staticProxyFor(ctx, url);
             return (HttpURLConnection)(px != null ? u3.openConnection(px) : u3.openConnection());
@@ -12200,6 +16737,207 @@ webDone=false;
     /** 按域名选 Referer；返回空字符串表示不发 Referer。
      *  实测：baidu 图床（f7.baidu.com / vd3.bdstatic.com）带 douyin Referer 会 403，
      *  无 Referer 或 baidu 系 Referer 才 200；微博图床反而需要 weibo 系。*/
+    // ===== 缩略图：内存 LRU -> 磁盘缓存 -> 网络 =====
+    final android.util.LruCache<String, android.graphics.Bitmap> thumbCache =
+            new android.util.LruCache<String, android.graphics.Bitmap>(96){
+                @Override protected int sizeOf(String k, android.graphics.Bitmap b){
+                    return b == null ? 1 : Math.max(1, b.getByteCount() / 1024);
+                }
+            };
+
+    /** 按类型给个占位图标 */
+    String thumbPlaceholder(String kind){
+        if("图片".equals(kind)) return "🖼";
+        if("音频".equals(kind)) return "🎵";
+        if("动图".equals(kind)) return "🎞";
+        if("合集".equals(kind)) return "📚";
+        return "🎬";
+    }
+
+    /** 等比解码（长边不超过 maxPx*2，先 inSampleSize 降采样） */
+    android.graphics.Bitmap decodeScaled(String path, int maxPx){
+        try{
+            android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(path, o);
+            int sample = 1;
+            int longSide = Math.max(o.outWidth, o.outHeight);
+            while(longSide / sample > maxPx * 2) sample *= 2;
+            o.inJustDecodeBounds = false;
+            o.inSampleSize = sample;
+            return android.graphics.BitmapFactory.decodeFile(path, o);
+        }catch(Throwable t){ return null; }
+    }
+
+    /** 视频抽首帧 */
+    android.graphics.Bitmap videoFirstFrame(String path, int maxPx){
+        android.media.MediaMetadataRetriever r = null;
+        try{
+            r = new android.media.MediaMetadataRetriever();
+            r.setDataSource(path);
+            android.graphics.Bitmap b =
+                    r.getFrameAtTime(1000 * 1000, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if(b == null) b = r.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if(b == null) return null;
+            int longSide = Math.max(b.getWidth(), b.getHeight());
+            if(longSide > maxPx){
+                float sc = (float) maxPx / longSide;
+                android.graphics.Bitmap s = android.graphics.Bitmap.createScaledBitmap(
+                        b, Math.max(1, (int)(b.getWidth() * sc)), Math.max(1, (int)(b.getHeight() * sc)), true);
+                if(s != b) b.recycle();
+                return s;
+            }
+            return b;
+        }catch(Throwable t){ return null; }
+        finally{
+            try{ if(r != null) r.release(); }catch(Throwable t){}
+        }
+    }
+
+    /** 本地文件缩略图（视频抽帧 / 图片降采样） */
+    void loadThumb(final android.widget.ImageView iv, final java.io.File f,
+                   final int sizePx, final String kind){
+        if(iv == null || f == null || !f.exists()) return;
+        final String key = "f:" + f.getAbsolutePath() + ":" + sizePx;
+        android.graphics.Bitmap c = thumbCache.get(key);
+        if(c != null){ iv.setImageBitmap(c); return; }
+        new Thread(new Runnable(){ public void run(){
+            android.graphics.Bitmap b = null;
+            try{
+                String nm = f.getName().toLowerCase();
+                if(nm.endsWith(".mp4") || nm.endsWith(".mkv") || nm.endsWith(".mov")
+                        || nm.endsWith(".webm")){
+                    b = videoFirstFrame(f.getAbsolutePath(), sizePx);
+                }else{
+                    b = decodeScaled(f.getAbsolutePath(), sizePx);
+                }
+            }catch(Throwable t){}
+            if(b == null) return;
+            thumbCache.put(key, b);
+            final android.graphics.Bitmap fb = b;
+            h.post(new Runnable(){ public void run(){ iv.setImageBitmap(fb); }});
+        }}).start();
+    }
+
+    /** 网络缩略图：内存 -> 磁盘 cache/thumbs -> 下载 */
+    void loadNetThumb(final android.widget.ImageView iv, final String url, final int sizePx){
+        if(iv == null || url == null || url.length() < 8) return;
+        if(!url.startsWith("http")) return;
+        android.graphics.Bitmap c = thumbCache.get(url);
+        if(c != null){ iv.setImageBitmap(c); return; }
+        new Thread(new Runnable(){ public void run(){
+            try{
+                // 磁盘缓存
+                java.io.File dir = new java.io.File(getCacheDir(), "thumbs");
+                if(!dir.exists()) dir.mkdirs();
+                String hname = Integer.toHexString(url.hashCode()) + ".jpg";
+                java.io.File cf = new java.io.File(dir, hname);
+                android.graphics.Bitmap b = null;
+                if(cf.exists() && cf.length() > 1024){
+                    b = decodeScaled(cf.getAbsolutePath(), sizePx);
+                }
+                if(b == null){
+                    byte[] data = httpGetBytes(url);
+                    if(data == null || data.length < 1024){
+                        DypLog.i("NET_THUMB_ERR len=" + (data == null ? -1 : data.length)
+                                + " " + url.substring(0, Math.min(70, url.length())));
+                        return;
+                    }
+                    // 原图落盘（保留原样，解码时再降采样）
+                    try{
+                        java.io.FileOutputStream fo = new java.io.FileOutputStream(cf);
+                        fo.write(data);
+                        fo.close();
+                    }catch(Throwable t){}
+                    b = decodeScaled(cf.getAbsolutePath(), sizePx);
+                    if(b == null){
+                        // 磁盘解码失败时直接用内存流
+                        android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+                        o.inSampleSize = 2;
+                        b = android.graphics.BitmapFactory.decodeByteArray(data, 0, data.length, o);
+                    }
+                }
+                if(b == null) return;
+                thumbCache.put(url, b);
+                final android.graphics.Bitmap fb = b;
+                h.post(new Runnable(){ public void run(){ iv.setImageBitmap(fb); }});
+            }catch(Throwable t){
+                DypLog.i("NET_THUMB_ERR " + t);
+            }
+        }}).start();
+    }
+
+    /** 按链接/ID 推断平台缩略图（列表里没拿到 cover 时的兜底） */
+    static String guessCover(String url, String id){
+        if(url == null) return "";
+        String u = url.toLowerCase();
+        try{
+            // YouTube
+            if(u.contains("youtube.com/watch") || u.contains("youtu.be/")){
+                String vid = id;
+                if(vid == null || vid.length() == 0){
+                    int p = u.indexOf("v=");
+                    if(p > 0){
+                        vid = url.substring(p + 2);
+                        int amp = vid.indexOf('&');
+                        if(amp > 0) vid = vid.substring(0, amp);
+                    }else{
+                        int sl = u.lastIndexOf('/');
+                        if(sl > 0) vid = url.substring(sl + 1);
+                    }
+                }
+                if(vid != null && vid.length() > 0)
+                    return "https://i.ytimg.com/vi/" + vid + "/mqdefault.jpg";
+            }
+            // B 站
+            if(u.contains("bilibili.com/video/")){
+                String bv = id;
+                if(bv == null || bv.length() == 0){
+                    int sl = u.lastIndexOf("/");
+                    if(sl > 0){
+                        bv = url.substring(sl + 1);
+                        int q = bv.indexOf('?');
+                        if(q > 0) bv = bv.substring(0, q);
+                    }
+                }
+                if(bv != null && bv.length() > 0)
+                    return "https://i0.hdslb.com/bfs/archive/" + bv + ".jpg";
+            }
+            // Instagram
+            if(u.contains("instagram.com/p/")){
+                String code2 = id;
+                if(code2 == null || code2.length() == 0){
+                    String rest = url.substring(u.indexOf("/p/") + 3);
+                    int sl = rest.indexOf('/');
+                    code2 = sl > 0 ? rest.substring(0, sl) : rest;
+                }
+                if(code2 != null && code2.length() > 0)
+                    return "https://www.instagram.com/p/" + code2 + "/media/?size=m";
+            }
+            // X / 推特：pbs.twimg.com 需要视频缩略图 id，拿不到就不给（避免 404 刷屏）
+        }catch(Throwable t){}
+        return "";
+    }
+
+    /** 带圆角的缩略图 ImageView */
+    android.widget.ImageView makeThumbView(int sizePx){
+        final android.widget.ImageView iv = new android.widget.ImageView(this);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(sizePx), dp(sizePx));
+        lp.rightMargin = dp(10);
+        iv.setLayoutParams(lp);
+        iv.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
+        iv.setBackgroundColor(curDark ? 0xFF22252C : 0xFFEDEFF3);
+        try{
+            iv.setClipToOutline(true);
+            iv.setOutlineProvider(new android.view.ViewOutlineProvider(){
+                @Override public void getOutline(android.view.View v, android.graphics.Outline o){
+                    o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), dp(6));
+                }
+            });
+        }catch(Throwable t){}
+        return iv;
+    }
+
     String refererFor(String url){
         if(url == null) return "";
         String u = url.toLowerCase();
@@ -12264,7 +17002,7 @@ webDone=false;
             if(TtParser.isTtUrl(url) && curSession != null){
                 c = TtParser.openDownload(MainActivity.this, url, curSession);
                 if(c == null){
-                    Log.i("DYP", "TT_DL_ALL_FAIL " + url.substring(0, Math.min(80, url.length())));
+                    DypLog.i("TT_DL_ALL_FAIL " + url.substring(0, Math.min(80, url.length())));
                     if(cb != null) cb.onError(new Exception("TikTok CDN 拒绝（代理/直连都不通）"));
                     return null;
                 }
@@ -12308,7 +17046,7 @@ webDone=false;
             if(cb != null) cb.onProgress(got, ftotal > 0 ? ftotal : got);
             return bo.toByteArray();
         }catch(Exception e){
-            Log.i("DYP","imgErr "+e);
+            DypLog.i("imgErr "+e);
             if(cb != null) cb.onError(e);
             return null;
         }finally{
@@ -12408,11 +17146,11 @@ webDone=false;
                 try{
                     // 等 videoBox 从 GONE→VISIBLE 完成一帧 layout，TextureView 才有尺寸
                     videoBox.post(new Runnable(){ public void run(){
-                        try{ doPlayInner(); }catch(Throwable t){ Log.i("DYP", "MINI_INIT_ERR " + t); }
+                        try{ doPlayInner(); }catch(Throwable t){ DypLog.i("MINI_INIT_ERR " + t); }
                     }});
-                }catch(Throwable t){ Log.i("DYP", "MINI_POST_ERR " + t); }
+                }catch(Throwable t){ DypLog.i("MINI_POST_ERR " + t); }
             }});
-        }catch(Throwable t){ Log.i("DYP", "MINI_INIT_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("MINI_INIT_ERR " + t); }
     }
 
     void doPlayInner(){
@@ -12442,18 +17180,29 @@ boolean ttUrl = isTikTokUrl(curPlay);
                         .setDefaultRequestProperties(new HashMap<String,String>(){{ put("Referer", ref); }})
                         .setAllowCrossProtocolRedirects(true);
                 // 代理：本地文件不套；服务器中转强制直连；其余按设置
-                final boolean isLocalFile = curPlay != null && curPlay.startsWith("file://");
+                // 注意：/sdcard 或 /storage 开头的绝对路径也算本地文件
+                // （之前只认 file://，导致直接传绝对路径时走 HTTP 源 → 本地文件播不出来）
+                final boolean isLocalFile = curPlay != null
+                        && (curPlay.startsWith("file://")
+                            || curPlay.startsWith("/sdcard")
+                            || curPlay.startsWith("/storage")
+                            || curPlay.startsWith("/data"));
                 final Proxy pxPlay = isLocalFile ? null
                     : ((curPlay != null && (curPlay.indexOf("/api/x/dl") >= 0
                         || curPlay.indexOf("/api/yt/file") >= 0
                         || curPlay.indexOf("/api/yt/stream") >= 0
                         || curPlay.indexOf("/api/tt/dl") >= 0))
                     ? null : curProxyFor(curPlay));
-                Log.i("DYP", "MINI_DS tt=" + ttUrl + " proxy=" + (pxPlay != null) + " local=" + isLocalFile);
+                DypLog.i("MINI_DS tt=" + ttUrl + " proxy=" + (pxPlay != null) + " local=" + isLocalFile);
                 androidx.media3.datasource.DataSource.Factory f;
                 if(isLocalFile){
-                    // 本地文件：DefaultDataSource 自动选 FileDataSource
+                    // 本地文件：DefaultDataSource 自动选 FileDataSource（不套代理）
                     f = new androidx.media3.datasource.DefaultDataSource.Factory(this, http);
+                    // 绝对路径必须补 file:// 前缀，否则 ExoPlayer 当相对 uri 解析失败
+                    if(curPlay != null && !curPlay.startsWith("file://")){
+                        curPlay = "file://" + curPlay;
+                        DypLog.i("MINI_LOCAL_FIX " + curPlay);
+                    }
                 } else {
                     f = http;
                 }
@@ -12461,7 +17210,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     final java.net.Proxy pxFinal = pxPlay;
                     final String refFinal = ref;
                     final String ckFinal = ttUrl && curSession != null ? curSession.cookieHeader() : null;
-                    Log.i("DYP", "MINI_DS_COOKIE len=" + (ckFinal == null ? -1 : ckFinal.length()));
+                    DypLog.i("MINI_DS_COOKIE len=" + (ckFinal == null ? -1 : ckFinal.length()));
                     f = new androidx.media3.datasource.DataSource.Factory(){
                         public androidx.media3.datasource.DataSource createDataSource(){
                             return new ProxyHttpDataSource(pxFinal, MUA, refFinal, ckFinal);
@@ -12469,20 +17218,20 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     };
                 } else if(ttUrl && curSession != null){
                     final String ckFinal = curSession.cookieHeader();
-                    Log.i("DYP", "MINI_DS_COOKIE(direct) len=" + ckFinal.length());
+                    DypLog.i("MINI_DS_COOKIE(direct) len=" + ckFinal.length());
                     final String refFinal = ref;
                     f = new androidx.media3.datasource.DataSource.Factory(){
                         public androidx.media3.datasource.DataSource createDataSource(){
-                            return new ProxyHttpDataSource(java.net.Proxy.NO_PROXY, MUA, refFinal, ckFinal);
+                            return new ProxyHttpDataSource((java.net.Proxy) null, MUA, refFinal, ckFinal);
                         }
                     };
                 }
                 // B 站 CDN：必须桌面 UA（手机 UA 一律 403）+ Referer + buvid3
                 if(biliUrl && pxPlay == null){
-                    final java.net.Proxy pxB = java.net.Proxy.NO_PROXY;
+                    final java.net.Proxy pxB = null;
                     final String refB = "https://www.bilibili.com/";
                     final String ckB = BiliParser.biliCookie();
-                    Log.i("DYP", "MINI_BILI_CK len=" + ckB.length());
+                    DypLog.i("MINI_BILI_CK len=" + ckB.length());
                     f = new androidx.media3.datasource.DataSource.Factory(){
                         public androidx.media3.datasource.DataSource createDataSource(){
                             return new ProxyHttpDataSource(pxB, BiliParser.UA_DESKTOP, refB, ckB);
@@ -12510,7 +17259,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                             long d = miniPlayer.getDuration();
                             if(d > 0) miniTimeAll.setText(fmt(d));
                             miniPlay.setText("\u23f8");
-                            Log.i("DYP", "MINI_READY dur=" + d);
+                            DypLog.i("MINI_READY dur=" + d);
                          } else if(state == androidx.media3.common.Player.STATE_BUFFERING){
                               // 缓冲中：X/YouTube 走服务器中转，回源大视频可能要 1-2 分钟
                               String tip = "缓冲中";
@@ -12525,11 +17274,11 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     }
                     @Override public void onVideoSizeChanged(androidx.media3.common.VideoSize vs){
                         miniVideoW = vs.width; miniVideoH = vs.height;
-                        Log.i("DYP", "MINI_VIDEO " + miniVideoW + "x" + miniVideoH);
+                        DypLog.i("MINI_VIDEO " + miniVideoW + "x" + miniVideoH);
                         applyMiniScale();
                     }
                     @Override public void onPlayerError(androidx.media3.common.PlaybackException e){
-                        Log.i("DYP", "MINI_ERR " + e.getErrorCodeName());
+                        DypLog.i("MINI_ERR " + e.getErrorCodeName());
                         // YouTube direct 直连失败（403 绑 IP）：自动回退服务器流式中转
                         if(YtParser.isYtUrl(curUrl) && !ytSrvFallbackDone
                                 && (curPlay == null || curPlay.contains("googlevideo.com") || curPlay.contains("videoplayback"))){
@@ -12545,7 +17294,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                 final YtParser.YtVideo v = YtParser.resolveServer(MainActivity.this, fbUrl, false);
                                 h.post(new Runnable(){ public void run(){
                                     if(v.ok() && v.videoUrl.length() > 0){
-                                        Log.i("DYP", "YT_SRV_FALLBACK url=" + v.videoUrl.substring(0, Math.min(60, v.videoUrl.length())));
+                                        DypLog.i("YT_SRV_FALLBACK url=" + v.videoUrl.substring(0, Math.min(60, v.videoUrl.length())));
                                         curPlay = v.videoUrl;
                                         curAudio = "";
                                         miniProxyKey = null;
@@ -12566,7 +17315,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                             int next = curGearIdx + 1;
                             String nu = gearUrl(next);
                             if(nu.length() > 0){
-                                Log.i("DYP", "GEAR_DOWN " + gearLabel(curGearIdx) + " -> " + gearLabel(next)
+                                DypLog.i("GEAR_DOWN " + gearLabel(curGearIdx) + " -> " + gearLabel(next)
                                     + " err=" + e.getErrorCodeName());
                                 curGearIdx = next;
                                 playFallbackDone = true;
@@ -12588,7 +17337,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                             playFallbackDone = true;
                             final String fb = curFallbackPlay;
                             final String fbAlt = curVidUri.length() > 0 ? playUrl(curVidUri, "1080p") : "";
-                            Log.i("DYP", "PLAY_FALLBACK 4K 失败降 1080p err=" + e.getErrorCodeName());
+                            DypLog.i("PLAY_FALLBACK 4K 失败降 1080p err=" + e.getErrorCodeName());
                             h.post(new Runnable(){ public void run(){
                                 s("播放源不支持，已自动切到 1080p");
                             }});
@@ -12613,7 +17362,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                 final String srvUrl = BiliParser.biliProxyUrl(MainActivity.this, fbCdn, fbKey, "");
                                 h.post(new Runnable(){ public void run(){
                                     if(srvUrl != null && srvUrl.length() > 0 && !srvUrl.equals(fbCdn)){
-                                        Log.i("DYP", "BILI_SRV_FALLBACK " + srvUrl.substring(0, Math.min(70, srvUrl.length())));
+                                        DypLog.i("BILI_SRV_FALLBACK " + srvUrl.substring(0, Math.min(70, srvUrl.length())));
                                         curPlay = srvUrl;
                                         miniProxyKey = null;
                                         try{ if(miniPlayer != null){ miniPlayer.release(); miniPlayer = null; } }catch(Throwable t){}
@@ -12645,7 +17394,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                 final XParser.XVideo v = XParser.resolveServerOnly(MainActivity.this, fbUrl);
                                 h.post(new Runnable(){ public void run(){
                                     if(v.ok() && v.hasVideo()){
-                                        Log.i("DYP", "X_SRV_FALLBACK render");
+                                        DypLog.i("X_SRV_FALLBACK render");
                                         curPlay = v.firstVideo();
                                         // 服务器中转地址：不走用户代理（走代理可能同样不通）
                                         miniProxyKey = null;
@@ -12666,27 +17415,27 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 // 二次解析后 TextureView 被 GONE→VISIBLE，surface 可能失效，从当前 SurfaceTexture 重建
                 try{
                     android.graphics.SurfaceTexture st = video.getSurfaceTexture();
-                    Log.i("DYP", "MINI_SURFACE_CHK st=" + (st != null) + " tvW=" + video.getWidth() + " tvH=" + video.getHeight()
+                    DypLog.i("MINI_SURFACE_CHK st=" + (st != null) + " tvW=" + video.getWidth() + " tvH=" + video.getHeight()
                             + " vis=" + (video.getVisibility() == View.VISIBLE));
                     if(st != null){
                         if(videoSurface != null){ try{ videoSurface.release(); }catch(Throwable t){} }
                         videoSurface = new android.view.Surface(st);
-                        Log.i("DYP", "MINI_SURFACE_REBUILT valid=" + videoSurface.isValid());
+                        DypLog.i("MINI_SURFACE_REBUILT valid=" + videoSurface.isValid());
                     } else {
                         // SurfaceTexture 还没创建（layout 未完成）：等 listener 补绑
-                        Log.i("DYP", "MINI_SURFACE_WAIT_LISTENER");
+                        DypLog.i("MINI_SURFACE_WAIT_LISTENER");
                     }
-                }catch(Throwable t){ Log.i("DYP", "MINI_SURFACE_ERR " + t); }
+                }catch(Throwable t){ DypLog.i("MINI_SURFACE_ERR " + t); }
             }
             if(videoSurface != null){
                 miniPlayer.setVideoSurface(videoSurface);
-                Log.i("DYP", "MINI_SET_SURFACE valid=" + videoSurface.isValid());
+                DypLog.i("MINI_SET_SURFACE valid=" + videoSurface.isValid());
             } else {
-                Log.i("DYP", "MINI_NO_SURFACE");
+                DypLog.i("MINI_NO_SURFACE");
             }
             if(curAudio != null && curAudio.length() > 0 && curAudio.startsWith("http")){
                 // YouTube direct：视频轨 + 音频轨双 URL，用 MergingMediaSource 合并播放
-                Log.i("DYP", "MINI_MERGE audio=" + curAudio.substring(0, Math.min(60, curAudio.length())));
+                DypLog.i("MINI_MERGE audio=" + curAudio.substring(0, Math.min(60, curAudio.length())));
                 String base = curPlay;
                 androidx.media3.datasource.DataSource.Factory baseF = dsf[0];
                 if(baseF == null){
@@ -12714,7 +17463,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             miniPlayer.setPlayWhenReady(true);
             s("\u64ad\u653e\u4e2d...");
             startMiniProgress();
-        }catch(Throwable t){ Log.i("DYP", "MINI_INIT_ERR " + t); }
+        }catch(Throwable t){ DypLog.i("MINI_INIT_ERR " + t); }
     }
 
     /** 小窗初始化：TextureView + 手势 + 控制条 */
@@ -12842,7 +17591,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             if(miniPlayer != null && miniPlayer.isPlaying()){
                 miniPlayer.pause();
                 if(miniPlay != null) miniPlay.setText("\u25b6");
-                Log.i("DYP", "MINI_AUTO_PAUSE onPause");
+                DypLog.i("MINI_AUTO_PAUSE onPause");
             }
         }catch(Throwable t){}
         try{ if(web != null) web.onPause(); }catch(Throwable t){}
@@ -12865,7 +17614,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                             && !AppInfo.storagePermBlocked(MainActivity.this)
                             && !permAskedThisLaunch){
                         permAskedThisLaunch = true;
-                        Log.i("DYP", "PERM_AUTO_REQUEST API=" + android.os.Build.VERSION.SDK_INT);
+                        DypLog.i("PERM_AUTO_REQUEST API=" + android.os.Build.VERSION.SDK_INT);
                         ensureStoragePerm();
                     }
                 }catch(Throwable t){}
@@ -12884,7 +17633,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     if(PowerHelper.isIgnoringBattery(MainActivity.this)) return;   // 已放行，不用提
                     getSharedPreferences(SP, MODE_PRIVATE).edit()
                             .putBoolean("bg_tip_asked", true).apply();
-                    Log.i("DYP", "BG_TIP_SHOW API=" + android.os.Build.VERSION.SDK_INT);
+                    DypLog.i("BG_TIP_SHOW API=" + android.os.Build.VERSION.SDK_INT);
                     dypDlg()
                         .setTitle("让下载在后台不中断")
                         .setMessage("手机的省电策略会在后台限制本应用，"
@@ -13013,7 +17762,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
         try{
             if(miniPlayer != null){
                 miniPlayer.setPlaybackParameters(new androidx.media3.common.PlaybackParameters(sp, 1.0f));
-                Log.i("DYP", "MINI_SPEED " + sp);
+                DypLog.i("MINI_SPEED " + sp);
             }
         }catch(Throwable t){}
     }
@@ -13076,7 +17825,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             int boxH = (int)(vh);
             android.view.ViewGroup.LayoutParams lp = video.getLayoutParams();
             if(lp.height != boxH){ lp.height = boxH; video.setLayoutParams(lp); }
-            Log.i("DYP", "MINI_SCALE " + vw + "x" + vh + " -> " + (int)dispW + "x" + (int)dispH);
+            DypLog.i("MINI_SCALE " + vw + "x" + vh + " -> " + (int)dispW + "x" + (int)dispH);
         }catch(Throwable t){}
     }
 
@@ -13143,7 +17892,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             it.putExtra("desc", d);
             it.putExtra("ref", KsParser.isKsUrl(curPlay) ? "https://www.kuaishou.com/" : null);
             startActivity(it);
-        }catch(Exception e){ Log.i("DYP","openPlayerErr "+e); s("\u64ad\u653e\u5668\u542f\u52a8\u5931\u8d25"); }
+        }catch(Exception e){ DypLog.i("openPlayerErr "+e); s("\u64ad\u653e\u5668\u542f\u52a8\u5931\u8d25"); }
     }
     void exitFull(){}
     void doFullscreen(){ openPlayer(); }
@@ -13249,7 +17998,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     if(cnt == 0){ s("未选择任何视频"); return; }
                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
                     s("已加入下载：" + cnt + " 个视频");
-                    Log.i("DYP", "XV_QUEUE n=" + cnt + " total=" + n);
+                    DypLog.i("XV_QUEUE n=" + cnt + " total=" + n);
                 }
             })
             .setNeutralButton("全选下载", new android.content.DialogInterface.OnClickListener(){
@@ -13257,7 +18006,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     for(int i = 0; i < n; i++) downloadXVideo(i);
                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
                     s("已加入下载：" + n + " 个视频");
-                    Log.i("DYP", "XV_QUEUE all n=" + n);
+                    DypLog.i("XV_QUEUE all n=" + n);
                 }
             })
             .setNegativeButton("取消", null)
@@ -13298,10 +18047,10 @@ boolean ttUrl = isTikTokUrl(curPlay);
         o(sb.toString());
         h.postDelayed(new Runnable(){ public void run(){
             if(ytPlaylist.isEmpty()){
-                Log.i("DYP", "YT_AUTO_PARSE_FIRST skip: playlist empty");
+                DypLog.i("YT_AUTO_PARSE_FIRST skip: playlist empty");
                 return;
             }
-            Log.i("DYP", "YT_AUTO_PARSE_FIRST n=" + ytPlaylist.size());
+            DypLog.i("YT_AUTO_PARSE_FIRST n=" + ytPlaylist.size());
             parseYtItem(0);
         }}, 1500);
     }
@@ -13319,7 +18068,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 if(v.ok()){
                     webDone = true;
                     String r = render(v.toResultJson());
-                    Log.i("DYP", "RESULT_BEGIN\n" + r + "\nRESULT_END");
+                    DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
                     o(r);
                     s("完成(YouTube) 第 " + (idx + 1) + "/" + ytPlaylist.size() + " 集 · 左右滑动切换");
                 } else {
@@ -13331,6 +18080,17 @@ boolean ttUrl = isTikTokUrl(curPlay);
     }
 
     /** 是否主页链接（转发给 ProfileParser 判断） */
+    /** 从 X 主页链接里抠用户名（x.com/xxx、twitter.com/xxx，去 query/@） */
+    static String xScreenName(String url){
+        if(url == null) return "";
+        try{
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?:x|twitter)\\.com/([A-Za-z0-9_]{2,20})(?:[/?#]|$)")
+                .matcher(url.toLowerCase());
+            if(m.find()) return m.group(1);
+        }catch(Throwable t){}
+        return "";
+    }
     boolean isProfileUrl(String url){
         if(ProfileParser.isProfileUrl(url)) return true;
         // B 站空间主页：space.bilibili.com/{mid} 或 m.bilibili.com/space/{mid}
@@ -13365,6 +18125,754 @@ boolean ttUrl = isTikTokUrl(curPlay);
 
     /** 主页批量下载：勾选要下载第几个（多选）。
      *  默认列出当前页条目，可「全选本页」；勾选后按序号入队。 */
+    /** 主页批量下载入口：串行解析，每条拿到真直链再入队 */
+    void startBatchProfileDl(java.util.List<ProfileParser.ProfileItem> picked){
+        if(picked == null || picked.isEmpty()){
+            showHintToast("没有勾选任何作品");
+            return;
+        }
+        if(batchDlIndex >= 0 && batchDlIndex < batchDlQueue.size()){
+            showHintToast("批量下载进行中，请稍候");
+            return;
+        }
+        // 按 url 去重：主页列表可能有重复条目，重复下载会撞名
+        java.util.LinkedHashMap<String, ProfileParser.ProfileItem> uniq =
+                new java.util.LinkedHashMap<String, ProfileParser.ProfileItem>();
+        for(ProfileParser.ProfileItem it : picked){
+            if(it == null) continue;
+            String key = it.url != null && it.url.length() > 0 ? it.url
+                    : ("id:" + (it.id == null ? "" : it.id));
+            if(key.length() == 0) continue;
+            if(!uniq.containsKey(key)) uniq.put(key, it);
+        }
+        if(uniq.isEmpty()){ showHintToast("没有可下载的作品"); return; }
+        int dropped = picked.size() - uniq.size();
+        batchDlQueue.clear();
+        batchDlQueue.addAll(uniq.values());
+        batchDlIndex = 0;
+        batchDlTotal = batchDlQueue.size();
+        batchDlOk = 0;
+        batchDlKicked = false;
+        String dupTip = dropped > 0 ? ("，已去重 " + dropped + " 条") : "";
+        s("批量下载：共 " + batchDlTotal + " 条" + dupTip + "，先解析全部直链…");
+        showHintToast("批量下载 " + batchDlTotal + " 条" + dupTip);
+        DypLog.i("BATCH_DL_START total=" + batchDlTotal + " dropped=" + dropped);
+        // 批量下载不切页签：用户要求只有主页/合集解析才跳列表
+        stepBatchProfileDl();
+    }
+
+    /** 批量队列推进 */
+    /** 判定某个列表条目属于哪个平台。
+     *
+     *  为什么要单独写：批量解析可以混着 B站/快手/TikTok/抖音 一起跑，
+     *  原来 enqueueDownload 里硬编码 "抖音"，
+     *  结果所有平台的图集视频全落到 抖音/ 下。
+     *
+     *  判定顺序：
+     *    1) 条目自己的 URL（分享链接，最好认）
+     *    2) 媒体直链域名（有些分享链接是短链，platOf 认不出）
+     *    3) 兜底给 platOf 自己去猜
+     */
+    String platForItem(ProfileParser.ProfileItem it){
+        // 注意：platOf 认不出平台时返回的是 "其他"，不是空串。
+        // 所以必须把 "其他" 也当成「没认出来」，继续往下兜底，
+        // 否则第一级就永远命中 "其他"，后两级（直链 / 封面）形同虚设。
+        if(it == null) return "其他";
+        // 解析阶段已经明确标了平台（TikTok / X 主页解析器会填），优先用它：
+        // 列表条目的 url 有时是占位链接（@/video/id），platOf 认不出会退回「其他」，
+        // 批量下载就会误进抖音分支。
+        if(it.plat != null && it.plat.trim().length() > 0) return it.plat.trim();
+        String p1 = platOf(it.url == null ? "" : it.url);
+        if(!isOtherPlat(p1)) return p1;
+        String p2 = platOf(it.directUrl == null ? "" : it.directUrl);
+        if(!isOtherPlat(p2)) return p2;
+        if(it.cover != null && it.cover.length() > 0){
+            String p3 = platOf(it.cover);
+            if(!isOtherPlat(p3)) return p3;
+        }
+        return "其他";
+    }
+
+    /** platOf 的「没认出来」判定：空串和 "其他" 都算没认出 */
+    static boolean isOtherPlat(String p){
+        return p == null || p.length() == 0 || "其他".equals(p);
+    }
+
+    /** 列表转 "|" 拼接串（图集图片 / 实况地址用） */
+    String joinList(java.util.List<String> a){
+        if(a == null || a.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < a.size(); i++){
+            if(i > 0) sb.append('|');
+            String v = a.get(i);
+            // 地址里不可能有 |，但保险起见剔掉
+            sb.append(v == null ? "" : v.replace("|", ""));
+        }
+        return sb.toString();
+    }
+
+    /** "|" 拼接串转列表 */
+    java.util.List<String> splitList(String s){
+        java.util.List<String> r = new java.util.ArrayList<String>();
+        if(s == null || s.length() == 0) return r;
+        String[] a = s.split("[|]");
+        for(int i = 0; i < a.length; i++){
+            String v = a[i].trim();
+            if(v.length() > 0) r.add(v);
+            else r.add("");
+        }
+        return r;
+    }
+
+    /** 至少一张实况 */
+    int liveOf(java.util.List<String> a){
+        if(a == null) return 0;
+        int n = 0;
+        for(int i = 0; i < a.size(); i++){
+            String v = a.get(i);
+            if(v != null && v.length() > 0) n++;
+        }
+        return n;
+    }
+
+    /** 图片 CDN 判定（抖音图片走 douyinpic / 签名域） */
+    boolean isImageCdnUrl(String u){
+        if(u == null) return false;
+        String l = u.toLowerCase();
+        if(l.indexOf("douyinpic.com") >= 0) return true;
+        if(l.indexOf("byteimg.com") >= 0) return true;
+        if(l.indexOf("pstatp.com") >= 0) return true;
+        if(l.indexOf("kuaishou.com/") >= 0 && l.indexOf("jpg") > 0) return true;
+        // 明显的图片后缀
+        if(l.indexOf(".jpeg") > 0 || l.indexOf(".jpg") > 0
+                || l.indexOf(".png") > 0 || l.indexOf(".webp") > 0
+                || l.indexOf(".gif") > 0) return true;
+        return false;
+    }
+
+    /** 按 URL 推断图片扩展名 */
+    String imgExtOf(String u){
+        if(u == null) return "jpg";
+        String l = u.toLowerCase();
+        if(l.indexOf(".png") > 0 || l.indexOf("format=png") > 0) return "png";
+        if(l.indexOf(".webp") > 0 || l.indexOf("format=webp") > 0) return "webp";
+        if(l.indexOf(".gif") > 0) return "gif";
+        if(l.indexOf(".heic") > 0) return "heic";
+        return "jpg";
+    }
+
+    /** 本次批量下载里：没有直链的条数 / detail 被风控的条数（用于结束提示） */
+    volatile int batchDlNoUrl = 0;
+    volatile int batchDlDetailBlocked = 0;
+
+    /**
+     * 批量下载专用的服务器 TikTok 解析：只返回 JSON 文本，不动任何 UI 状态字段
+     * （parseTikTokByServer 会写 curPlay / curImgs 等，批量场景不能碰）。
+     * 失败返回 ""。
+     */
+    String ttResolveByServerQuiet(String rawUrl){
+        String srv = effSrv();
+        if(srv.length() == 0) return "";
+        HttpURLConnection c = null;
+        try{
+            String full = srv + "/api/tt?url=" + java.net.URLEncoder.encode(rawUrl, "UTF-8");
+            c = openConn(full);
+            c.setRequestProperty("User-Agent", MUA);
+            c.setRequestProperty("Accept", "*/*");
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(25000);
+            int code = c.getResponseCode();
+            String body = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
+            DypLog.i("BATCH_TT_SRVQ http=" + code + " len=" + (body == null ? 0 : body.length()));
+            if(code != 200 || body == null || body.length() == 0) return "";
+            if(body.indexOf("\"ok\":true") < 0 && body.indexOf("\"ok\": true") < 0) return "";
+            return body;
+        }catch(Throwable t){
+            DypLog.i("BATCH_TT_SRVQ_ERR " + t);
+        }finally{
+            try{ if(c != null) c.disconnect(); }catch(Throwable t){}
+        }
+        return "";
+    }
+
+    void stepBatchProfileDl(){
+        if(batchDlIndex < 0 || batchDlIndex >= batchDlQueue.size()){
+            int ok = batchDlOk;
+            int tot = batchDlTotal;
+            batchDlIndex = -1;
+            batchDlQueue.clear();
+            batchDlTotal = 0;
+            batchDlOk = 0;
+            s("批量下载完成：成功入队 " + ok + "/" + tot + " 条");
+            showHintToast("批量完成：" + ok + "/" + tot + " 条已入队");
+            return;
+        }
+        ProfileParser.ProfileItem it = batchDlQueue.get(batchDlIndex);
+        String u = it.url != null && it.url.length() > 0 ? it.url
+                : (it.id != null && it.id.matches("\\d{15,20}")
+                    ? "https://www.tiktok.com/@/video/" + it.id : "");
+        if(u.length() == 0){
+            DypLog.i("BATCH_DL_SKIP_NO_URL idx=" + batchDlIndex);
+            batchDlIndex++;
+            stepBatchProfileDl();
+            return;
+        }
+        // ============================================================
+        // 【TikTok / X 主页条目：走自己的解析器，绝不能进抖音 detail】
+        //
+        // 原来这里没有平台判断，TikTok 主页批量下载时：
+        //   fetchDetailForBatch(id) → DyDetail.fetch() ← 抖音的接口
+        // TikTok 的 id 打抖音 detail 一定失败 → 15 秒超时 → loadForParse 开整页
+        // → 每条再等几十秒。34 条就是几十分钟，用户看到的就是
+        //   「批量下载完成：成功入队 0/3 条」。
+        //
+        // 现在按平台分派：TikTok 用本地 TtParser（手机直连，不走服务器），
+        // X 用列表已带的 video.twimg.com 直链。
+        // ============================================================
+        final String itemPlatNow = platForItem(it);
+        if("TikTok".equals(itemPlatNow) || "X".equals(itemPlatNow)){
+            DypLog.i("BATCH_DL_OWNPLAT idx=" + batchDlIndex + " plat=" + itemPlatNow
+                    + " id=" + (it.id == null ? "" : it.id)
+                    + " kind=" + it.kind + " directLen="
+                    + (it.directUrl == null ? 0 : it.directUrl.length()));
+            final int myIdxO = batchDlIndex;
+            final ProfileParser.ProfileItem myIt = it;
+            final String myPlat = itemPlatNow;
+            final String myUrl2 = u;
+            s("批量下载 " + (batchDlIndex + 1) + "/" + batchDlTotal + "：解析中…");
+            new Thread(new Runnable(){ public void run(){
+                int queued = 0;
+                String err = "";
+                try{
+                    if("TikTok".equals(myPlat)){
+                        // 【本地优先，服务器兜底】
+                        //
+                        // 实测（2026-11-03）：
+                        //   手机本地 TtParser → tpl=apidata，图集/视频都拿到
+                        //   服务器 /api/tt     → 服务器自身连 TikTok 单作品页
+                        //                        60 秒超时(000)，必然失败
+                        // 之前把服务器放前面，每条白等 25 秒才回退，34 条就是 14 分钟。
+                        // 现在反过来：本地先跑，本地拿不到才试服务器。
+                        TtParser.TtVideo v = TtParser.resolve(MainActivity.this, myUrl2);
+                        DypLog.i("BATCH_TT_LOCAL tpl=" + v.template + " v=" + v.hasVideo()
+                                + " imgs=" + v.images.size() + " err=" + v.err);
+                        // 服务器兜底：只在本地完全失败时才试（省掉绝大多数等待）
+                        String srvR = null;
+                        if(!v.ok() && effSrv().length() > 0){
+                            try{
+                                srvR = ttResolveByServerQuiet(myUrl2);
+                            }catch(Throwable t){
+                                DypLog.i("BATCH_TT_SRV_THROW " + t);
+                            }
+                        }
+                        if(!v.ok() && srvR != null && srvR.length() > 0){
+                            // 服务器已经给了完整 JSON，直接按它入队
+                            String sid0 = (myIt.id != null && myIt.id.length() > 0)
+                                    ? myIt.id : str(jget(srvR, "id"));
+                            String type0 = str(jget(srvR, "type"));
+                            String dlObj0 = jobj(srvR, "dl_url");
+                            String vObj0 = jobj(srvR, "video");
+                            String play0 = str(jget(vObj0, "playAddr"));
+                            String uVid0 = str(jget(dlObj0, "video"));
+                            if(uVid0.length() > 0 && !uVid0.startsWith("http"))
+                                uVid0 = effSrv() + uVid0;
+                            String usePlay = play0.length() > 0 ? play0 : uVid0;
+                            if("image".equals(type0)){
+                                String imgArr0 = jarrRaw(dlObj0, "images");
+                                String imgJson0 = jobj(srvR, "images");
+                                String[] rel0 = (imgArr0.length() > 0)
+                                        ? imgArr0.split("\n") : new String[0];
+                                int gi0 = 0;
+                                if(rel0.length > 0){
+                                    for(int i2 = 0; i2 < rel0.length; i2++){
+                                        String iu = rel0[i2].trim();
+                                        if(iu.length() == 0) continue;
+                                        if(!iu.startsWith("http")) iu = effSrv() + iu;
+                                        enqueueDownloadPlat(iu, "图" + (gi0 + 1),
+                                                imgExtOf(iu), "图片", "",
+                                                "TikTok", sid0 + "_" + (gi0 + 1), "");
+                                        gi0++; queued++;
+                                    }
+                                }else{
+                                    String[] urls0 = jarrUrls(imgJson0);
+                                    for(int i2 = 0; i2 < urls0.length; i2++){
+                                        String iu = urls0[i2];
+                                        if(iu == null || iu.indexOf("http") != 0) continue;
+                                        enqueueDownloadPlat(iu, "图" + (gi0 + 1),
+                                                imgExtOf(iu), "图片", "",
+                                                "TikTok", sid0 + "_" + (gi0 + 1), "");
+                                        gi0++; queued++;
+                                    }
+                                }
+                            }else if(usePlay.length() > 0){
+                                enqueueDownloadPlat(usePlay, "视频", "mp4", "视频", "",
+                                        "TikTok", sid0, "");
+                                queued++;
+                            }
+                            DypLog.i("BATCH_TT_SRV_OK idx=" + myIdxO + " type=" + type0
+                                    + " queued=" + queued);
+                        }else if(!v.ok()){
+                            DypLog.i("BATCH_TT_SRV_MISS idx=" + myIdxO + " 本地也失败");
+                        }
+                        if(queued == 0 && v != null){
+                            String sid = (myIt.id != null) ? myIt.id : v.id;
+                            if(v.images.size() > 0){
+                                for(int gi = 0; gi < v.images.size(); gi++){
+                                    String iu = v.images.get(gi);
+                                    if(iu == null || iu.indexOf("http") != 0) continue;
+                                    String live = "";
+                                    if(v.liveUrls != null && gi < v.liveUrls.size()){
+                                        String dv = v.liveUrls.get(gi);
+                                        if(dv != null && dv.length() > 0) live = liveDirect(dv);
+                                    }
+                                    if(live.length() > 0){
+                                        enqueueDownloadPlat(iu, "实况" + (gi + 1), "jpg", "动图", "",
+                                                "TikTok", sid + "_" + (gi + 1), live);
+                                    }else{
+                                        enqueueDownloadPlat(iu, "图" + (gi + 1), imgExtOf(iu), "图片", "",
+                                                "TikTok", sid + "_" + (gi + 1), "");
+                                    }
+                                    queued++;
+                                }
+                            }
+                            if(v.hasVideo()){
+                                enqueueDownloadPlat(v.playUrl, "视频", "mp4", "视频", "",
+                                        "TikTok", sid, "");
+                                queued++;
+                            }
+                            if(queued == 0) err = (v.err.length() > 0 ? v.err : "无可下载内容");
+                        }else if(queued == 0){
+                            err = "服务器与本地都没拿到直链";
+                        }
+                    }else{
+                        // X：列表直链（video.twimg.com）直接入队
+                        String d = (myIt.directUrl != null) ? myIt.directUrl : "";
+                        if(d.indexOf("http") == 0){
+                            enqueueDownloadPlat(d, "视频", "mp4", "视频", "",
+                                    "X", myIt.id, "");
+                            queued++;
+                        }else if(myIt.imgs != null && !myIt.imgs.isEmpty()){
+                            for(int gi = 0; gi < myIt.imgs.size(); gi++){
+                                String iu = myIt.imgs.get(gi);
+                                if(iu == null || iu.indexOf("http") != 0) continue;
+                                enqueueDownloadPlat(iu, "图" + (gi + 1), imgExtOf(iu), "图片", "",
+                                        "X", myIt.id + "_" + (gi + 1), "");
+                                queued++;
+                            }
+                        }else{
+                            err = "列表里没有直链";
+                        }
+                    }
+                }catch(Throwable t){
+                    err = "" + t;
+                    DypLog.i("BATCH_OWNPLAT_ERR " + t);
+                }
+                final int fq = queued;
+                final String fe = err;
+                h.post(new Runnable(){ public void run(){
+                    if(batchDlIndex != myIdxO) return;
+                    if(fq > 0){
+                        batchDlOk++;
+                        DypLog.i("BATCH_DL_OWNPLAT_OK idx=" + myIdxO
+                                + " plat=" + myPlat + " queued=" + fq);
+                        s("批量下载 " + (myIdxO + 1) + "/" + batchDlTotal + "：已入队 "
+                                + fq + " 个文件");
+                    }else{
+                        DypLog.i("BATCH_DL_OWNPLAT_MISS idx=" + myIdxO
+                                + " plat=" + myPlat + " err=" + fe);
+                        s("批量下载 " + (myIdxO + 1) + "/" + batchDlTotal + "：跳过（" + fe + "）");
+                    }
+                    batchDlIndex++;
+                    h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 80);
+                }});
+            }}).start();
+            return;
+        }
+        // ============================================================
+        // 【按解析阶段定好的类型直接分派】
+        //
+        // 解析主页时已经把每条判成 VIDEO/IMAGE/LIVE/MUSIC 了：
+        //   PROF_KIND id=... kind=4(音乐(无视频))
+        // 这里不再靠运行时试探，直接按结论走，
+        // 音乐作品一次请求都不发（以前要白打一次 detail + 一次风控）。
+        // ============================================================
+        if(it.kind == ProfileParser.KIND_ARTICLE){
+            // 文章正文只在 detail 里，必须走一次 detail。
+            String aid = (it.id != null) ? it.id.trim() : "";
+            if(aid.matches("\\d{15,20}")){
+                DypLog.i("BATCH_DL_KIND_ARTICLE idx=" + batchDlIndex + " id=" + aid
+                        + " 走 detail 取正文");
+                batchDetailWant = true;
+                pendingAutoDlTag = "文章" + (batchDlIndex + 1);
+                pendingAutoDlIdx = batchDlIndex;
+                final int cidx = batchDlIndex;
+                s("批量下载 " + (batchDlIndex + 1) + "/" + batchDlTotal + "：取文章…");
+                try{ fetchDetailForBatch(aid); }catch(Throwable t){}
+                h.postDelayed(new Runnable(){ public void run(){
+                    if(batchDlIndex == cidx && batchDetailWant){
+                        DypLog.i("BATCH_DL_ARTICLE_TIMEOUT idx=" + cidx);
+                        batchDetailWant = false;
+                        advanceBatchAfterDetail(false);
+                    }
+                }}, 20000L);
+                return;
+            }
+            batchDlIndex++;
+            h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 60);
+            return;
+        }
+        if(it.kind == ProfileParser.KIND_MUSIC){
+            batchDlMusic++;
+            DypLog.i("BATCH_DL_KIND_MUSIC idx=" + batchDlIndex + " id=" + it.id
+                    + " 解析阶段已判为音乐作品，跳过");
+            batchDlIndex++;
+            s("批量下载 " + batchDlIndex + "/" + batchDlTotal + "：音乐作品已跳过");
+            h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 60);
+            return;
+        }
+        if(it.kind == ProfileParser.KIND_IMAGE
+                || it.kind == ProfileParser.KIND_LIVE){
+            DypLog.i("BATCH_DL_KIND_IMG idx=" + batchDlIndex + " kind=" + it.kind
+                    + " n=" + (it.imgs == null ? 0 : it.imgs.size()));
+            // 落到下面的图集分支（it.isImage 也是 true）
+        }
+        // ============================================================
+        // 【关键优化】优先用主页列表接口已经给出的 play_addr 直链。
+        //
+        // aweme_list 里每条都带 video.play_addr.url_list[0]，
+        // appendDyProfileItems() 早就把它存进了 it.directUrl。
+        //
+        // 旧逻辑却对每条都 loadForParse 一次分享页 ——
+        // 相当于「为了拿一个手里已经有的直链，去重新请求一次抖音」。
+        // 37 条就是 37 次请求，必然触发风控，
+        // 表现就是「批量下载每条都弹验证，只能成功一两条」。
+        //
+        // 现在：有直链就直接入队，一次网络请求都不发，风控无从触发。
+        // 只有极少数条目没给 directUrl 时，才回落老路径。
+        // ============================================================
+        // ============================================================
+        // 【图集必须最优先】isImage 判断要放在直链分支之前。
+        //
+        // 因为 collectBatchItem 里做了：
+        //     if(hasImgs) it.directUrl = imgUrls.get(0);
+        // 图集的 directUrl 就是第一张图的地址，非空、也不是音频，
+        // 所以一定会命中下面那个「直链」分支，
+        // 被当成 mp4 视频去下 —— 存出来是个打不开的假视频。
+        //
+        // 之前的顺序把 isImage 写在直链后面，永远进不来。
+        // ============================================================
+        if(it.isImage){
+            // 图集地址来源优先级：
+            //   1) it.imgs（新格式，全量）
+            //   2) directUrl（旧格式 / 单图）
+            //   3) cover（旧格式兜底，实测图文就是这个情况）
+            java.util.List<String> srcImgs = new java.util.ArrayList<String>();
+            if(it.imgs != null && !it.imgs.isEmpty()){
+                srcImgs.addAll(it.imgs);
+            }else{
+                String d0 = (it.directUrl != null) ? it.directUrl : "";
+                if(d0.indexOf("http") == 0){
+                    srcImgs.add(d0);
+                }else if(it.cover != null && it.cover.indexOf("http") == 0
+                        && isImageCdnUrl(it.cover)){
+                    srcImgs.add(it.cover);
+                }
+            }
+            if(srcImgs.isEmpty()){
+                DypLog.i("BATCH_DL_IMAGE_NOURL idx=" + batchDlIndex
+                        + " cover=" + (it.cover == null ? "" : it.cover.length())
+                        + " directLen=" + (it.directUrl == null ? 0 : it.directUrl.length()));
+                batchDlIndex++;
+                h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 20);
+                return;
+            }
+            int qn = 0, ln = 0;
+            for(int gi = 0; gi < srcImgs.size(); gi++){
+                String iu = srcImgs.get(gi);
+                if(iu == null || iu.indexOf("http") != 0) continue;
+                String iext = imgExtOf(iu);
+                String live = "";
+                if(it.dyns != null && gi < it.dyns.size()){
+                    String dv = it.dyns.get(gi);
+                    if(dv != null && dv.length() > 0) live = liveDirect(dv);
+                }
+                String sid = (it.id != null && it.id.length() > 0)
+                        ? (it.id + "_" + (gi + 1)) : "";
+                // 平台不能写死「抖音」——
+                // 用户会混着批量解析 B站图文、快手图文、TikTok 图集，
+                // 写死就会全部落到「抖音/图片」，文件根本分不清来源。
+                String iplat = platForItem(it);
+                if(live.length() > 0){
+                    // 实况图 → 动图目录，和单独下载完全一致
+                    enqueueDownloadPlat(iu, "实况" + (gi + 1), "jpg", "动图", "",
+                            iplat, sid, live);
+                    ln++;
+                }else{
+                    enqueueDownloadPlat(iu, "图" + (gi + 1), iext, "图片", "",
+                            iplat, sid, "");
+                    qn++;
+                }
+            }
+            DypLog.i("BATCH_DL_IMAGE idx=" + batchDlIndex + "/" + batchDlTotal
+                    + " imgs=" + qn + " live=" + ln);
+            batchDlOk++;
+            batchDlIndex++;
+            s("批量下载 " + batchDlIndex + "/" + batchDlTotal + "：已入队（图片 "
+                    + qn + " 张 / 实况 " + ln + " 张）");
+            h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 20);
+            return;
+        }
+
+        String direct = (it.directUrl != null) ? it.directUrl : "";
+        // 双保险：即使列表里残留了音频地址，这里也不能拿去下单
+        if(direct.length() > 0 && isLikelyAudioUrl(direct)){
+            DypLog.i("BATCH_DL_SKIP_AUDIO idx=" + batchDlIndex
+                    + " url=" + direct.substring(0, Math.min(80, direct.length())));
+            direct = "";
+        }
+        String why = rejectNonMediaUrl(direct);
+        if(direct.length() > 0 && why.length() == 0){
+            String tag = "视频" + (batchDlIndex + 1);
+            String vplat = platForItem(it);
+            DypLog.i("BATCH_DL_DIRECT idx=" + batchDlIndex + "/" + batchDlTotal
+                    + " tag=" + tag + " plat=" + vplat);
+            // 显式传平台：直链是 douyinvod/byteicdn 这类 CDN 域名，
+            // platOf 认不出来会存到「其他/视频」，用户就找不到文件。
+            //
+            // 显式传 stableId = 作品 id：抖音直链每次带新签名，
+            // 拿 URL hashCode 当 id 会让同一视频每次算出不同文件名，
+            // 去重失效，结果同一个视频下 3 份。
+            String sid = (it.id != null) ? it.id : "";
+            enqueueDownload(direct, tag, "mp4", "视频", "", vplat, sid);
+            batchDlOk++;
+            batchDlIndex++;
+            s("批量下载 " + batchDlIndex + "/" + batchDlTotal + "：已入队（直链）");
+            // 全部走直链，不需要等 WebView，直接推进下一条
+            h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 20);
+            return;
+        }
+        if(direct.length() > 0 && why.length() > 0){
+            DypLog.i("BATCH_DL_DIRECT_REJECT idx=" + batchDlIndex + " why=" + why);
+        }
+
+        // ============================================================
+        // 【图集分支】图集不能当视频下。
+        //
+        // 原来这里没有 isImage 判断，图集条目也走
+        //     enqueueDownload(..., "mp4", "视频")
+        // 拿图片 CDN 地址当 mp4 下 —— 要么被 Content-Type 校验拒掉，
+        // 要么存成打不开的假视频。
+        // 用户实测「图文的没下载」就是这个原因。
+        // ============================================================
+        // 走到这里说明没有可用直链
+        batchDlNoUrl++;
+
+        // ---- 回落一：有作品 id → 调 detail 接口取真视频 ----
+        //
+        // 为什么不用 loadForParse（打开整页）：
+        //  · 慢（每条 5~20 秒）
+        //  · 重（整页渲染、签名、Cookie 都要过一遍）
+        //  · 容易触发风控（37 条 = 37 次页面请求）
+        //
+        // detail 接口只发一次 XHR，返回的 aweme_detail.video 是完整的，
+        // bit_rate[] 每档都带真正的视频 CDN 地址。
+        String awemeId = (it.id != null) ? it.id.trim() : "";
+        boolean hasId = awemeId.matches("\\d{15,20}");
+        if(!hasId){
+            // 从 url 里再抠一次
+            String ex = extractMediaId(u);
+            if(ex.matches("\\d{15,20}")){ awemeId = ex; hasId = true; }
+        }
+        if(hasId){
+            pendingAutoDlTag = "视频" + (batchDlIndex + 1);
+            pendingAutoDlIdx = batchDlIndex;
+            batchDetailId = awemeId;
+            batchDetailWant = true;
+            s("批量下载 " + (batchDlIndex + 1) + "/" + batchDlTotal + "：取直链…");
+            DypLog.i("BATCH_DL_DETAIL idx=" + batchDlIndex + "/" + batchDlTotal
+                    + " id=" + awemeId);
+            try{ fetchDetailForBatch(awemeId); }catch(Throwable t){
+                DypLog.i("BATCH_DL_DETAIL_ERR " + t);
+            }
+            // 超时兜底：detail 15 秒没回来，退回整页解析
+            final int myIdxD = batchDlIndex;
+            h.postDelayed(new Runnable(){ public void run(){
+                if(batchDetailWant && myIdxD == batchDlIndex){
+                    DypLog.i("BATCH_DL_DETAIL_TIMEOUT idx=" + myIdxD + " 退回整页解析");
+                    batchDetailWant = false;
+                    pendingAutoDlTag = "视频" + (myIdxD + 1);
+                    pendingAutoDlIdx = myIdxD;
+                    loadForParse(u);
+                }
+            }}, 15000L);
+            return;
+        }
+
+        // ---- 回落二：连 id 都没有，只能走整页解析 ----
+        pendingAutoDlTag = "视频" + (batchDlIndex + 1);
+        pendingAutoDlIdx = batchDlIndex;
+        s("批量下载 " + (batchDlIndex + 1) + "/" + batchDlTotal + "：解析中…");
+        DypLog.i("BATCH_DL_PARSE idx=" + batchDlIndex + "/" + batchDlTotal + " url=" + u);
+        loadForParse(u);
+        // 超时保护。
+        //
+        // 原来是 20 秒硬超时，实测不够：iesdouyin 分享页在风控下经常要 20~40 秒才 load 完，
+        // 结果每条都是 BATCH_DL_TIMEOUT，一条都下不到（日志：
+        //   BATCH_DL_PARSE 18:56:21 → BATCH_DL_TIMEOUT 18:56:41 → onPageFinished 18:56:40）。
+        // 现在放宽到 45 秒，并且超时后先重试一次再放弃。
+        final int myIdx = batchDlIndex;
+        final String myUrl = u;
+        h.postDelayed(new Runnable(){ public void run(){
+            if(batchDlIndex == myIdx && pendingAutoDlTag.length() > 0){
+                int tried = (batchDlRetry.get(myIdx) == null ? 0 : batchDlRetry.get(myIdx));
+                if(tried < 1){
+                    batchDlRetry.put(myIdx, tried + 1);
+                    DypLog.i("BATCH_DL_TIMEOUT_RETRY idx=" + myIdx + " 重试一次 url=" + myUrl);
+                    pendingAutoDlTag = "";
+                    pendingAutoDlIdx = -1;
+                    h.postDelayed(new Runnable(){ public void run(){
+                        if(batchDlIndex == myIdx){ stepBatchProfileDl(); }
+                    }}, 800);
+                    return;
+                }
+                DypLog.i("BATCH_DL_TIMEOUT idx=" + myIdx + " 重试后仍超时，跳过");
+                pendingAutoDlTag = "";
+                pendingAutoDlIdx = -1;
+                batchDlIndex++;
+                if(batchDlIndex >= batchDlTotal) kickBatchDownloads();
+                else stepBatchProfileDl();
+            }
+        }}, 45000);
+    }
+
+    /** 全部解析完，统一下载：这里并发才生效（队列里已有多条，线程池按 dlConcurrency 跑） */
+    void kickBatchDownloads(){
+        int okN = batchDlOk;
+        int tot = batchDlTotal;
+        batchDlIndex = -1;
+        batchDlQueue.clear();
+        batchDlTotal = 0;
+        batchDlOk = 0;
+        batchDlKicked = false;
+        int queued;
+        synchronized(downloadQueue){ queued = downloadQueue.size(); }
+        DypLog.i("BATCH_DL_KICK ok=" + okN + "/" + tot
+                + " queued=" + queued + " conc=" + dlConcurrency());
+        s("批量下载：已入队 " + okN + "/" + tot + " 条，开始并发下载");
+        showHintToast("解析完成 " + okN + "/" + tot + " 条，开始下载");
+        if(queued > 0 && !dlRunning){
+            dlRunning = true;
+            runDownloadQueue();
+            DypLog.i("BATCH_DL_QUEUE_START queued=" + queued);
+        }else if(queued > 0){
+            DypLog.i("BATCH_DL_QUEUE_ALREADY queued=" + queued);
+        }
+    }
+
+    /** 主页解析入口：让用户粘主页链接，然后走正常解析 */
+    void showProfileInputDialog(){
+        curDark = isDarkMode();
+        final EditText et = new EditText(this);
+        et.setHint("粘贴主页链接，例如\nhttps://www.douyin.com/user/xxx\nhttps://v.douyin.com/xxxxx/");
+        et.setSingleLine(false);
+        et.setMinLines(3);
+        et.setTextSize(13);
+        styleInput(et);
+        int pad = dp(16);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setBackgroundColor(curDark ? 0xFF17191F : 0xFFFFFFFF);
+        wrap.setPadding(pad, dp(8), pad, dp(4));
+        wrap.addView(et, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        dypDlg()
+            .setTitle("主页解析")
+            .setMessage("粘贴博主主页链接，会翻完所有作品列进列表。\n"
+                      + "支持抖音 / 快手 / B站 / TikTok / YouTube / X / 小红书 / IG。")
+            .setView(wrap)
+            .setPositiveButton("开始解析", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface d, int w){
+                    String u = et.getText() == null ? "" : et.getText().toString().trim();
+                    u = extractUrl(u);
+                    if(u == null || u.length() == 0){
+                        showHintToast("没识别到链接");
+                        return;
+                    }
+                    DypLog.i("PROFILE_PARSE_FROM_LIST " + u);
+                    switchTab(0);
+                    input.setText(u);
+                    parse();
+                }})
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /**
+     * 列表页「批量下载」：直接对列表里所有条目批量下载。
+     *
+     * 之前的「全部下载」是逐条问用户，这个是直接全下，且走并发。
+     */
+    void startBatchDlFromList(){
+        // 「批量下载」= 只负责「挑第几个」，直接开勾选弹窗。
+        // 「全部下载」是旁边那个独立按钮，两者不再互相嵌套。
+        //
+        // 【数据池必须跟当前显示的子页签走】
+        // 以前这里锁死读 batchCollected（批量解析池），
+        // 于是列表里明明显示着「主页解析 · 共 34 条」，
+        // 点「批量下载」却弹「列表是空的，先解析一些作品」——
+        // 因为主页结果存在 itemsFromProfile，根本不在 batchCollected 里。
+        java.util.List<ProfileParser.ProfileItem> snapshot;
+        int sub = listSubTab;
+        if(sub == 2){
+            synchronized(itemsFromProfile){
+                snapshot = new java.util.ArrayList<ProfileParser.ProfileItem>(itemsFromProfile);
+            }
+        }else if(sub == 0){
+            synchronized(batchCollected){
+                snapshot = new java.util.ArrayList<ProfileParser.ProfileItem>(batchCollected);
+            }
+        }else if(sub == 3){
+            snapshot = new java.util.ArrayList<ProfileParser.ProfileItem>();
+            synchronized(mixItems){
+                for(String[] row : mixItems){
+                    if(row == null || row.length < 2) continue;
+                    ProfileParser.ProfileItem pi = new ProfileParser.ProfileItem();
+                    pi.id = row[0] == null ? "" : row[0];
+                    pi.title = row[1] == null ? "" : row[1];
+                    pi.directUrl = (row.length > 2 && row[2] != null) ? row[2] : "";
+                    pi.cover = (row.length > 3 && row[3] != null) ? row[3] : "";
+                    pi.url = "https://www.douyin.com/video/" + pi.id;
+                    pi.plat = "抖音";
+                    if(pi.directUrl.length() > 0) pi.kind = ProfileParser.KIND_VIDEO;
+                    snapshot.add(pi);
+                }
+            }
+        }else{
+            synchronized(itemsFromSingle){
+                snapshot = new java.util.ArrayList<ProfileParser.ProfileItem>(itemsFromSingle);
+            }
+        }
+        DypLog.i("BATCH_DL_POOL sub=" + sub + " name=" + listSubName(sub)
+                + " n=" + snapshot.size());
+        if(snapshot.isEmpty()){
+            showHintToast("列表是空的，先解析一些作品");
+            return;
+        }
+        final java.util.List<ProfileParser.ProfileItem> all = snapshot;
+        final int total = all.size();
+        // 当前页范围：跟列表页「上一页/下一页」口径一致（PROFILE_PAGE_SIZE 条/页）
+        final int pages = Math.max(1, (total + PROFILE_PAGE_SIZE - 1) / PROFILE_PAGE_SIZE);
+        int pg = profilePage;
+        if(pg < 0) pg = 0;
+        if(pg >= pages) pg = pages - 1;
+        final int from = pg * PROFILE_PAGE_SIZE;
+        final int to = Math.min(total, from + PROFILE_PAGE_SIZE);
+        DypLog.i("BATCH_DL_PICK total=" + total + " page=" + (pg + 1) + "/" + pages
+                + " range=" + from + "-" + to);
+        curDark = isDarkMode();
+        showProfilePickDialog(all, from, to);
+    }
+
     void showProfilePickDialog(final java.util.List<ProfileParser.ProfileItem> list,
                                final int from, final int to){
         final int cnt = Math.max(0, to - from);
@@ -13386,23 +18894,13 @@ boolean ttUrl = isTikTokUrl(curPlay);
             })
             .setPositiveButton("开始下载", new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int w){
-                    int added = 0;
+                    java.util.List<ProfileParser.ProfileItem> picked = new java.util.ArrayList<ProfileParser.ProfileItem>();
                     for(int k = 0; k < checked.length; k++){
                         if(!checked[k]) continue;
                         int i = from + k;
-                        ProfileParser.ProfileItem it = list.get(i);
-                        String u = it.url != null && it.url.length() > 0 ? it.url
-                                : (it.id != null && it.id.matches("\\d{15,20}")
-                                    ? "https://www.tiktok.com/@/video/" + it.id : "");
-                        if(u.length() == 0) continue;
-                        enqueueDownload(u, "视频" + (i + 1), "mp4", "视频");
-                        added++;
+                        picked.add(list.get(i));
                     }
-                    if(added == 0){ showHintToast("没有勾选任何作品"); return; }
-                    Log.i("DYP", "PROFILE_PICK_DL added=" + added);
-                    s("已加入下载队列：" + added + " 条");
-                    showHintToast("已加入 " + added + " 条下载任务");
-                    switchTab(0);
+                    startBatchProfileDl(picked);
                 }
             })
             .setNeutralButton("全选本页", new android.content.DialogInterface.OnClickListener(){
@@ -13417,22 +18915,13 @@ boolean ttUrl = isTikTokUrl(curPlay);
                         })
                         .setPositiveButton("开始下载", new android.content.DialogInterface.OnClickListener(){
                             public void onClick(android.content.DialogInterface dd, int ww){
-                                int added = 0;
+                                java.util.List<ProfileParser.ProfileItem> picked = new java.util.ArrayList<ProfileParser.ProfileItem>();
                                 for(int k = 0; k < checked.length; k++){
                                     if(!checked[k]) continue;
                                     int i = from + k;
-                                    ProfileParser.ProfileItem it = list.get(i);
-                                    String u = it.url != null && it.url.length() > 0 ? it.url
-                                            : (it.id != null && it.id.matches("\\d{15,20}")
-                                                ? "https://www.tiktok.com/@/video/" + it.id : "");
-                                    if(u.length() == 0) continue;
-                                    enqueueDownload(u, "视频" + (i + 1), "mp4", "视频");
-                                    added++;
+                                    picked.add(list.get(i));
                                 }
-                                if(added == 0){ showHintToast("没有勾选任何作品"); return; }
-                                s("已加入下载队列：" + added + " 条");
-                                showHintToast("已加入 " + added + " 条下载任务");
-                                switchTab(0);
+                                startBatchProfileDl(picked);
                             }
                         })
                         .setNegativeButton("返回", null)
@@ -13443,9 +18932,139 @@ boolean ttUrl = isTikTokUrl(curPlay);
             .show();
     }
 
+    // ============================================================
+    // 列表页子页签（用户要求：子父页面）
+    //
+    //   列表页
+    //     ├─ [批量解析]  ← 解析页「批量解析」的结果
+    //     ├─ [主页解析]  ← 「主页解析」的结果
+    //     └─ [批量下载]  ← 全部下载 / 批量下载 / 清空列表
+    //
+    // 以前三种来源混在同一份数据里，用户分不清这个列表是哪来的。
+    // ============================================================
+    volatile int listSubTab = 1;
+    TextView subTabBatchParse, subTabProfileParse, subTabBatchDl, subTabMixParse;
+    /** 渲染期间置 true，避免 showProfileList 反向覆盖数据池 */
+    volatile boolean listRendering = false;
+
+    final java.util.List<ProfileParser.ProfileItem> itemsFromProfile =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<ProfileParser.ProfileItem>());
+    /** 视频/图文（单条）解析的结果 */
+    final java.util.List<ProfileParser.ProfileItem> itemsFromSingle =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<ProfileParser.ProfileItem>());
+    final java.util.List<ProfileParser.ProfileItem> itemsFromBatch =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<ProfileParser.ProfileItem>());
+    /** 合集解析的结果（抖音合集、B站合集等） */
+    final java.util.List<ProfileParser.ProfileItem> itemsFromMix =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<ProfileParser.ProfileItem>());
+
+    /**
+     * 子页签在布局里的真实顺序。
+     * 只在这里定义一次 —— 高亮、点击、表头文案都从这里取，
+     * 避免「数组顺序和布局顺序不一致」导致高亮错位。
+     *
+     *   0 = 批量解析        subTabBatchParse
+     *   1 = 视频/图文解析    subTabBatchDl
+     *   2 = 主页解析        subTabProfileParse
+     */
+    TextView[] listSubViews(){
+        return new TextView[]{ subTabBatchParse, subTabBatchDl,
+                subTabProfileParse, subTabMixParse };
+    }
+
+    /** 子页签名字 */
+    static String listSubName(int idx){
+        if(idx == 0) return "批量解析";
+        if(idx == 1) return "视频/图文解析";
+        if(idx == 2) return "主页解析";
+        if(idx == 3) return "合集";
+        return "视频/图文解析";
+    }
+
+    /** 切列表页子页签 */
+    void switchListSub(int idx){
+        try{
+            listSubTab = idx;
+            boolean dark = isDarkMode();
+            int actC = dark ? 0xFFE8EAF0 : 0xFF1A1C22;
+            int nC   = dark ? 0xFF8A8F9C : 0xFF9AA0AC;
+            TextView[] subs = listSubViews();
+            for(int i = 0; i < subs.length; i++){
+                if(subs[i] == null) continue;
+                if(i == idx){
+                    subs[i].setBackground(makeRoundRect(0x1AFE2C55, 0, 10));
+                    subs[i].setTextColor(actC);
+                    subs[i].setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                }else{
+                    subs[i].setBackground(makeRoundRect(0x0DFFFFFF, 0x14FFFFFF, 10));
+                    subs[i].setTextColor(nC);
+                    subs[i].setTypeface(android.graphics.Typeface.DEFAULT);
+                }
+            }
+            // 取该子页对应的数据重新渲染
+            java.util.List<ProfileParser.ProfileItem> src;
+            if(idx == 0){
+                synchronized(itemsFromBatch){ src = new java.util.ArrayList<ProfileParser.ProfileItem>(itemsFromBatch); }
+            }else if(idx == 1){
+                synchronized(itemsFromSingle){ src = new java.util.ArrayList<ProfileParser.ProfileItem>(itemsFromSingle); }
+            }else if(idx == 3){
+                synchronized(itemsFromMix){ src = new java.util.ArrayList<ProfileParser.ProfileItem>(itemsFromMix); }
+            }else{
+                synchronized(itemsFromProfile){ src = new java.util.ArrayList<ProfileParser.ProfileItem>(itemsFromProfile); }
+            }
+            listRendering = true;
+            try{
+                showProfileList(src);
+            }finally{
+                listRendering = false;
+            }
+            DypLog.i("LIST_SUB idx=" + idx + " n=" + src.size());
+        }catch(Throwable t){ DypLog.i("LIST_SUB_ERR " + t); }
+    }
+
     void showProfileList(final java.util.List<ProfileParser.ProfileItem> list){
-        Log.i("DYP", "SHOW_PROFILE_LIST n=" + (list != null ? list.size() : 0) + " wrap=" + (listWrap != null));
+        DypLog.i("SHOW_PROFILE_LIST n=" + (list != null ? list.size() : 0) + " wrap=" + (listWrap != null));
         if(listWrap == null) return;
+        // 关键：把渲染的数据同步进 batchCollected。
+        // 以前这里只渲染界面、不写 batchCollected，导致列表页「批量下载」
+        // 读到空列表 → 提示「列表是空的」一闪而过，看着像按钮没反应。
+        // 列表页「批量解析 / 主页解析 / 批量下载」三个入口现在共用这一份数据。
+        try{
+            synchronized(batchCollected){
+                batchCollected.clear();
+                if(list != null) batchCollected.addAll(list);
+            }
+            DypLog.i("BATCH_COLLECT_SYNC n=" + batchCollected.size());
+        }catch(Throwable t){
+            DypLog.i("BATCH_COLLECT_SYNC_ERR " + t);
+        }
+        // 按来源存进各自的数据池（子页签用）。
+        // listRendering=true 表示这是子页签切换触发的重渲染，不能反向覆盖池子，
+        // 否则「批量解析」切过去一次就把主页那份冲掉了。
+        try{
+            if(!listRendering && list != null){
+                java.util.List<ProfileParser.ProfileItem> pool;
+                String srcName;
+                if(profileMode){
+                    pool = itemsFromProfile;  srcName = "主页解析";
+                }else if(batchCollectMode){
+                    pool = itemsFromBatch;    srcName = "批量解析";
+                }else{
+                    pool = itemsFromSingle;   srcName = "视频/图文解析";
+                }
+                synchronized(pool){
+                    pool.clear();
+                    pool.addAll(list);
+                }
+                DypLog.i("LIST_POOL_SAVE src=" + srcName + " n=" + pool.size());
+                // 写完立刻落盘。
+                // 之前漏了这一行：主页解析 36 条明明进了 itemsFromProfile，
+                // 但 list_pools.tsv 里一条都没有，重启就全丢。
+                saveListPools();
+            }
+        }catch(Throwable t){
+            DypLog.i("LIST_POOL_SAVE_ERR " + t);
+        }
         listWrap.removeAllViews();
         final int n = list.size();
         final int pages = Math.max(1, (n + PROFILE_PAGE_SIZE - 1) / PROFILE_PAGE_SIZE);
@@ -13454,28 +19073,58 @@ boolean ttUrl = isTikTokUrl(curPlay);
         final int from = profilePage * PROFILE_PAGE_SIZE;
         final int to = Math.min(n, from + PROFILE_PAGE_SIZE);
 
-        String _src = batchCollectMode ? "批量解析" : "主页";
+        // 【关键】文案跟「当前选中的子页签」走，不跟全局解析标志走。
+        // 以前用 profileMode/batchCollectMode，切子页签时这俩不变，
+        // 于是永远显示最后一次解析来源的名字（用户看到的是「视频/图文解析」）。
+        String _src = listRendering ? listSubName(listSubTab)
+                : (mixMode ? "合集"
+                   : (profileMode ? "主页解析"
+                      : (batchCollectMode ? "批量解析" : "视频/图文解析")));
         listHead.setText(pages > 1
-                ? (_src + "共 " + n + " 条 · 第 " + (profilePage + 1) + "/" + pages + " 页 · 点「下载」直接下")
-                : (_src + "共 " + n + " 条 · 点「下载」直接下，点标题先解析"));
+                ? (_src + " · 共 " + n + " 条 · 第 " + (profilePage + 1) + "/" + pages + " 页")
+                : (_src + " · 共 " + n + " 条"));
+        // 有新结果时自动切到对应子页签（用户不用手动找）
+        try{
+            if(!listRendering){
+                // 合集解析完自动落到「合集」页签
+                int want = mixMode ? 3 : (profileMode ? 2 : (batchCollectMode ? 0 : 1));
+                if(listSubTab != want){
+                    listSubTab = want;
+                    h.post(new Runnable(){ public void run(){
+                        try{
+                            boolean dark = isDarkMode();
+                            int actC = dark ? 0xFFE8EAF0 : 0xFF1A1C22;
+                            int nC   = dark ? 0xFF8A8F9C : 0xFF9AA0AC;
+                            TextView[] subs = listSubViews();
+                            for(int i = 0; i < subs.length; i++){
+                                if(subs[i] == null) continue;
+                                if(i == want){
+                                    subs[i].setBackground(makeRoundRect(0x1AFE2C55, 0, 10));
+                                    subs[i].setTextColor(actC);
+                                    subs[i].setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                                }else{
+                                    subs[i].setBackground(makeRoundRect(0x0DFFFFFF, 0x14FFFFFF, 10));
+                                    subs[i].setTextColor(nC);
+                                    subs[i].setTypeface(android.graphics.Typeface.DEFAULT);
+                                }
+                            }
+                        }catch(Throwable t){}
+                    }});
+                }
+            }
+        }catch(Throwable t){}
         btnDlAll.setVisibility(n > 0 ? View.VISIBLE : View.GONE);
         if(btnClearList != null) btnClearList.setVisibility(n > 0 ? View.VISIBLE : View.GONE);
-        btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
-            // 两步：先选「下载全部」还是「挑第几个」（setMessage + setItems 会挤掉列表，必须分开）
+btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){
+            // 「全部下载」= 只负责「本页全部」，不再弹选项。
+            // 想挑第几个请用旁边的「批量下载」按钮，两个按钮各管一件事。
             dypDlg()
-                .setTitle("批量下载")
-                .setMessage("【只处理当前页】本页共 " + (to - from) + " 条（全部共 " + n + " 条，"
-                    + pages + " 页）。\n"
-                    + "换页请先用下方「上一页/下一页」切到目标页，再点这里。\n\n"
-                    + "· 下载全部：把本页所有条目加入下载队列\n"
-                    + "· 选择下载：勾选本页要下载第几个（可多选）\n\n"
-                    + "境外平台会走服务器中转，大视频较多时速度受限。")
-                .setPositiveButton("选择下载", new android.content.DialogInterface.OnClickListener(){
-                    public void onClick(android.content.DialogInterface d, int w){
-                        showProfilePickDialog(list, from, to);
-                    }
-                })
-                .setNeutralButton("下载全部", new android.content.DialogInterface.OnClickListener(){
+                .setTitle("全部下载")
+                .setMessage("【本页 " + (to - from) + " 条】全部加入下载队列？\n\n"
+                    + "全部共 " + n + " 条（" + pages + " 页），换页请先用「上一页/下一页」切到目标页。\n"
+                    + "加进队列后会逐条解析出真实直链，再按并发数（"
+                    + dlConcurrency() + " 个）同时下载。")
+                .setPositiveButton("确定下载本页", new android.content.DialogInterface.OnClickListener(){
                     public void onClick(android.content.DialogInterface d, int w){
                         int added = 0;
                         for(int i = from; i < to; i++){
@@ -13554,6 +19203,37 @@ boolean ttUrl = isTikTokUrl(curPlay);
             lp.bottomMargin = dp(8);
             row.setLayoutParams(lp);
 
+            // 横排：左缩略图 + 右侧内容（标题 + 按钮）
+            LinearLayout hline = new LinearLayout(this);
+            hline.setOrientation(LinearLayout.HORIZONTAL);
+            hline.setGravity(android.view.Gravity.TOP);
+
+            android.widget.ImageView thumb = makeThumbView(56);
+            hline.addView(thumb);
+            String cov = it.cover;
+            if(cov == null || cov.length() == 0 || !cov.startsWith("http")){
+                // 老数据/未填封面：按链接推断平台缩略图
+                cov = guessCover(it.url, it.id);
+            }
+            if(cov != null && cov.length() > 0 && cov.startsWith("http")){
+                loadNetThumb(thumb, cov, 120);
+            }else{
+                TextView ph = new TextView(this);
+                ph.setText(thumbPlaceholder(it.isImage ? "图片" : "视频"));
+                ph.setTextSize(20);
+                ph.setGravity(android.view.Gravity.CENTER);
+                thumb.setVisibility(View.GONE);
+                ph.setLayoutParams(new LinearLayout.LayoutParams(dp(56), dp(56)));
+                hline.addView(ph);
+            }
+
+            LinearLayout rightWrap = new LinearLayout(this);
+            rightWrap.setOrientation(LinearLayout.VERTICAL);
+            rightWrap.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            hline.addView(rightWrap);
+            row.addView(hline);
+
             TextView title = new TextView(this);
             String t = it.title;
             if(t.length() == 0) t = it.id;
@@ -13565,7 +19245,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 switchTab(0);
                 parseProfileItem(list, idx);
             }});
-            row.addView(title);
+            rightWrap.addView(title);
 
             LinearLayout btns = new LinearLayout(this);
             btns.setOrientation(LinearLayout.HORIZONTAL);
@@ -13654,11 +19334,28 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 dur.setGravity(android.view.Gravity.CENTER_VERTICAL);
                 btns.addView(dur);
             }
-            row.addView(btns);
+            rightWrap.addView(btns);
             listWrap.addView(row);
         }
-        s("主页解析完成 · " + n + " 条 · 已切到列表页");
-        switchTab(1);
+        // 启动期渲染：只画内容，不写状态文字、不切页签。
+        //
+        // 两个条件任一成立就认为是启动期：
+        //   · restoringList（loadBatchList 正在恢复）
+        //   · 距 App 启动不到 3 秒（switchListSub / loadListPools 等路径）
+        //
+        // 为什么需要第二个条件：restoringList 只在 loadBatchList 里置 true，
+        // 而启动时 switchListSub(1) 也会走 showProfileList，
+        // 那时 restoringList 已经是 false，于是又写了一遍
+        // 「主页解析完成 · N 条 · 已切到列表页」——用户一开 App 就看到这句，
+        // 明明什么都没解析。
+        boolean bootPeriod = (System.currentTimeMillis() - appBootAt) < 3000L;
+        if(restoringList || bootPeriod){
+            DypLog.i("LIST_RESTORE_RENDER n=" + n
+                    + " (不切页签 restoring=" + restoringList + " boot=" + bootPeriod + ")");
+        }else{
+            s("主页解析完成 · " + n + " 条 · 已切到列表页");
+            switchTab(1);
+        }
     }
 
     /** 解析主页列表第 idx 条（0 基） */
@@ -13670,6 +19367,232 @@ boolean ttUrl = isTikTokUrl(curPlay);
         final String target = it.url.length() > 0 ? it.url
                 : (it.id.length() > 0 && it.id.matches("\\d{15,20}") ? "https://www.tiktok.com/@/video/" + it.id : "");
         if(target.length() == 0){ s("该条无链接"); return; }
+        // 【列表直链 → 走正常渲染，而不是直接下载】
+        //
+        // 主页解析时已经把真实媒体直链拿到了（directUrl），
+        // 但「解析看详情」的语义是「在解析页把这条加载出来」：
+        // 封面、播放器、下载/BGM 按钮都要有，用户再决定下不下。
+        // 所以这里不能直接入队下载，而是把直链包成一个 XParser.XVideo，
+        // 交给和单推文解析完全相同的 render(v.toResultJson()) 路径。
+        //
+        // 为什么不能走 loadForParse(target)：那会落到 XParser.resolve，
+        // 它的两个数据源当前都不可用（syndication 429 / fxtwitter 无时间线），
+        // 于是报「所有数据源都没拿到媒体」。
+        final String listDirect = (it.directUrl == null) ? "" : it.directUrl.trim();
+        if(listDirect.startsWith("http") && it.kind != ProfileParser.KIND_IMAGE){
+            DypLog.i("LIST_DIRECT_RENDER idx=" + idx + " url="
+                    + listDirect.substring(0, Math.min(90, listDirect.length())));
+            XParser.XVideo xv = new XParser.XVideo();
+            xv.id = it.id == null ? "" : it.id;
+            xv.text = it.title == null ? "" : it.title;
+            xv.pageUrl = target;
+            xv.coverUrl = it.cover == null ? "" : it.cover;
+            xv.videos.add(listDirect);
+            xv.videoSize.add("");
+            xv.videoDur.add(it.durSec > 0 ? String.valueOf(it.durSec) : "");
+            xv.videoPoster.add(it.cover == null ? "" : it.cover);
+            s("解析第 " + (idx + 1) + " 条...");
+            webDone = true;
+            xSrvUsable = xv.serverUsable;
+            xSrvReason = xv.serverReason;
+            switchTab(0);   // 回到解析页，和正常解析一致
+            // render() 内部会 post 到 UI 线程，和单推文解析同一条路径
+            String r = render(xv.toResultJson());
+            DypLog.i("RESULT_BEGIN\n" + r + "\nRESULT_END");
+            s("完成(X) 第 " + (idx + 1) + " 条");
+            return;
+        }
+        // 磁力条目：直接交给 BT 引擎，绝不塞进 WebView（否则 ERR_UNKNOWN_URL_SCHEME）
+        if(BtDownloader.isMagnet(target) || target.indexOf(".torrent") > 0){
+            DypLog.i("LIST_CLICK_MAGNET");
+            startMagnetDownload(target);
+            return;
+        }
+        // 【抖音单条详情：detail 优先，别一上来就整页解析】
+        //
+        // 整页解析要 WebView 加载完整页面（含埋点、播放器、推荐流），
+        // 是风控命中率最高的路径；而 detail 只发一个 XHR，
+        // 带上 uifid 之后实测 200。
+        String did = (it.id != null) ? it.id.trim() : "";
+        boolean isDy = (target.indexOf("douyin.com") >= 0
+                || target.indexOf("iesdouyin.com") >= 0)
+                && did.matches("\\d{15,20}");
+        if(isDy){
+            s("解析第 " + (idx + 1) + " 条（detail）...");
+            DypLog.i("LIST_DETAIL_FIRST idx=" + idx + " id=" + did);
+            final int fix = idx;
+            final String fdid = did;
+            final String ftarget = target;
+            new Thread(new Runnable(){ public void run(){
+                String ck = "";
+                String ui = "";
+                try{ ck = dyEffectiveCookie(); }catch(Throwable t){}
+                try{ ui = dyCurUifid(); }catch(Throwable t){}
+                if(ck == null) ck = "";
+                if(ui == null) ui = "";
+                DyDetail.Result r = null;
+                try{ r = DyDetail.fetch(fdid, ck, 2, ui); }catch(Throwable t){
+                    DypLog.i("LIST_DETAIL_ERR " + t);
+                }
+                final DyDetail.Result fr = r;
+                h.post(new Runnable(){ public void run(){
+                    String vurl = "";
+                    boolean music = false;
+                    if(fr != null && fr.ok && fr.body != null && fr.body.length() > 0){
+                        try{
+                            Object root = new JP(fr.body).parse();
+                            if(root instanceof Map){
+                                Map m = (Map) root;
+                                Object ad = get(m, "aweme_detail");
+                                if(ad instanceof Map){
+                                    Map adM = (Map) ad;
+                                    long at = parseLong(get(adM, "aweme_type"), 0);
+                                    long mt = parseLong(get(adM, "media_type"), 0);
+                                    // ============ 图集优先 ============
+                                    // 图文作品的资源全在 images[] 里，
+                                    // video 可能压根不存在。上一版只看 video，
+                                    // 图集就被判成「解析不出来」了。
+                                    // 【文章优先】抖音文章也带 aweme_type=163/media_type=43，
+                                    // 靠 article_info 区分。正文在 article_content 里（JSON 字符串）。
+                                    Object artObj0 = get(adM, "article_info");
+                                    if(artObj0 instanceof Map){
+                                        String atitle = gs(get((Map) artObj0, "article_title"));
+                                        String amd = dyArticleMd(artObj0);
+                                        String saved = saveDyArticle(fdid, atitle, amd);
+                                        DypLog.i("LIST_DETAIL_ARTICLE id=" + fdid
+                                                + " title=" + atitle + " mdLen=" + amd.length()
+                                                + " saved=" + saved);
+                                        if(saved.length() > 0){
+                                            s("已保存文章：第 " + (fix + 1) + " 条 · " + atitle);
+                                            showHintToast("文章已保存");
+                                        }else{
+                                            s("第 " + (fix + 1) + " 条是文章，但正文获取失败");
+                                            showHintToast("文章保存失败");
+                                        }
+                                        return;
+                                    }
+                                    Object imgsObj = get(adM, "images");
+                                    if(!(imgsObj instanceof List) || ((List) imgsObj).isEmpty()){
+                                        Object ipi = get(adM, "image_post_info");
+                                        if(ipi instanceof Map){
+                                            Object ipiImgs = get((Map) ipi, "images");
+                                            if(ipiImgs instanceof List && !((List) ipiImgs).isEmpty()){
+                                                imgsObj = ipiImgs;
+                                            }
+                                        }
+                                    }
+                                    if(imgsObj instanceof List && !((List) imgsObj).isEmpty()){
+                                        java.util.List<String> im = new java.util.ArrayList<String>();
+                                        java.util.List<String> dv = new java.util.ArrayList<String>();
+                                        for(Object imo : (List) imgsObj){
+                                            if(!(imo instanceof Map)) continue;
+                                            Map imm = (Map) imo;
+                                            String iu = firstUrl(get(imm, "url_list"));
+                                            if(iu.length() > 0 && !iu.equals("?")) im.add(iu);
+                                            // 实况动轨：images[i].video.play_addr
+                                            String lv = "";
+                                            Object lvo = get(imm, "video");
+                                            if(lvo instanceof Map){
+                                                Object lpa = get((Map) lvo, "play_addr");
+                                                if(lpa instanceof Map) lv = firstUrl(get((Map) lpa, "url_list"));
+                                                if(lv.length() == 0){
+                                                    Object lda = get((Map) lvo, "download_addr");
+                                                    if(lda instanceof Map) lv = firstUrl(get((Map) lda, "url_list"));
+                                                }
+                                            }
+                                            dv.add(lv == null ? "" : lv);
+                                        }
+                                        if(!im.isEmpty()){
+                                            int liveN = 0;
+                                            for(int g = 0; g < im.size(); g++){
+                                                String iu = im.get(g);
+                                                String lv = (g < dv.size()) ? dv.get(g) : "";
+                                                String sid = fdid + "_" + (g + 1);
+                                                if(lv.length() > 0){
+                                                    liveN++;
+                                                    String ld = liveDirect(lv);
+                                                    enqueueDownloadPlat(iu, "实况" + (g + 1), "jpg", "动图",
+                                                            "", "抖音", sid);
+                                                    if(ld.length() > 0){
+                                                        enqueueDownloadPlat(ld, "实况" + (g + 1), "mp4", "动图",
+                                                                "", "抖音", sid + "_dyn");
+                                                    }
+                                                }else{
+                                                    enqueueDownloadPlat(iu, "图" + (g + 1), imgExtOf(iu), "图片",
+                                                            "", "抖音", sid);
+                                                }
+                                            }
+                                            DypLog.i("LIST_DETAIL_IMGS id=" + fdid
+                                                    + " n=" + im.size() + " live=" + liveN);
+                                            s("已加入下载队列：第 " + (fix + 1)
+                                                    + " 条（图集 " + im.size() + " 张"
+                                                    + (liveN > 0 ? "，含 " + liveN + " 张实况" : "") + "）");
+                                            showHintToast("图集已入队 " + im.size() + " 张");
+                                            return;
+                                        }
+                                    }
+                                    Object vObj = get(adM, "video");
+                                    if(vObj instanceof Map){
+                                        Map vm = (Map) vObj;
+                                        Object brs = get(vm, "bit_rate");
+                                        String best = "";
+                                        if(brs instanceof List){
+                                            Map bm2 = null; long ba = -1;
+                                            for(Object bo : (List) brs){
+                                                if(!(bo instanceof Map)) continue;
+                                                Map bmm = (Map) bo;
+                                                Object bpa = get(bmm, "play_addr");
+                                                if(!(bpa instanceof Map)) continue;
+                                                long w = parseLong(get((Map) bpa, "width"), 0);
+                                                long h2 = parseLong(get((Map) bpa, "height"), 0);
+                                                if(w <= 0 || h2 <= 0) continue;
+                                                if(w * h2 > ba){ ba = w * h2; bm2 = bmm; }
+                                            }
+                                            if(bm2 != null){
+                                                Object bpa = get(bm2, "play_addr");
+                                                if(bpa instanceof Map) best = firstUrl(get((Map) bpa, "url_list"));
+                                            }
+                                        }
+                                        if(best.length() == 0){
+                                            Object pa = get(vm, "play_addr");
+                                            if(pa instanceof Map) best = firstUrl(get((Map) pa, "url_list"));
+                                        }
+                                        boolean noGears = !(brs instanceof List) || ((List) brs).isEmpty();
+                                        if(at == 163 || mt == 43 || (noGears && isLikelyAudioUrl(best))){
+                                            music = true;
+                                            DypLog.i("LIST_DETAIL_MUSIC id=" + fdid
+                                                    + " aweme_type=" + at + " media_type=" + mt);
+                                        }else if(best.length() > 0 && !isLikelyAudioUrl(best)){
+                                            vurl = best;
+                                        }
+                                    }
+                                }
+                            }
+                        }catch(Throwable t){
+                            DypLog.i("LIST_DETAIL_PARSE_ERR " + t);
+                        }
+                    }
+                    if(vurl.length() > 0){
+                        DypLog.i("LIST_DETAIL_OK id=" + fdid + " url="
+                                + vurl.substring(0, Math.min(80, vurl.length())));
+                        enqueueDownload(vurl, "视频" + (fix + 1), "mp4", "视频", "", "抖音", fdid);
+                        s("已加入下载队列：第 " + (fix + 1) + " 条");
+                        showHintToast("已加入下载队列");
+                        return;
+                    }
+                    if(music){
+                        s("第 " + (fix + 1) + " 条是抖音音乐作品（只有音频，没有视频）");
+                        showHintToast("音乐作品，无视频流");
+                        return;
+                    }
+                    // detail 也没戏 → 退回整页解析（最后手段）
+                    DypLog.i("LIST_DETAIL_NG id=" + fdid + " 退回整页解析");
+                    s("解析第 " + (fix + 1) + " 条...");
+                    loadForParse(ftarget);
+                }});
+            }}).start();
+            return;
+        }
         s("解析第 " + (idx + 1) + " 条...");
         loadForParse(target);
     }
@@ -13701,7 +19624,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                         if(curPlay != null && curPlay.length() > 0) return curPlay;
                     }
                 }catch(Throwable t){
-                    Log.i("DYP", "TT_SRV_FALLBACK " + t);
+                    DypLog.i("TT_SRV_FALLBACK " + t);
                 }
                 TtParser.TtVideo tv = TtParser.resolve(this, url);
                 if(tv.ok() && tv.hasVideo()){
@@ -13717,7 +19640,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             // 抖音/快手：原样返回（下载器能处理）
             return url;
         }catch(Throwable t){
-            Log.i("DYP", "RESOLVE_DL_ERR " + t);
+            DypLog.i("RESOLVE_DL_ERR " + t);
             return null;
         }
     }
@@ -13740,7 +19663,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             String srv = effSrv();
             if(srv.length() == 0) return null;
             String api = srv + "/api/link/resolve?url=" + java.net.URLEncoder.encode(cardUrl, "UTF-8");
-            HttpURLConnection c = (HttpURLConnection) new java.net.URL(api).openConnection(java.net.Proxy.NO_PROXY);
+            HttpURLConnection c = (HttpURLConnection) new java.net.URL(api).openConnection();
             c.setRequestProperty("User-Agent", MUA);
             c.setRequestProperty("Accept", "application/json,*/*");
             // HMAC 鉴权
@@ -13770,7 +19693,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             in.close();
             c.disconnect();
             String body = bo.toString("UTF-8");
-            Log.i("DYP", "LINK_RESOLVE http=" + code + " len=" + body.length());
+            DypLog.i("LINK_RESOLVE http=" + code + " len=" + body.length());
             if(code != 200) return null;
             Object root = XParser.Json.parse(body);
             if(!(root instanceof java.util.Map)) return null;
@@ -13791,7 +19714,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             b.append('}');
             return b.toString();
         }catch(Throwable t){
-            Log.i("DYP", "LINK_CARD_ERR " + t);
+            DypLog.i("LINK_CARD_ERR " + t);
             return null;
         }
     }
@@ -13807,7 +19730,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                      final String vidUri, final Runnable onRaw, final Runnable on1080){
         new Thread(new Runnable(){ public void run(){
             long size = InnerDownloader.probeSize(rawPlay);
-            Log.i("DYP", "DL_PROBE size=" + size + " url=" + rawPlay.substring(0, Math.min(60, rawPlay.length())));
+            DypLog.i("DL_PROBE size=" + size + " url=" + rawPlay.substring(0, Math.min(60, rawPlay.length())));
             if(size <= 0 || size < BIG_FILE_BYTES){
                 h.post(new Runnable(){ public void run(){ onRaw.run(); }});
                 return;
@@ -13892,6 +19815,13 @@ boolean ttUrl = isTikTokUrl(curPlay);
             showHintToast("需要存储权限才能保存文件，请在弹窗里点「允许」");
             return;
         }
+        // 磁力：绝不走 HTTP 下载（magnet: 交给 InnerDownloader 必失败，
+        // 而且会和 BT 引擎的进度抢进度条，看起来「不动 + 乱跳」）
+        if(BtDownloader.isMagnet(curUrl) || (curUrl != null && curUrl.indexOf(".torrent") > 0)){
+            DypLog.i("DL_BTN_MAGNET " + curUrl.substring(0, Math.min(60, curUrl.length())));
+            startMagnetDownload(curUrl);
+            return;
+        }
         DiagLog.i(DiagLog.M_DOWNLOAD, "开始下载 | 链接=" + (curUrl == null ? "?" : curUrl));
         // X 多视频：一条推带 2~4 个视频，先让用户选第几个
         if(curXVideos.size() > 1){
@@ -13945,7 +19875,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                 showHintToast("拿不到 1080p 地址，改为下载原画");
                                 pick = rawP;
                             }
-                            Log.i("DYP", "DL_PICK_1080 " + pick.substring(0, Math.min(60, pick.length())));
+                            DypLog.i("DL_PICK_1080 " + pick.substring(0, Math.min(60, pick.length())));
                             enqueueDownloadWithAudio(pick, "视频", "mp4", "视频", "", auF);
                         }});
                     return;
@@ -14000,7 +19930,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     if(cnt == 0){ s("未选择任何图片"); return; }
                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
                     s("已加入下载：" + cnt + " 个");
-                    Log.i("DYP", "IMG_QUEUE n=" + cnt);
+                    DypLog.i("IMG_QUEUE n=" + cnt);
                 }
             })
             .setNeutralButton("全选下载", new android.content.DialogInterface.OnClickListener(){
@@ -14018,7 +19948,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     }
                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
                     s("已加入下载：" + n + " 个");
-                    Log.i("DYP", "IMG_QUEUE all n=" + n);
+                    DypLog.i("IMG_QUEUE all n=" + n);
                 }
             })
             .setNegativeButton("取消", null)
@@ -14037,7 +19967,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             }});
             img = httpGetBytes(task.url);
             if(img == null || img.length < 100){
-                Log.i("DYP", "LIVE_IMG_FAIL len=" + (img == null ? -1 : img.length));
+                DypLog.i("LIVE_IMG_FAIL len=" + (img == null ? -1 : img.length));
                 appLog("下载", "✗ 实况静态图下载失败");
                 return false;
             }
@@ -14046,7 +19976,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             }});
             mp4 = httpGetBytes(task.liveUrl);
             if(mp4 == null || mp4.length < 1000){
-                Log.i("DYP", "LIVE_MP4_FAIL len=" + (mp4 == null ? -1 : mp4.length));
+                DypLog.i("LIVE_MP4_FAIL len=" + (mp4 == null ? -1 : mp4.length));
                 appLog("下载", "✗ 实况动轨下载失败");
                 return false;
             }
@@ -14054,7 +19984,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 progSet(0.85f, "封装实况照片…");
             }});
             LivePhoto.Result r = LivePhoto.build(img, mp4, target);
-            Log.i("DYP", "LIVE_RESULT ok=" + r.ok + " size=" + r.size + " err=" + r.err
+            DypLog.i("LIVE_RESULT ok=" + r.ok + " size=" + r.size + " err=" + r.err
                     + " img=" + img.length + " mp4=" + mp4.length);
             appLog("下载", (r.ok ? "✓ 实况 " : "✗ 实况 ")
                     + (r.ok ? target.getName() + "  " + InnerDownloader.sizeText(r.size) : r.err));
@@ -14063,7 +19993,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             }
             return r.ok;
         }catch(Throwable t){
-            Log.i("DYP", "LIVE_DL_ERR " + t);
+            DypLog.i("LIVE_DL_ERR " + t);
             appLog("下载", "✗ 实况封装异常 " + t);
             return false;
         }
@@ -14091,7 +20021,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 @Override public void onDone(boolean ok2, File out, String msg){}
             }, curSession, this);
             if(!vOk || vTmp.length() < 1024){
-                Log.i("DYP", "YT_DUAL_V_FAIL len=" + (vTmp.exists() ? vTmp.length() : -1));
+                DypLog.i("YT_DUAL_V_FAIL len=" + (vTmp.exists() ? vTmp.length() : -1));
                 appLog("下载", "✗ 视频轨下载失败");
                 return false;
             }
@@ -14110,7 +20040,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 @Override public void onDone(boolean ok2, File out, String msg){}
             }, curSession, this);
             if(!aOk || aTmp.length() < 1024){
-                Log.i("DYP", "YT_DUAL_A_FAIL len=" + (aTmp.exists() ? aTmp.length() : -1));
+                DypLog.i("YT_DUAL_A_FAIL len=" + (aTmp.exists() ? aTmp.length() : -1));
                 appLog("下载", "✗ 音轨下载失败，改用纯视频轨");
                 // 音轨失败不整体失败：直接改名视频轨为最终文件
                 try{ if(target.exists()) target.delete(); vTmp.renameTo(target); }catch(Throwable t){}
@@ -14121,7 +20051,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 progSet(0.92f, String.format(Locale.US, "(%d/%d) 合成音视频…", fIdx, fTotal));
             }});
             boolean mOk = muxMp4(vTmp.getAbsolutePath(), aTmp.getAbsolutePath(), target.getAbsolutePath());
-            Log.i("DYP", "YT_DUAL_MUX ok=" + mOk + " out=" + (target.exists() ? target.length() : -1));
+            DypLog.i("YT_DUAL_MUX ok=" + mOk + " out=" + (target.exists() ? target.length() : -1));
             appLog("下载", (mOk ? "✓ 视频+音轨已合成 " : "✗ 合成失败 ")
                     + target.getName() + "  " + InnerDownloader.sizeText(target.length()));
             if(mOk){
@@ -14129,7 +20059,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             }
             return mOk;
         }catch(Throwable t){
-            Log.i("DYP", "YT_DUAL_ERR " + t);
+            DypLog.i("YT_DUAL_ERR " + t);
             appLog("下载", "✗ 双轨下载异常 " + t);
             return false;
         }finally{
@@ -14204,7 +20134,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
             mux.stop();
             return true;
         }catch(Throwable t){
-            Log.i("DYP", "MUX_ERR " + t);
+            DypLog.i("MUX_ERR " + t);
             return false;
         }finally{
             try{ if(vEx != null) vEx.release(); }catch(Throwable t){}
@@ -14249,23 +20179,23 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 final long[] lastLog = new long[]{0};
                 byte[] data = httpGetBytes(srcUrl, new ProgressCb(){
                     @Override public void onStart(long total){
-                        Log.i("DYP", "DL start total=" + total);
+                        DypLog.i("DL start total=" + total);
                         progSet(0f, "下载中  " + (total > 0 ? humanSize(total) : "未知大小"));
                     }
                     @Override public void onProgress(long done, long total){
                         float r = total > 0 ? (float)((double) done / total) : 0f;
                         progSet(r * 0.35f, "下载中  " + humanSize(done) + (total > 0 ? " / " + humanSize(total) : ""));
                         long now = System.currentTimeMillis();
-                        if(now - lastLog[0] > 1000){ lastLog[0] = now; Log.i("DYP", "DL " + done + "/" + total); }
+                        if(now - lastLog[0] > 1000){ lastLog[0] = now; DypLog.i("DL " + done + "/" + total); }
                     }
-                    @Override public void onError(Exception e){ Log.i("DYP", "DL err " + e); }
+                    @Override public void onError(Exception e){ DypLog.i("DL err " + e); }
                 });
                 if(data == null || data.length < 1024){ s("视频下载失败"); progHide(); return; }
 
                 tmp = new java.io.File(getCacheDir(), useMusic ? "tmp_audio_src.m4a" : "tmp_audio_src.mp4");
                 java.io.FileOutputStream fo = new java.io.FileOutputStream(tmp);
                 fo.write(data); fo.close();
-                Log.i("DYP", "DL done " + data.length + "B music=" + useMusic);
+                DypLog.i("DL done " + data.length + "B music=" + useMusic);
                 data = null;
 
                 // ---------- 阶段 2：转码（35% ~ 100%） ----------
@@ -14293,7 +20223,7 @@ final String pfx;
                                 "转码中  %.1fs / %s", timeMs / 1000.0, fmtAll));
                         }
                         @Override public void onDone(boolean ok2, String msg){
-                            Log.i("DYP", "MP3 done ok=" + ok2 + " msg=" + msg);
+                            DypLog.i("MP3 done ok=" + ok2 + " msg=" + msg);
                             appLog("转码", (ok2 ? "✓ " : "✗ ") + fout + "  " + msg);
                         }
                     });
@@ -14308,7 +20238,7 @@ final String pfx;
                     progHide();
                 }
             }catch(Throwable t){
-                Log.i("DYP","EXTRACT_ERR " + t);
+                DypLog.i("EXTRACT_ERR " + t);
                 s("提取失败");
                 progHide();
             }finally{
@@ -14346,7 +20276,7 @@ final String pfx;
                     public void onClick(android.content.DialogInterface d, int w){
                         if(ok){
                             String r = PowerHelper.openOemBackgroundSettings(MainActivity.this);
-                            Log.i("DYP", "OEM_SETTINGS_OPEN " + r);
+                            DypLog.i("OEM_SETTINGS_OPEN " + r);
                             showHintToast("把本应用设为「允许后台运行」");
                         }else{
                             PowerHelper.requestIgnoreBattery(MainActivity.this);
@@ -14361,7 +20291,7 @@ final String pfx;
                             showBackgroundTips();
                         }else{
                             String r = PowerHelper.openOemBackgroundSettings(MainActivity.this);
-                            Log.i("DYP", "OEM_SETTINGS_OPEN " + r);
+                            DypLog.i("OEM_SETTINGS_OPEN " + r);
                             showHintToast("把本应用设为「允许后台运行」");
                         }
                     }
@@ -14439,12 +20369,233 @@ final String pfx;
         return new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "DYParse").getAbsolutePath();
     }
 
-    /** 分类下载目录：分类自定义 > 根目录/分类 */
+    /** 同时下载数选择（1~8，10/12/16 更激进） */
+    void showDlConcDialog(){
+        curDark = isDarkMode();
+        final int[] vals = { 1, 2, 3, 4, 5, 6, 8, 10, 12, 16 };
+        String[] items = new String[vals.length];
+        for(int i = 0; i < vals.length; i++){
+            String tip;
+            if(vals[i] == 1) tip = "串行 · 最稳";
+            else if(vals[i] <= 3) tip = "省流量";
+            else if(vals[i] <= 6) tip = "较快";
+            else if(vals[i] <= 8) tip = "很快（可能被平台限速）";
+            else tip = "拉满（耗电/发热明显）";
+            items[i] = vals[i] + " 个 · " + tip;
+        }
+        int cur = dlConcurrency();
+        int sel = 0;
+        for(int i = 0; i < vals.length; i++) if(vals[i] == cur) sel = i;
+        dypDlg()
+            .setTitle("同时下载数")
+            .setSingleChoiceItems(items, sel, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putInt("dl_concurrency", vals[which]).apply();
+                    DypLog.i("DL_CONCURRENCY set=" + vals[which]);
+                    try{ dd.dismiss(); }catch(Throwable t){}
+                    buildSettingsPage();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 单文件分片数选择 */
+    void showSegDialog(){
+        curDark = isDarkMode();
+        final int[] vals = { 1, 2, 4, 8, 12, 16 };
+        String[] items = new String[vals.length];
+        for(int i = 0; i < vals.length; i++){
+            String tip;
+            if(vals[i] == 1) tip = "不分片 · 单线程（最稳，旧机型推荐）";
+            else if(vals[i] <= 4) tip = "温和加速";
+            else if(vals[i] <= 8) tip = "推荐 · 速度明显变快";
+            else tip = "激进 · 耗流量，部分 CDN 会限速";
+            items[i] = vals[i] + " 段 · " + tip;
+        }
+        int cur = InnerDownloader.segCount(this);
+        int sel = 0;
+        for(int i = 0; i < vals.length; i++) if(vals[i] == cur) sel = i;
+        dypDlg()
+            .setTitle("单文件分片数")
+            .setMessage("只对支持 Range 的直链生效，且文件需大于 4MB。\n" + "不支持分片的链接会自动回退单线程续传，不会失败。")
+            .setSingleChoiceItems(items, sel, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putInt("dl_segments", vals[which]).apply();
+                    DypLog.i("DL_SEGMENTS set=" + vals[which]);
+                    try{ dd.dismiss(); }catch(Throwable t){}
+                    buildSettingsPage();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 摘要：「已选 N 个，其余默认」 */
+    String dlPlatSummary(){
+        int custom = 0;
+        for(String p : DL_PLATS){
+            String key = "dl_dir_" + dlPlatKeyOf(p);
+            String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+            if(v != null && v.length() > 0) custom++;
+        }
+        if(custom == 0) return "全部走默认 · 点这里按平台修改（视频/图片/动图自动再分）";
+        return custom + " 个平台已自定义，" + (DL_PLATS.length - custom) + " 个走默认";
+    }
+
+    /** 平台目录管理：列表选平台 → 二级弹窗改路径 */
+    void showDlPlatDialog(){
+        curDark = isDarkMode();
+        String[] items = new String[DL_PLATS.length];
+        for(int i = 0; i < DL_PLATS.length; i++){
+            String p = DL_PLATS[i];
+            String key = "dl_dir_" + dlPlatKeyOf(p);
+            String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+            String def = new File(dlRootDir(), p).getAbsolutePath();
+            items[i] = p + (v != null && v.length() > 0 ? " · 已改" : "")
+                    + "\n" + (v != null && v.length() > 0 ? v : def);
+        }
+        dypDlg()
+            .setTitle("下载路径（每平台一个根目录，里面的视频/图片/动图由程序自动分）")
+            .setItems(items, new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    showDlPlatEditDialog(DL_PLATS[which]);
+                }
+            })
+            .setNegativeButton("关闭", null)
+            .create().show();
+    }
+
+    /** 修改某个平台的根目录（改成选择目录，不再手打路径） */
+    void showDlPlatEditDialog(final String plat){
+        curDark = isDarkMode();
+        final String key = "dl_dir_" + dlPlatKeyOf(plat);
+        final String def = new java.io.File(dlRootDir(), plat).getAbsolutePath();
+        String cur = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
+        final boolean custom = cur != null && cur.length() > 0;
+        final String shown = custom ? cur : def;
+
+        // 两步弹窗：先说明，再进目录选择器。
+        // 不用 setMessage + setItems 混写 —— 列表项会把 message 挤没。
+        dypDlg()
+            .setTitle("「" + plat + "」下载目录")
+            .setMessage((custom ? "当前（自定义）：\n" : "当前（默认）：\n") + shown
+                    + "\n\n"
+                    + "这个目录下的「视频 / 图片 / 动图 / 音频 / 合集」由程序自动再分子目录。")
+            .setPositiveButton("选择目录", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    pickDirWithSystem(key, def, "选择「" + plat + "」的保存位置");
+                }
+            })
+            .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int w){
+                    getSharedPreferences(SP, MODE_PRIVATE).edit()
+                        .putString(key, "").apply();
+                    DypLog.i("DIR_PICK plat=" + plat + " -> (恢复默认)");
+                    buildSettingsPage();
+                    Toast.makeText(MainActivity.this,
+                        plat + " 已恢复默认目录", Toast.LENGTH_SHORT).show();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
+
+    /** 分类下载目录（兼容旧调用）：落到「当前解析平台」/分类 */
     String dlDirFor(String cat){
-        String k = dlKeyOf(cat);
-        String v = getSharedPreferences(SP, MODE_PRIVATE).getString(k, "");
+        return dlDirFor2(platOf(curUrl), cat);
+    }
+
+    // ===== 平台目录：每平台一个根目录，里面再分 视频/图片/动图/音频/合集 =====
+    /** 平台清单（顺序：国内→海外，与 PLATFORM_LIST 对齐） */
+    static final String[] DL_PLATS = {
+        "抖音", "快手", "B站", "小红书", "微信视频号", "微信公众号", "微博",
+        "今日头条", "西瓜视频", "AcFun", "好看视频", "最右", "皮皮虾", "皮皮搞笑",
+        "微视", "豆包", "腾讯视频",
+        "TikTok", "X", "YouTube", "Instagram",
+        "磁力", "其他"
+    };
+
+    /** 由链接判定平台名（决定下载到哪个平台目录） */
+    static String platOf(String url){
+        if(url == null || url.length() == 0) return "其他";
+        String u = url.toLowerCase();
+        if(BtDownloader.isMagnet(u) || u.indexOf(".torrent") > 0) return "磁力";
+        // 抖音：除了网页域名，还要覆盖 CDN。
+        // 主页列表的 play_addr 直链都是 CDN 域名，
+        // 不补这些会被判成「其他」，文件就落到 其他/视频 里。
+        if(u.contains("douyin.com") || u.contains("iesdouyin.com") || u.contains("amemv.com")
+                || u.contains("snssdk.com")
+                || u.contains("douyinvod") || u.contains("douyinpic")
+                || u.contains("byteicdn") || u.contains("byteimg")
+                || u.contains("zjcdn") || u.contains("dycdn")
+                || u.contains("pstatp.com") || u.contains("ixigua.com/obj")) return "抖音";
+        if(u.contains("kuaishou.com") || u.contains("yximgs.com") || u.contains("kwimgs.com")
+                || u.contains("gifshow.com")) return "快手";
+        if(TtParser.isTtUrl(u) || u.contains("tiktok")) return "TikTok";
+        if(isXDomain(u) || u.contains("twitter.com")) return "X";
+        if(YtParser.isYtUrl(u) || u.contains("youtube.com") || u.contains("youtu.be")
+                || u.contains("googlevideo")) return "YouTube";
+        if(BiliParser.isBiliUrl(u) || u.contains("bilibili.com") || u.contains("b23.tv")
+                || u.contains("bilivideo")) return "B站";
+        if(u.contains("instagram.com") || u.contains("cdninstagram.com")) return "Instagram";
+        if(u.contains("weibo.com") || u.contains("m.weibo.cn") || u.contains("sinaimg")) return "微博";
+        if(u.contains("v.qq.com")) return "腾讯视频";
+        if(u.contains("weixin.qq.com") || u.contains("finder.video.qq")) return "微信视频号";
+        if(XhsParser.isXhsUrl(u) || u.contains("xiaohongshu.com") || u.contains("xhscdn")) return "小红书";
+        if(u.contains("toutiao.com")) return "今日头条";
+        if(u.contains("ixigua.com")) return "西瓜视频";
+        if(u.contains("acfun.cn")) return "AcFun";
+        if(u.contains("haokan.baidu.com")) return "好看视频";
+        if(u.contains("pipix.com")) return "皮皮虾";
+        if(u.contains("zuiyou.com")) return "最右";
+        if(u.contains("weishi.qq.com")) return "微视";
+        if(u.contains("doubao.com")) return "豆包";
+        return "其他";
+    }
+
+    /** 平台名 -> prefs key 后缀（ASCII 安全） */
+    static String dlPlatKeyOf(String plat){
+        if(plat == null || plat.length() == 0) return "other";
+        if("抖音".equals(plat)) return "douyin";
+        if("快手".equals(plat)) return "kuaishou";
+        if("B站".equals(plat)) return "bilibili";
+        if("小红书".equals(plat)) return "xhs";
+        if("微信视频号".equals(plat)) return "sph";
+        if("微信公众号".equals(plat)) return "wxmp";
+        if("微博".equals(plat)) return "weibo";
+        if("今日头条".equals(plat)) return "toutiao";
+        if("西瓜视频".equals(plat)) return "xigua";
+        if("AcFun".equals(plat)) return "acfun";
+        if("好看视频".equals(plat)) return "haokan";
+        if("最右".equals(plat)) return "zuiyou";
+        if("皮皮虾".equals(plat)) return "pipix";
+        if("皮皮搞笑".equals(plat)) return "ppgg";
+        if("微视".equals(plat)) return "weishi";
+        if("豆包".equals(plat)) return "doubao";
+        if("腾讯视频".equals(plat)) return "txvideo";
+        if("TikTok".equals(plat)) return "tiktok";
+        if("X".equals(plat)) return "x";
+        if("YouTube".equals(plat)) return "youtube";
+        if("Instagram".equals(plat)) return "instagram";
+        if("磁力".equals(plat)) return "magnet";
+        return "other";
+    }
+
+    /** 平台根目录：用户自定义 > 默认 Download/DYParse/<平台> */
+    String dlPlatDir(String plat){
+        String key = "dl_dir_" + dlPlatKeyOf(plat);
+        String v = getSharedPreferences(SP, MODE_PRIVATE).getString(key, "");
         if(v != null && v.length() > 0) return v;
-        return new File(dlRootDir(), cat).getAbsolutePath();
+        return new File(dlRootDir(), plat).getAbsolutePath();
+    }
+
+    /** 最终落盘目录 = 平台根目录 / 分类（视频/图片/动图/音频/合集） */
+    String dlDirFor2(String plat, String cat){
+        String base = dlPlatDir(plat);
+        return new File(base, cat).getAbsolutePath();
     }
 
     /** 分类 → prefs key */
@@ -14470,9 +20621,218 @@ final String pfx;
         enqueueDownload(url, tag, ext, cat, "");
     }
 
+    /** 带显式平台名的入队：调用方已经知道平台时用这个，别让 platOf 去猜 URL 域名。
+     *  典型场景：主页/合集列表拿到的 CDN 直链（douyinvod 等），
+     *  platOf 认不出来会落到「其他」，文件就存错目录。
+     *  注意用 6 参（带 mixDir），避免和已有的 5 参重载冲突。 */
+    void enqueueDownload(String url, String tag, String ext, String cat,
+                         String mixDir, String platOverride){
+        enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, "");
+    }
+
+    /** 带平台 + 稳定 id 的入队（批量直链专用）。
+     *  stableId 用作品 id（aweme_id / 视频 id），保证同一作品每次文件名一致，
+     *  否则抖音直链带签名的特性会让同一视频被重复下载多份。 */
+    void enqueueDownload(String url, String tag, String ext, String cat,
+                         String mixDir, String platOverride, String stableId){
+        enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, stableId);
+    }
+
+    /** 单个下载（不带音轨）：不进下载列表 */
+    void enqueueSingle(String url, String tag, String ext, String cat, String mixDir){
+        if(BtDownloader.isMagnet(url) || (url != null && url.indexOf(".torrent") > 0)){
+            final String mm = url;
+            h.post(new Runnable(){ public void run(){ startMagnetDownload(mm); }});
+            return;
+        }
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir);
+        try{ InnerDownloader.clearCancel(t.url); dlDeleted.remove(dlTaskKey(t)); }catch(Throwable te){}
+        // 重新下载同一 URL：清掉上次删除留下的取消标记
+        try{ InnerDownloader.clearCancel(url); dlDeleted.remove(dlTaskKey(t));
+             dlPaused.remove(dlTaskKey(t)); }catch(Throwable te){}
+        // 单个下载也进「下载」页：退出软件后能继续下，用户要求下载过程都在下载里看得到
+        t.silent = false;
+        t.plat = platOf(url);
+        try{ t.nameBase = taskStableName(url, tag); }catch(Throwable e){}
+        downloadQueue.add(t);
+        DypLog.i("DL_QUEUE_SINGLE + " + tag + " cat=" + cat);
+        saveDlTasks();
+        // 批量解析阶段：解析够 conc 条后由 BATCH_DL_EARLY_KICK 启动队列，
+        // 之后每条入队都直接跑（dlRunning 已是 true）。
+        // 在首次 kick 之前不启动，避免队列里只有 1 条时并发等于 1。
+        boolean holdForBatch = (batchDlIndex >= 0 && batchDlIndex < batchDlTotal
+                && !batchDlKicked);
+        if(!dlRunning && !holdForBatch){
+            dlRunning = true;
+            runDownloadQueue();
+        } else if(holdForBatch){
+            DypLog.i("DL_QUEUE_HOLD 批量解析中（未达并发数），暂不启动");
+        }
+    }
+
+    /** 单个下载（带音轨）：不进下载列表 */
+    void enqueueSingleWithAudio(String url, String tag, String ext, String cat,
+                                String mixDir, String audioUrl){
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir, "", "", audioUrl);
+        try{ InnerDownloader.clearCancel(t.url); dlDeleted.remove(dlTaskKey(t)); }catch(Throwable te){}
+        t.silent = true;
+        t.plat = platOf(url);
+        downloadQueue.add(t);
+        DypLog.i("DL_QUEUE_SINGLE_AUDIO + " + tag + " cat=" + cat);
+        saveDlTasks();
+        if(!dlRunning){
+            dlRunning = true;
+            runDownloadQueue();
+        }
+    }
+
+    /** 从链接里抠稳定的作品 id（抖音/TikTok/B站/YouTube/X/IG），抠不到返回空 */
+    static String extractMediaId(String u){
+        if(u == null) return "";
+        try{
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("/(?:video|note|slides|photo)/(\\d{6,25})").matcher(u);
+            if(m.find()) return m.group(1);
+            m = java.util.regex.Pattern
+                .compile("(?:bilibili\\.com/video/|b23\\.tv/)(BV[0-9A-Za-z]{8,14}|av\\d{5,12})").matcher(u);
+            if(m.find()) return m.group(1);
+            m = java.util.regex.Pattern.compile("[?&]v=([A-Za-z0-9_-]{8,16})").matcher(u);
+            if(m.find()) return m.group(1);
+            m = java.util.regex.Pattern.compile("youtu\\.be/([A-Za-z0-9_-]{8,16})").matcher(u);
+            if(m.find()) return m.group(1);
+            m = java.util.regex.Pattern.compile("/(?:status|i/status)/(\\d{6,25})").matcher(u);
+            if(m.find()) return m.group(1);
+            m = java.util.regex.Pattern.compile("instagram\\.com/(?:p|reel|tv)/([A-Za-z0-9_-]{5,20})").matcher(u);
+            if(m.find()) return m.group(1);
+        }catch(Throwable t){}
+        return "";
+    }
+
+    /**
+     * 判断一个地址是不是「真的能下到媒体文件的直链」。
+     *
+     * 批量下载曾经把作品页 URL（https://www.douyin.com/video/123）当成直链入队，
+     * 下载器 GET 回来的是抖音反爬验证页 HTML（~32KB），
+     * 存成 .mp4 后相册显示 00:00 —— 用户看到的就是「批量下载又不行了」。
+     *
+     * 这里做入队前拦截：只放行媒体 CDN 域名，页面域名一律拒绝。
+     * 返回空串表示可用，返回非空表示拒绝原因。
+     */
+    static String rejectNonMediaUrl(String u){
+        if(u == null || u.length() == 0) return "空地址";
+        String s = u.toLowerCase();
+        if(!(s.startsWith("http://") || s.startsWith("https://"))) return "非 http 地址";
+        // 明确是「网页」的域名/路径：一律拒绝
+        String[] pageHosts = {
+            "www.douyin.com", "douyin.com", "v.douyin.com", "iesdouyin.com",
+            "www.iesdouyin.com", "m.douyin.com",
+            "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+            "www.kuaishou.com", "v.kuaishou.com", "live.kuaishou.com",
+            "x.com", "twitter.com", "www.youtube.com", "youtu.be",
+            "www.bilibili.com", "b23.tv", "space.bilibili.com",
+            "www.instagram.com", "www.xiaohongshu.com", "xhslink.com",
+            "weixin.qq.com", "channels.weixin.qq.com"
+        };
+        String host = "";
+        try{
+            java.net.URL uu = new java.net.URL(u);
+            host = uu.getHost() == null ? "" : uu.getHost().toLowerCase();
+        }catch(Throwable t){
+            return "URL 解析失败";
+        }
+        for(String h : pageHosts){
+            if(host.equals(h)) return "这是作品页地址不是直链(" + host + ")";
+        }
+        // 路径里出现 /video/<数字> 这类作品路径，也说明是页面
+        if(s.matches(".*/(video|note|slides|photo)/\\d{6,25}.*")) return "作品页路径";
+        return "";
+    }
+    /** 按链接判定文件名前缀（跟下载平台目录保持一致） */
+    static String mediaPfx(String u){
+        if(u == null) return "dl_";
+        try{
+            if(TtParser.isTtUrl(u)) return "tt_";
+            if(KsParser.isKsUrl(u) || u.indexOf("kuaishou") >= 0 || u.indexOf("kwaicdn") >= 0) return "ks_";
+            if(isXDomain(u) || u.indexOf("twitter.com") >= 0) return "x_";
+            if(YtParser.isYtUrl(u) || u.indexOf("googlevideo") >= 0) return "yt_";
+            if(BiliParser.isBiliUrl(u) || u.indexOf("bilivideo") >= 0 || u.indexOf("hdslb") >= 0) return "bl_";
+            if(u.indexOf("xhscdn") >= 0 || u.indexOf("xiaohongshu") >= 0) return "xhs_";
+            if(u.indexOf("sinaimg") >= 0 || u.indexOf("weibo") >= 0) return "wb_";
+            if(u.indexOf("ixigua") >= 0) return "xg_";
+            if(u.indexOf("toutiao") >= 0) return "ttoutiao_";
+            if(u.indexOf("douyin") >= 0 || u.indexOf("amemv") >= 0
+                    || u.indexOf("iesdouyin") >= 0 || u.indexOf("douyinpic") >= 0) return "dy_";
+        }catch(Throwable t){}
+        return "dl_";
+    }
+
+    /** 入队时就定好文件名（不带扩展名）：重启恢复后名字不变，才能接着 .part 续传 */
+    String taskStableName(String url, String tag){
+        return taskStableName(url, tag, "");
+    }
+
+    /**
+     * 文件名主体（决定去重是否有效）。
+     *
+     * @param stableId 调用方已知的稳定 id（如主页列表的 aweme_id）。
+     *                 非空时优先用它 —— 抖音 CDN 直链每次都带新签名，
+     *                 拿整条 URL 的 hashCode 当 id 会导致同一个视频
+     *                 每次算出不同文件名，去重失效、重复下载。
+     */
+    String taskStableName(String url, String tag, String stableId){
+        try{
+            String u = url == null ? "" : url;
+            // 【优先用调用方给的 stableId】
+            //
+            // 以前是「先从 URL 抠 id，抠不到才用 stableId」。
+            // 但抖音 CDN 直链里经常夹着别的数字段，
+            // extractMediaId 会把它们误当作品 id：
+            //   直链下载 → 抠到 A → dy_A_视频6.mp4
+            //   detail 下载 → 抠到 B → dy_B_视频6_2.mp4
+            // 同一个作品存成两份。
+            //
+            // 主页/批量解析调用时一定知道自己手里的 aweme_id，
+            // 那是全流程恒定的，必须无条件优先。
+            String sid = (stableId == null) ? "" : stableId.trim();
+            String id;
+            if(sid.length() > 0){
+                id = sid;
+            }else{
+                id = extractMediaId(u);
+                if(id.length() == 0){
+                    // 抠不到 id（CDN 直链等），按可靠性依次回退：
+                    //   1) curId（当前解析出的作品 id）
+                    //   2) 整条 URL 的 hashCode —— 最不可靠，
+                    //      抖音直链带签名，同一视频每次都不一样
+                    if(curId != null && curId.length() > 0){
+                        id = curId;
+                    }else{
+                        id = "u" + Integer.toHexString(u.hashCode());
+                    }
+                }
+            }
+            String t = tag == null ? "" : tag.replace("/", "_").replace("\\", "_");
+            return mediaPfx(u) + id + "_" + t;
+        }catch(Throwable t){ return ""; }
+    }
+
     void enqueueDownload(String url, String tag, String ext, String cat, String mixDir){
-        downloadQueue.add(new DlTask(url, tag, ext, cat, mixDir));
-        Log.i("DYP", "DL_QUEUE + " + tag + " cat=" + cat + " 总计=" + downloadQueue.size());
+        // 磁力一律不进 HTTP 队列：交给 BT 引擎（否则 HTTP 下载 magnet: 必失败，
+        // 还会和 BT 进度抢同一个进度条，表现为「进度条不动 + 乱跳」）
+        if(BtDownloader.isMagnet(url) || (url != null && url.indexOf(".torrent") > 0)){
+            DypLog.i("DL_ENQ_MAGNET_TO_BT " + url.substring(0, Math.min(60, url.length())));
+            final String mm = url;
+            h.post(new Runnable(){ public void run(){ startMagnetDownload(mm); }});
+            return;
+        }
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir);
+        try{ InnerDownloader.clearCancel(t.url); dlDeleted.remove(dlTaskKey(t)); }catch(Throwable te){}
+        t.plat = platOf(url);
+        try{ t.nameBase = taskStableName(url, tag); }catch(Throwable e){}
+        downloadQueue.add(t);
+        DypLog.i("DL_QUEUE + " + tag + " cat=" + cat + " plat=" + t.plat
+                + " 总计=" + downloadQueue.size());
+        saveDlTasks();
         if(!dlRunning){
             dlRunning = true;
             runDownloadQueue();
@@ -14481,12 +20841,511 @@ final String pfx;
 
     /** 带独立音轨入队（YouTube direct 双轨下载） */
     void enqueueDownloadWithAudio(String url, String tag, String ext, String cat, String mixDir, String audioUrl){
-        downloadQueue.add(new DlTask(url, tag, ext, cat, mixDir, "", "", audioUrl));
-        Log.i("DYP", "DL_QUEUE + " + tag + " cat=" + cat + " audio=" + (audioUrl.length() > 0) + " 总计=" + downloadQueue.size());
+        if(BtDownloader.isMagnet(url) || (url != null && url.indexOf(".torrent") > 0)){
+            DypLog.i("DL_ENQ_MAGNET_TO_BT " + url.substring(0, Math.min(60, url.length())));
+            final String mm = url;
+            h.post(new Runnable(){ public void run(){ startMagnetDownload(mm); }});
+            return;
+        }
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir, "", "", audioUrl);
+        try{ InnerDownloader.clearCancel(t.url); dlDeleted.remove(dlTaskKey(t)); }catch(Throwable te){}
+        t.plat = platOf(url);
+        try{ t.nameBase = taskStableName(url, tag); }catch(Throwable e){}
+        downloadQueue.add(t);
+        saveDlTasks();
+        DypLog.i("DL_QUEUE + " + tag + " cat=" + cat + " audio=" + (audioUrl.length() > 0) + " 总计=" + downloadQueue.size());
         if(!dlRunning){
             dlRunning = true;
             runDownloadQueue();
         }
+    }
+
+    /** 入队核心：platOverride 非空时用它当平台，不再让 platOf 去猜 URL 域名。
+     *
+     *  为什么需要：主页/合集列表拿到的 play_addr 直链是 CDN 域名
+     *  （v3-web.douyinvod.com / v5-dy.byteicdn.com / zjcdn ...），
+     *  platOf 认不出来会落到「其他」，文件就存到 其他/视频 而不是 抖音/视频。
+     *  调用方明明知道平台，直接传进来比事后猜可靠得多。 */
+    void enqueueDownloadPlat(String url, String tag, String ext, String cat,
+                             String mixDir, String platOverride){
+        enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, "", "");
+    }
+
+    void enqueueDownloadPlat(String url, String tag, String ext, String cat,
+                             String mixDir, String platOverride, String stableId){
+        enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, stableId, "");
+    }
+
+    /** liveUrl 非空 = 实况图：url 是静态图，liveUrl 是动轨视频，
+     *  下载后两者封成一个 .jpg，存到「动图」目录（和单独下载一致）。 */
+    void enqueueDownloadPlat(String url, String tag, String ext, String cat,
+                             String mixDir, String platOverride, String stableId,
+                             String liveUrl){
+        if(BtDownloader.isMagnet(url) || (url != null && url.indexOf(".torrent") > 0)){
+            final String mm = url;
+            h.post(new Runnable(){ public void run(){ startMagnetDownload(mm); }});
+            return;
+        }
+        DlTask t = new DlTask(url, tag, ext, cat, mixDir,
+                (liveUrl == null ? "" : liveUrl), "", "");
+        try{ InnerDownloader.clearCancel(t.url); dlDeleted.remove(dlTaskKey(t)); }catch(Throwable te){}
+        // 平台：优先用调用方给的，没有再让 platOf 猜
+        String p = (platOverride == null) ? "" : platOverride.trim();
+        if(p.length() > 0){
+            t.plat = p;
+            DypLog.i("DL_PLAT_FORCE plat=" + p + " tag=" + tag);
+        }else{
+            t.plat = platOf(url);
+        }
+        try{ t.nameBase = taskStableName(url, tag, stableId); }catch(Throwable e){}
+        downloadQueue.add(t);
+        saveDlTasks();
+        DypLog.i("DL_QUEUE + " + tag + " cat=" + cat + " plat=" + t.plat
+                + " name=" + t.nameBase + " 总计=" + downloadQueue.size());
+        if(!dlRunning){
+            dlRunning = true;
+            runDownloadQueue();
+        }
+    }
+
+    // ============================================================
+    // 批量下载的 detail 通道
+    //
+    // 为什么要它：主页列表接口返回的 video 字段是残缺的，
+    // 38 条里 30 多条只带 music 轨（douyinstatic/ies-music/*.mp3），
+    // 拿这种地址下载就是「只有音频没有画面」。
+    //
+    // 而 /aweme/v1/web/aweme/detail/ 返回的 aweme_detail.video 是完整的，
+    // bit_rate[] 每档都带真正的视频 CDN（xxx.douyinvod.com）。
+    // 只发一次 XHR，比打开整页快得多，也不会触发页面级风控。
+    // ============================================================
+    /** 是否正在等批量 detail 结果 */
+    volatile boolean batchDetailWant = false;
+    /** 正在等哪个作品的 detail */
+    volatile String batchDetailId = "";
+
+    /** 批量用：按作品 id 请求 detail，拿到真视频地址后入队。
+     *
+     *  走 DyDetail.fetch() —— 原生 HTTP，带 msToken + uifid + secsdk 签名。
+     *
+     *  为什么不用 WebView 里 fetch：
+     *    之前那版只带 device/browser 参数，没 uifid 没签名，
+     *    抖音直接回 403：
+     *        Blocked by ArgusSecurityPlugin Uifid Not Found
+     *    （DyDetail 第 19 行注释已写明这个坑）
+     *    而且走 WebView 还受页面风控状态影响，更不稳。
+     *
+     *  原生请求 + 完整签名是目前最稳的一条。 */
+    /**
+     * detail 失败 → 降级到整页解析（loadForParse）。
+     *
+     * 单条解析就是走这条路的，实测能拿到真视频直链；
+     * detail 是我们自己拼 XHR，缺 uifid 就被 403。
+     *
+     * 每个 id 最多降级一次，避免无限循环。
+     */
+    void fallbackToPageParse(final int idx, final String why){
+        if(idx < 0 || idx >= batchDlQueue.size()) return;
+        Integer tried = batchDlPageTried.get(idx);
+        if(tried != null && tried >= 1){
+            DypLog.i("BATCH_DL_PAGE_GIVEUP idx=" + idx + " 整页解析也试过了");
+            batchDlIndex = idx;
+            h.post(new Runnable(){ public void run(){ advanceBatchAfterDetail(false); }});
+            return;
+        }
+        batchDlPageTried.put(idx, 1);
+        final ProfileParser.ProfileItem item = batchDlQueue.get(idx);
+        String u = (item != null && item.url != null) ? item.url : "";
+        DypLog.i("BATCH_DL_PAGE_FALLBACK idx=" + idx + " why=" + why + " url=" + u);
+        if(u.length() == 0){
+            batchDlIndex = idx;
+            h.post(new Runnable(){ public void run(){ advanceBatchAfterDetail(false); }});
+            return;
+        }
+        batchDetailWant = false;
+        batchDlIndex = idx;
+        pendingAutoDlTag = "视频" + (idx + 1);
+        pendingAutoDlIdx = idx;
+        s("批量下载 " + (idx + 1) + "/" + batchDlTotal + "：解析中…");
+        h.post(new Runnable(){ public void run(){ loadForParse(u); }});
+        // 【看门狗】整页解析被抖音风控时，loadForParse 不会回调，
+        // batchDlIndex 就永远卡在这一条（实测卡死在 idx=0 十几分钟）。
+        // 25 秒还没推进，就强推下一条。
+        h.postDelayed(new Runnable(){ public void run(){
+            if(batchDlIndex == idx && "视频" .concat(String.valueOf(idx + 1)).equals(pendingAutoDlTag)){
+                DypLog.i("BATCH_DL_PAGE_TIMEOUT idx=" + idx + " 整页解析超时，跳过");
+                pendingAutoDlTag = "";
+                pendingAutoDlIdx = -1;
+                batchDlPageTried.put(idx, 9);
+                advanceBatchAfterDetail(false);
+            }
+        }}, 25000L);
+    }
+
+    /** 整页解析试过的条目（每个只降级一次） */
+    final java.util.Map<Integer, Integer> batchDlPageTried =
+            new java.util.concurrent.ConcurrentHashMap<Integer, Integer>();
+
+    /** 本次批量下载里「纯音乐作品」的条数（aweme_type=163 / media_type=43） */
+    volatile int batchDlMusic = 0;
+
+    /** detail body 落盘诊断：只存前 2 条 */
+    volatile int detailDumpLeft = 2;
+
+    void fetchDetailForBatch(final String awemeId){
+        new Thread(new Runnable(){ public void run(){
+            try{
+                // cookie / uifid：都走 App 的实时取值（WebView → 本地 → 访客凭据三级兜底）
+                //
+                // 以前这里只取 CookieStore 本地文件，那份里没有 UIFID_TEMP，
+                // 于是 detail 请求不带 uifid，被抖音 Argus 直接 403：
+                //   Blocked by ArgusSecurityPlugin Uifid Not Found
+                // 而 App 内其实拿得到 uifid（日志 UIFID_FROM_CM len=352）。
+                String ck = "";
+                try{ ck = dyEffectiveCookie(); }catch(Throwable t){}
+                if(ck == null) ck = "";
+                String ui = "";
+                try{ ui = dyCurUifid(); }catch(Throwable t){}
+                if(ui == null) ui = "";
+                DypLog.i("BATCH_DETAIL_CRED ckLen=" + ck.length() + " uifidLen=" + ui.length());
+                DyDetail.Result r = DyDetail.fetch(awemeId, ck, 2, ui);
+                DypLog.i("BATCH_DETAIL_REQ id=" + awemeId + " " + r);
+                // 【一次性诊断】把 detail 原始 body 存下来，
+                // 用来确认 bit_rate / play_addr 到底给了什么。
+                if(r != null && r.ok && r.body != null && detailDumpLeft > 0){
+                    detailDumpLeft--;
+                    try{
+                        java.io.File df = new java.io.File(
+                                android.os.Environment.getExternalStorageDirectory(),
+                                "Download/DYParse/detail_dump_" + awemeId + ".json");
+                        df.getParentFile().mkdirs();
+                        java.io.FileOutputStream fo = new java.io.FileOutputStream(df);
+                        fo.write(r.body.getBytes("UTF-8"));
+                        fo.close();
+                        DypLog.i("BATCH_DETAIL_DUMP path=" + df.getAbsolutePath()
+                                + " len=" + r.body.length());
+                    }catch(Throwable dt){
+                        DypLog.i("BATCH_DETAIL_DUMP_ERR " + dt);
+                    }
+                }
+                if(r == null || !r.ok || r.body == null || r.body.length() == 0){
+                    batchDlDetailBlocked++;
+                    DypLog.i("BATCH_DETAIL_FAIL id=" + awemeId
+                            + " err=" + (r == null ? "null" : r.err));
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                Object root = new JP(r.body).parse();
+                if(!(root instanceof Map)){
+                    DypLog.i("BATCH_DETAIL_NOT_MAP");
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                Object ad = get((Map) root, "aweme_detail");
+                if(!(ad instanceof Map)){
+                    DypLog.i("BATCH_DETAIL_NO_AWEME");
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                Map adM = (Map) ad;
+                Object vObj = get(adM, "video");
+                if(!(vObj instanceof Map)){
+                    DypLog.i("BATCH_DETAIL_NO_VIDEO id=" + awemeId);
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                Map vm = (Map) vObj;
+                // 【文章最先判】抖音文章也带 aweme_type=163/media_type=43，
+                // 必须靠 article_info 区分，否则会被当音乐作品跳过。
+                try{
+                    Object artObj = get(adM, "article_info");
+                    if(artObj instanceof Map){
+                        String atitle = gs(get((Map) artObj, "article_title"));
+                        String amd = dyArticleMd(artObj);
+                        String saved = saveDyArticle(awemeId, atitle, amd);
+                        DypLog.i("BATCH_DETAIL_ARTICLE id=" + awemeId
+                                + " title=" + atitle + " mdLen=" + amd.length()
+                                + " saved=" + saved);
+                        batchDetailWant = false;
+                        final int aidx = batchDlIndex;
+                        final boolean aok = saved.length() > 0;
+                        h.post(new Runnable(){ public void run(){
+                            if(aok) batchDlOk++;
+                            batchDlIndex = aidx;
+                            advanceBatchAfterDetail(aok);
+                        }});
+                        return;
+                    }
+                }catch(Throwable t){}
+
+                String best = "";
+                // 【音乐作品识别】aweme_type=163 / media_type=43 是抖音「音乐/BGM 作品」，
+                // 天生没有视频流（play_addr 直接指向 ies-music 的 mp3）。
+                // 这种条目当视频下必然失败，还白耗一次风控额度 → 直接跳过并计数。
+                try{
+                    long at0 = parseLong(get(adM, "aweme_type"), 0);
+                    long mt0 = parseLong(get(adM, "media_type"), 0);
+                    Object brs0 = get(vm, "bit_rate");
+                    boolean noGears = !(brs0 instanceof List) || ((List) brs0).isEmpty();
+                    String pa0 = "";
+                    Object paObj0 = get(vm, "play_addr");
+                    if(paObj0 instanceof Map) pa0 = firstUrl(get((Map) paObj0, "url_list"));
+                    if(at0 == 163 || mt0 == 43 || (noGears && isLikelyAudioUrl(pa0))){
+                        batchDlMusic++;
+                        DypLog.i("BATCH_DETAIL_MUSIC id=" + awemeId + " aweme_type=" + at0
+                                + " media_type=" + mt0 + " noGears=" + noGears
+                                + " 纯音乐作品，跳过");
+                        batchDetailWant = false;
+                        final int midx0 = batchDlIndex;
+                        h.post(new Runnable(){ public void run(){
+                            batchDlIndex = midx0;
+                            advanceBatchAfterDetail(false);
+                        }});
+                        return;
+                    }
+                }catch(Throwable t){}
+                // 1) bit_rate 里分辨率最高的那一档（真视频流）
+                try{
+                    List brs = (List) get(vm, "bit_rate");
+                    if(brs != null){
+                        Map bestMap = null; long bestArea = -1;
+                        for(int b = 0; b < brs.size(); b++){
+                            Object bo = brs.get(b);
+                            if(!(bo instanceof Map)) continue;
+                            Map bm = (Map) bo;
+                            Object bpa = get(bm, "play_addr");
+                            if(!(bpa instanceof Map)) continue;
+                            long w = parseLong(get((Map) bpa, "width"), 0);
+                            long h2 = parseLong(get((Map) bpa, "height"), 0);
+                            if(w <= 0 || h2 <= 0) continue;
+                            long area = w * h2;
+                            if(area > bestArea){ bestArea = area; bestMap = bm; }
+                        }
+                        if(bestMap != null){
+                            Object bpa = get(bestMap, "play_addr");
+                            if(bpa instanceof Map){
+                                String uu = firstUrl(get((Map) bpa, "url_list"));
+                                if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                            }
+                        }
+                        DypLog.i("BATCH_DETAIL_GEARS n=" + brs.size()
+                                + " best=" + (best.length() > 0 ? "yes" : "no"));
+                    }
+                }catch(Throwable t){}
+                // 2) 退回顶层 play_addr
+                if(best.length() == 0){
+                    Object pa = get(vm, "play_addr");
+                    if(pa instanceof Map){
+                        String uu = firstUrl(get((Map) pa, "url_list"));
+                        if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                    }
+                }
+                // 3) 退回 download_addr
+                if(best.length() == 0){
+                    Object da = get(vm, "download_addr");
+                    if(da instanceof Map){
+                        String uu = firstUrl(get((Map) da, "url_list"));
+                        if(uu.length() > 0 && !uu.equals("?")) best = uu;
+                    }
+                }
+                if(best.length() == 0){
+                    DypLog.i("BATCH_DETAIL_NO_URL id=" + awemeId);
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                if(isLikelyAudioUrl(best)){
+                    DypLog.i("BATCH_DETAIL_AUDIO id=" + awemeId + " url="
+                            + best.substring(0, Math.min(80, best.length())));
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                DypLog.i("BATCH_DETAIL_OK id=" + awemeId + " url="
+                        + best.substring(0, Math.min(100, best.length())));
+                batchDetailWant = false;
+                final String vv = best;
+                final String sid = awemeId;
+                h.post(new Runnable(){ public void run(){
+                    String tag = "视频" + (batchDlIndex + 1);
+                    DypLog.i("BATCH_DL_ENQ_DETAIL tag=" + tag + " plat=抖音");
+                    enqueueDownload(vv, tag, "mp4", "视频", "", "抖音", sid);
+                    batchDlOk++;
+                    advanceBatchAfterDetail(true);
+                }});
+            }catch(Throwable t){
+                DypLog.i("BATCH_DETAIL_ERR " + t);
+                batchDetailWant = false;
+                h.post(new Runnable(){ public void run(){ advanceBatchAfterDetail(false); }});
+            }
+        }}).start();
+    }
+
+    /** JS 回传的批量 detail 结果 */
+    void onBatchDetailFromWeb(final String body){
+        final String b = body == null ? "" : body;
+        new Thread(new Runnable(){ public void run(){
+            try{
+                Object root = new JP(b).parse();
+                if(!(root instanceof Map)){
+                    DypLog.i("BATCH_DETAIL_BAD " + b);
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                Map m = (Map) root;
+                String err = gs(get(m, "err"));
+                String vurl = gs(get(m, "url"));
+                String id = gs(get(m, "id"));
+                if(err.length() > 0 || vurl.length() == 0){
+                    DypLog.i("BATCH_DETAIL_FAIL id=" + id + " err=" + err
+                            + " url_len=" + vurl.length());
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                // 【音乐作品识别】aweme_type=163 / media_type=43 是抖音的
+                // 「音乐/BGM 作品」：天生没有视频流，play_addr 直接就是 ies-music 的 mp3。
+                // 这种条目当视频下必然失败，而且白白消耗一次风控额度，
+                // 所以直接跳过（单独计一类数，最后在结束提示里说清楚）。
+                try{
+                    long at = 0, mt = 0, dur0 = 0;
+                    try{ at = parseLong(get((Map) root, "aweme_type"), 0); }catch(Throwable t2){}
+                    try{ mt = parseLong(get((Map) root, "media_type"), 0); }catch(Throwable t2){}
+                    boolean musicOnly = (at == 163 || mt == 43)
+                            || isLikelyAudioUrl(vurl);
+                    if(musicOnly){
+                        batchDlMusic++;
+                        DypLog.i("BATCH_DETAIL_MUSIC id=" + id + " aweme_type=" + at
+                                + " media_type=" + mt + " dur=" + dur0
+                                + " 纯音乐作品，跳过");
+                        batchDetailWant = false;
+                        final int midx = batchDlIndex;
+                        h.post(new Runnable(){ public void run(){
+                            batchDlIndex = midx;
+                            advanceBatchAfterDetail(false);
+                        }});
+                        return;
+                    }
+                }catch(Throwable t){}
+
+                // 音频也拒掉（detail 极少出现，但不能不防）
+                if(isLikelyAudioUrl(vurl)){
+                    DypLog.i("BATCH_DETAIL_AUDIO id=" + id + " url="
+                            + vurl.substring(0, Math.min(80, vurl.length())));
+                    batchDetailWant = false;
+                    // 【关键】不再直接跳过，改成走整页解析。
+                    // 单条解析就是这条路，实测能拿到真视频直链。
+                    final int fidx = batchDlIndex;
+                    h.post(new Runnable(){ public void run(){
+                        fallbackToPageParse(fidx, "detail失败");
+                    }});
+                    return;
+                }
+                DypLog.i("BATCH_DETAIL_OK id=" + id + " url="
+                        + vurl.substring(0, Math.min(80, vurl.length())));
+                batchDetailWant = false;
+                final String vv = vurl;
+                h.post(new Runnable(){ public void run(){
+                    String tag = "视频" + (batchDlIndex + 1);
+                    DypLog.i("BATCH_DL_ENQ_DETAIL tag=" + tag + " plat=抖音");
+                    enqueueDownload(vv, tag, "mp4", "视频", "", "抖音", id);
+                    batchDlOk++;
+                    advanceBatchAfterDetail(true);
+                }});
+            }catch(Throwable t){
+                DypLog.i("BATCH_DETAIL_PARSE_ERR " + t + " stack=" + android.util.Log.getStackTraceString(t));
+                batchDetailWant = false;
+                final int fidx2 = batchDlIndex;
+                h.post(new Runnable(){ public void run(){ fallbackToPageParse(fidx2, "解析异常"); }});
+            }
+        }}).start();
+    }
+
+    /** detail 拿到（或失败）后推进批量队列 */
+    void advanceBatchAfterDetail(boolean ok){
+        if(batchDlIndex < 0 || batchDlIndex >= batchDlQueue.size()) return;
+        batchDlIndex++;
+        if(batchDlIndex >= batchDlTotal){
+            s("批量下载完成：成功入队 " + batchDlOk + "/" + batchDlTotal + " 条");
+            showHintToast("批量完成：" + batchDlOk + "/" + batchDlTotal + " 条已入队");
+            int okc = batchDlOk;
+            batchDlIndex = -1;
+            batchDlQueue.clear();
+            batchDlTotal = 0;
+            batchDlOk = 0;
+            DypLog.i("BATCH_DL_DONE ok=" + okc + " noUrl=" + batchDlNoUrl
+                    + " detail403=" + batchDlDetailBlocked);
+            // 一条都没入队时，要把原因说清楚，别让用户干等。
+            // 实测：抖音主页接口现在只给 douyinstatic 的背景音乐，
+            // 真视频流被剥离，directUrl 全空 → 回落 detail → 403。
+            if(okc == 0 && batchDlTotal > 0){
+                if(batchDlDetailBlocked > 0 && batchDlNoUrl > 0){
+                    s("批量下载失败：列表里这些作品主页接口没给视频直链，"
+                            + "走 detail 又被抖音风控拦了（要登录 Cookie）。"
+                            + "建议：先在设置里登录抖音，再逐条点「解析」重试。");
+                }else if(batchDlMusic > 0){
+                    s("这批里有 " + batchDlMusic + " 条是抖音音乐作品（没有视频），"
+                            + "已跳过。其余 " + (batchDlTotal - batchDlMusic)
+                            + " 条需要风控冷却后再试。");
+                }else if(batchDlNoUrl > 0){
+                    s("批量下载失败：这些条目都没有视频直链（"
+                            + batchDlNoUrl + " 条），请逐条点「解析」获取。");
+                }else{
+                    s("批量下载完成：成功入队 0/" + batchDlTotal + " 条");
+                }
+            }
+            batchDlNoUrl = 0;
+            batchDlDetailBlocked = 0;
+            batchDlMusic = 0;
+            return;
+        }
+        s("批量下载 " + (batchDlIndex + 1) + "/" + batchDlTotal + "…");
+        h.postDelayed(new Runnable(){ public void run(){ stepBatchProfileDl(); }}, 300);
     }
 
     /** 下载任务：cat = 分类目录（视频/图片/音频/合集），mixDir = 合集专属子目录（可为空） */
@@ -14494,8 +21353,9 @@ final String pfx;
         final String url, tag, ext, cat, mixDir;
         /** 非空表示这是实况图：url=静态图，liveUrl=动轨视频，下载后封装成一个 .jpg */
         final String liveUrl;
-        /** 非空时用它作为文件名主体（合集用：标题_第N集），否则用 dy_<id>_<tag> */
-        final String nameBase;
+        /** 非空时用它作为文件名主体（合集用：标题_第N集），否则用 dy_<id>_<tag>
+         *  非 final：入队时由 taskStableName() 填入，保证重启后名字不变、能续传 */
+        String nameBase;
         /** YouTube direct：独立音轨直链，非空时下载后与视频轨本地 mux */
         final String audioUrl;
         DlTask(String u, String t, String e){ this(u, t, e, "视频", "", "", "", ""); }
@@ -14515,72 +21375,97 @@ final String pfx;
             nameBase = nb == null ? "" : nb;
             audioUrl = au == null ? "" : au;
         }
+        /** true = 单个下载，不进「下载」页列表（只在解析页进度条显示） */
+        boolean silent = false;
+        /** 下载平台（抖音/快手/B站/YouTube/…），决定存到哪个平台目录 */
+        String plat = "";
         boolean isLive(){ return liveUrl.length() > 0; }
     }
 
-    final java.util.List<DlTask> downloadQueue = new java.util.ArrayList<DlTask>();
+    final java.util.List<DlTask> downloadQueue =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<DlTask>());
     volatile boolean dlRunning = false;
+    /**
+     * 下载页行 key 全局递增器。
+     *
+     * 之前用 final int rowKey = idx（idxSeq 每轮 runDownloadQueue 从 0 重数），
+     * 第二批下载会和第一批 key 完全重叠 → 行被覆盖、删除删错、进度串到别的行。
+     * 改用全局递增，保证 key 永不复用。
+     */
+    final java.util.concurrent.atomic.AtomicInteger dlRowKeyGen =
+            new java.util.concurrent.atomic.AtomicInteger(1000);
+    /**
+     * 用户主动删除的任务黑名单（key = url|tag）。
+     *
+     * 任务线程的 finally 会把失败任务回填 dlFailed 并 saveDlTasks()。
+     * 用户点删除后线程又写回持久化，表现就是「删了又回来」。
+     * 这里记一份黑名单，写盘、回填、恢复时都跳过。
+     */
+    final java.util.Set<String> dlDeleted =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    /**
+     * 用户主动「暂停」的任务（key = url|tag）。
+     *
+     * 暂停会中断下载线程，InnerDownloader.fetch 返回 false，
+     * 如果不管，界面那行会被 runOneTask 结尾改写成「✗ 失败」，
+     * 并且 finally 会把任务当失败回填 → 表现为「点了暂停像没反应」。
+     * 这里单独记账，结尾与回填时都跳过。
+     */
+    final java.util.Set<String> dlPaused =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    static String dlTaskKey(DlTask t){
+        if(t == null) return "";
+        return (t.url == null ? "" : t.url) + "|" + (t.tag == null ? "" : t.tag);
+    }
     /** 本次下载实际落盘的目录集合（按顺序去重），用于完成时显示完整路径 */
     final java.util.LinkedHashSet<String> savedDirs = new java.util.LinkedHashSet<String>();
 
     /** 串行消费下载队列，进度条显示 第N个/总数 */
-    void runDownloadQueue(){
-        // 前台服务：切后台继续下载（WakeLock + 通知栏实时进度）
-        try{
-            DownloadService.markStart(this);
-            DownloadService.updateProgress("DYParse 下载", "准备中…", -1);
-        }catch(Throwable t){
-            Log.i("DYP", "DL_SERVICE_ERR " + t);
-        }
-        new Thread(new Runnable(){ public void run(){
-            int total = downloadQueue.size();
-            int idx = 0;
-            int okCount = 0, failCount = 0;
-            final String[] lastCatDir = new String[]{ "" };   // 记录最后一个任务的实际目录
-            progShow();
-            try{
-                while(!downloadQueue.isEmpty()){
-                    if(progCancel){ downloadQueue.clear(); break; }
-                    DlTask task;
-                    synchronized(downloadQueue){ task = downloadQueue.remove(0); }
-                    if(task == null || task.url == null || task.url.length() == 0) continue;
-                    idx++;
-                    final int fIdx = idx, fTotal = total;
-
-                    String name;
+    /** 执行单个下载任务（原串行循环体，逻辑不变）。返回是否成功。 */
+    boolean runOneTask(DlTask task, int idx, int total, String[] lastCatDir,
+                       java.util.concurrent.atomic.AtomicInteger doneCount,
+                       java.util.concurrent.atomic.AtomicInteger running){
+                    // 兜底：万一有磁力任务漏进 HTTP 队列，直接跳过（交给 BT 引擎）
+                    if(BtDownloader.isMagnet(task.url)){
+                        DypLog.i("DL_HTTP_SKIP_MAGNET " + task.url.substring(0, Math.min(50, task.url.length())));
+                        h.post(new Runnable(){ public void run(){ startMagnetDownload(task.url); }});
+                        return false;
+                    }
+                    // 稳定文件名：优先用入队时定好的 nameBase（重启后名字不变，
+                    // 半成品 .part 才匹配得上继续下）；没有就按「解析平台 + 作品 id」兜底。
+                    // 关键：绝不能依赖 curId——重启后 curId 是空/别的作品，会下错文件且续传全废。
+                    String base;
                     if(task.nameBase.length() > 0){
-                        // 合集：标题_第N集.mp4（不加时间戳，保证 .part 能匹配上做续传）
-                        name = task.nameBase + "." + task.ext;
+                        base = task.nameBase;
                     } else {
-                        // 前缀按「当前解析的平台」判定：X/YouTube 的媒体走服务器中转，
-                        // 光看下载 URL 会误判成 dy_，所以同时看 curUrl。
                         String pfx;
                         if(TtParser.isTtUrl(task.url)) pfx = "tt_";
                         else if(KsParser.isKsUrl(task.url)) pfx = "ks_";
                         else if(isXDomain(task.url) || isXDomain(curUrl)) pfx = "x_";
                         else if(YtParser.isYtUrl(task.url) || YtParser.isYtUrl(curUrl)) pfx = "yt_";
                         else if(BiliParser.isBiliUrl(task.url) || BiliParser.isBiliUrl(curUrl)
-|| task.url.indexOf("bilivideo.com") >= 0) pfx = "bl_";
+                                || task.url.indexOf("bilivideo.com") >= 0) pfx = "bl_";
                         else pfx = "dy_";
-                        // 关键：文件名必须稳定（不带时间戳），否则每次下载生成新名字，
-                        // 旧的 .part 永远匹配不上，断点续传等于失效。
-                        // 同一作品同一角标重复下载 → 直接覆盖/续传，这也是用户期望的行为。
-                        name = pfx + curId + "_" + task.tag + "." + task.ext;
+                        base = pfx + (curId == null ? "" : curId) + "_" + task.tag;
+                    }
+                    String name;
+                    synchronized(dlNameLock){
+                        name = base + "." + task.ext;
                         // 重名且已有完整文件时，加 _2/_3 后缀避免覆盖用户已下好的文件
-                        File catDirTmp = new File(dlDirFor(task.cat));
+                        File catDirTmp = new File(dlDirFor2(task.plat, task.cat));
                         if(task.mixDir != null && task.mixDir.length() > 0){
                             catDirTmp = new File(catDirTmp, task.mixDir);
                         }
                         File probe = new File(catDirTmp, name);
                         int dup = 2;
                         while(probe.exists() && probe.length() > 0 && dup < 100){
-                            name = pfx + curId + "_" + task.tag + "_" + dup + "." + task.ext;
+                            name = base + "_" + dup + "." + task.ext;
                             probe = new File(catDirTmp, name);
                             dup++;
                         }
                     }
                     // 分类下载目录：分类自定义 > 根目录/分类；合集再加专属子文件夹
-                    File catDir = new File(dlDirFor(task.cat));
+                    File catDir = new File(dlDirFor2(task.plat, task.cat));
                     if(task.mixDir != null && task.mixDir.length() > 0){
                         catDir = new File(catDir, task.mixDir);
                     }
@@ -14590,20 +21475,24 @@ final String pfx;
                     // 测试开关：设置里有 force_scoped 时强制走 MediaStore 兜底（仅调试用）
                     if(getSharedPreferences(SP, MODE_PRIVATE).getBoolean("force_scoped", false)){
                         dirWritable = false;
-                        Log.i("DYP", "DL_FORCE_SCOPED 测试开关已开启");
+                        DypLog.i("DL_FORCE_SCOPED 测试开关已开启");
                     }
                     File workDir = catDir;
-                    String relSub = task.cat;
+                    // MediaStore 兜底时的相对子目录：必须带平台名，
+                    // 否则 Android 10+ 走兜底路径后文件会落到 Download/动图/，
+                    // 而不是 Download/DYParse/TikTok/动图/，多平台混在一起分不清来源。
+                    String platSub = (task.plat == null) ? "" : task.plat.trim();
+                    String relSub = (platSub.length() > 0 ? platSub + "/" : "") + task.cat;
                     if(!dirWritable){
                         workDir = new File(getCacheDir(), "dl_tmp");
                         if(!workDir.exists()) workDir.mkdirs();
-                        Log.i("DYP", "DL_SCOPED_FALLBACK 目录不可写，改用私有临时目录: "
+                        DypLog.i("DL_SCOPED_FALLBACK 目录不可写，改用私有临时目录: "
                                 + catDir.getAbsolutePath() + " -> " + workDir.getAbsolutePath());
                         DiagLog.w(DiagLog.M_PERM, "下载目录不可写，走 MediaStore 兜底 | "
                                 + catDir.getAbsolutePath() + " | API=" + android.os.Build.VERSION.SDK_INT);
                     }
                     if(task.mixDir != null && task.mixDir.length() > 0){
-                        relSub = task.cat + "/" + task.mixDir;
+                        relSub = (platSub.length() > 0 ? platSub + "/" : "") + task.cat + "/" + task.mixDir;
                     }
                     final File target = new File(workDir, name);
                     lastCatDir[0] = catDir.getAbsolutePath();
@@ -14611,22 +21500,48 @@ final String pfx;
                     final long[] speedState = new long[]{ System.currentTimeMillis(), 0L };
 
                     s("下载中 " + idx + "/" + total + "：" + name);
-                    Log.i("DYP", "DL_START " + idx + "/" + total + " " + name);
+                    DypLog.i("DL_START " + idx + "/" + total + " " + name);
+                    // 单个下载(silent)不进「下载」页，只在解析页进度条显示
+                    final boolean silent = task.silent;
+                    final int rowKey = dlRowKeyGen.incrementAndGet();
+                    if(silent){
+                        dlSilentKeys.add(rowKey);   // 标记：所有 dlRow* 调用都会自动忽略
+                    }else{
+                        dlRowAdd(rowKey, name);
+                        dlRowUpdate(rowKey, 0, "连接中…");
+                        // 关键：注册行 -> 任务 / 路径的映射。
+                        // 不注册的话，用户点「删除」时 doDeleteDlRow 拿不到 DlTask，
+                        // 既加不进 dlDeleted 黑名单，也移不出队列，
+                        // 任务跑完后 finally 又回填 dlFailed 并写盘 —— 删除无效。
+                        dlRowResume.put(rowKey, task);
+                        try{ dlRowPath.put(rowKey, target.getAbsolutePath()); }catch(Throwable t){}
+                    }
 
                     boolean ok;
                     if(task.isLive()){
                         ok = downloadLivePhoto(task, target);
                     } else if(task.audioUrl != null && task.audioUrl.length() > 0){
                         // YouTube direct：视频轨 + 音频轨分别下载，MediaMuxer 本地合成 mp4
-                        ok = downloadDualTrack(task, target, fIdx, fTotal);
+                        ok = downloadDualTrack(task, target, idx, total);
                     } else {
-                        // TikTok 下载需要 Session（cookie + 代理分流）
+                        // TikTok 下载必须复用解析阶段的 Session。
+                        // 这里原来写的是 new TtParser.Session()，等于新建一个空 cookie 容器，
+                        // 下载请求不带 Cookie → TikTok CDN 直接 403（表现就是「能播不能下」）。
+                        // 播放器用的是 curSession，所以能播；下载也必须用同一份。
                         final Object ttSes = TtParser.isTtUrl(task.url)
-                                ? new TtParser.Session() : curSession;
+                                ? (curSession != null ? curSession : new TtParser.Session())
+                                : curSession;
+                        if(TtParser.isTtUrl(task.url)){
+                            int ckLen = -1;
+                            try{ ckLen = ((TtParser.Session) ttSes).cookieHeader().length(); }catch(Throwable t){}
+                            DypLog.i("TT_DL_SESSION reuse=" + (ttSes == curSession) + " ckLen=" + ckLen);
+                        }
                         ok = InnerDownloader.fetch(task.url, target, new InnerDownloader.Cb(){
                             @Override public void onStart(long totalBytes){
                                 progSet(0f, String.format(Locale.US, "(%d/%d) 下载中  %s",
-                                        fIdx, fTotal, InnerDownloader.sizeText(totalBytes)));
+                                        idx, total, InnerDownloader.sizeText(totalBytes)));
+                                dlRowUpdate(rowKey, 0, totalBytes > 0
+                                        ? ("0%  " + InnerDownloader.sizeText(totalBytes)) : "下载中…");
                             }
                             @Override public void onProgress(long done, long tot){
                                 float r = tot > 0 ? (float)((double) done / tot) : 0f;
@@ -14644,12 +21559,17 @@ final String pfx;
                                     speedState[1] = done;
                                 }
                                 progSet(r, String.format(Locale.US, "(%d/%d) 下载中  %s / %s%s",
-                                        fIdx, fTotal,
+                                        idx, total,
                                         InnerDownloader.sizeText(done),
                                         tot > 0 ? InnerDownloader.sizeText(tot) : "?", spd));
+                                int pct = tot > 0 ? (int)((double) done * 1000 / tot) : -1;
+                                dlRowUpdate(rowKey, pct, tot > 0
+                                        ? String.format(Locale.US, "%d%%  %s%s",
+                                            (pct / 10), InnerDownloader.sizeText(done), spd)
+                                        : (InnerDownloader.sizeText(done) + spd));
                             }
                             @Override public void onDone(boolean ok2, File out, String msg){
-                                Log.i("DYP", "DL_END " + fIdx + "/" + fTotal + " ok=" + ok2 + " " + msg);
+                                DypLog.i("DL_END " + idx + "/" + total + " ok=" + ok2 + " " + msg);
                                 String name = out != null ? out.getName() : (target != null ? target.getName() : "?");
                                 appLog("下载", (ok2 ? "✓ " : "✗ ") + name + "  " + msg);
                                 // 失败时清掉半成品，避免空文件留在下载目录
@@ -14660,7 +21580,7 @@ final String pfx;
                         }, ttSes, MainActivity.this);
                     }
 
-                    if(ok) okCount++; else failCount++;
+                    if(!ok) dlRowUpdate(rowKey, -1, "✗ 失败（可重试续传）");
                     // 关键：必须通知系统媒体库，否则文件在磁盘上但相册看不到
                     if(ok){
                         File real = target;
@@ -14669,24 +21589,26 @@ final String pfx;
                             android.net.Uri mv = ScopedStore.saveToDownloads(
                                     MainActivity.this, target, relSub, target.getName());
                             if(mv != null){
-                                Log.i("DYP", "DL_SCOPED_MOVED " + target.getName() + " -> " + mv);
+                                DypLog.i("DL_SCOPED_MOVED " + target.getName() + " -> " + mv);
                                 try{ target.delete(); }catch(Throwable t){}
                                 try{ savedDirs.add(catDir.getAbsolutePath()); }catch(Throwable t){}
                                 // MediaStore 插入后系统已建档，不需要再 scanFile
                                 h.post(new Runnable(){ public void run(){
-                                    progSet(1f, "(" + fIdx + "/" + fTotal + ") 完成"); }});
-                                continue;
+                                    progSet(1f, "(" + idx + "/" + total + ") 完成"); }});
+                                dlRowUpdate(rowKey, 1000, "✓ 完成");
+                                return true;
                             }
                             // MediaStore 也失败：文件留在私有目录，至少用户能在这里找到
-                            Log.i("DYP", "DL_SCOPED_FAIL 保留在私有目录 " + target.getAbsolutePath());
+                            DypLog.i("DL_SCOPED_FAIL 保留在私有目录 " + target.getAbsolutePath());
                             DiagLog.e(DiagLog.M_PERM, "MediaStore 兜底失败，文件留在 "
                                     + target.getAbsolutePath());
                             try{ savedDirs.add(workDir.getAbsolutePath()); }catch(Throwable t){}
                             h.post(new Runnable(){ public void run(){
-                                progSet(1f, "(" + fIdx + "/" + fTotal + ") 完成");
+                                progSet(1f, "(" + idx + "/" + total + ") 完成");
                                 showHintToast("公共目录写入受限，文件已存到应用私有目录");
                             }});
-                            continue;
+                            dlRowUpdate(rowKey, 1000, "✓ 完成（私有目录）");
+                            return true;
                         }
                         // 图片下载后按真实文件头修正后缀：抖音/快手给的是 WEBP，
                         // 存成 .jpg 会让部分相册打不开。
@@ -14695,28 +21617,534 @@ final String pfx;
 // 记录实际落盘目录（完整路径）
                         try{ savedDirs.add(real.getParentFile().getAbsolutePath()); }catch(Throwable t){}
                     }
-                    h.post(new Runnable(){ public void run(){ progSet(1f, "(" + fIdx + "/" + fTotal + ") 完成"); }});
+                    h.post(new Runnable(){ public void run(){ progSet(1f, "(" + idx + "/" + total + ") 完成"); }});
+                    // 用户主动暂停：不要把这行改写成「✗ 失败」，
+                    // 否则暂停状态一闪就被失败覆盖，看着像暂停没生效。
+                    if(dlPaused.contains(dlTaskKey(task))){
+                        DypLog.i("DL_ONE_PAUSED_KEEP " + task.tag);
+                        dlRowUpdate(rowKey, -1, "已暂停 · 点「继续」接着下");
+                    }else{
+                        dlRowUpdate(rowKey, ok ? 1000 : -1, ok ? "✓ 完成" : "✗ 失败");
+                    }
+                    return ok;
+    }
+
+    /** 下载并发数：默认 5，可在设置里改（1~DL_CONC_MAX） */
+    int dlConcurrency(){
+        int n = getSharedPreferences(SP, MODE_PRIVATE).getInt("dl_concurrency", 5);
+        if(n < 1) n = 1;
+        if(n > DL_CONC_MAX) n = DL_CONC_MAX;
+        return n;
+    }
+
+    /** 同时下载数上限 */
+    static final int DL_CONC_MAX = 16;
+
+    /** 文件名去重锁：并发时避免两个任务抢到同一个 _2 后缀 */
+    final Object dlNameLock = new Object();
+
+    /** 正在下载中的任务（已出队但没下完）：也要一起持久化，否则退出就白下了 */
+    /** 本轮失败/未完成的任务：队列结束时写回持久化，供用户手动继续 */
+    final java.util.List<DlTask> dlFailed =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<DlTask>());
+
+    final java.util.List<DlTask> dlInFlight =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<DlTask>());
+
+    /** 下载任务持久化 key：退出软件后任务不丢 */
+    static final String KEY_DL_TASKS = "dl_tasks_json";
+
+    /** 把当前队列序列化成 JSON 存起来 */
+    void saveDlTasks(){
+        try{
+            org.json.JSONArray arr = new org.json.JSONArray();
+            java.util.List<DlTask> snap = new java.util.ArrayList<DlTask>();
+            synchronized(downloadQueue){ snap.addAll(downloadQueue); }
+            synchronized(dlInFlight){ snap.addAll(dlInFlight); }
+            for(DlTask t : snap){
+                // 用户已删除的任务不再写盘，否则重启后又冒出来
+                if(dlDeleted.contains(dlTaskKey(t))) continue;
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("u", t.url == null ? "" : t.url);
+                o.put("t", t.tag == null ? "" : t.tag);
+                o.put("e", t.ext == null ? "" : t.ext);
+                o.put("c", t.cat == null ? "" : t.cat);
+                o.put("m", t.mixDir == null ? "" : t.mixDir);
+                o.put("lv", t.liveUrl == null ? "" : t.liveUrl);
+                o.put("nb", t.nameBase == null ? "" : t.nameBase);
+                o.put("au", t.audioUrl == null ? "" : t.audioUrl);
+                o.put("s", t.silent);
+                o.put("p", t.plat == null ? "" : t.plat);
+                arr.put(o);
+            }
+            getSharedPreferences(SP, MODE_PRIVATE).edit()
+                .putString(KEY_DL_TASKS, arr.toString()).apply();
+            DypLog.i("DL_TASKS_SAVED n=" + arr.length());
+        }catch(Throwable e){
+            DypLog.i("DL_TASKS_SAVE_ERR " + e);
+        }
+    }
+
+    /** 读回上次没下完的队列 */
+    java.util.List<DlTask> loadDlTasks(){
+        java.util.List<DlTask> out = new java.util.ArrayList<DlTask>();
+        try{
+            String s = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_DL_TASKS, "");
+            if(s == null || s.length() < 3) return out;
+            org.json.JSONArray arr = new org.json.JSONArray(s);
+            for(int i = 0; i < arr.length(); i++){
+                org.json.JSONObject o = arr.getJSONObject(i);
+                DlTask t = new DlTask(
+                    o.optString("u", ""), o.optString("t", ""), o.optString("e", ""),
+                    o.optString("c", "视频"), o.optString("m", ""),
+                    o.optString("lv", ""), o.optString("nb", ""), o.optString("au", ""));
+                t.silent = o.optBoolean("s", false);
+                t.plat = o.optString("p", "");
+                if(t.plat.length() == 0) t.plat = platOf(t.url);
+                if(t.url != null && t.url.length() > 0) out.add(t);
+            }
+            DypLog.i("DL_TASKS_LOADED n=" + out.size());
+        }catch(Throwable e){
+            DypLog.i("DL_TASKS_LOAD_ERR " + e);
+        }
+        return out;
+    }
+
+    /** 磁力任务持久化 key（磁力不走 HTTP 队列，单独存） */
+    static final String KEY_BT_TASKS = "bt_tasks_json";
+
+    /** 存当前磁力任务（重开软件后从 saveDir 的 .part 继续下） */
+    void saveBtTask(String magnet){
+        try{
+            getSharedPreferences(SP, MODE_PRIVATE).edit()
+                .putString(KEY_BT_TASKS, magnet == null ? "" : magnet).apply();
+            DypLog.i("BT_TASK_SAVED");
+        }catch(Throwable t){}
+    }
+
+    /** 读上次未下完的磁力任务 */
+    String loadBtTask(){
+        try{
+            String s = getSharedPreferences(SP, MODE_PRIVATE).getString(KEY_BT_TASKS, "");
+            return s == null ? "" : s;
+        }catch(Throwable t){ return ""; }
+    }
+
+    void clearBtTask(){
+        try{
+            getSharedPreferences(SP, MODE_PRIVATE).edit().remove(KEY_BT_TASKS).apply();
+            DypLog.i("BT_TASK_CLEARED");
+        }catch(Throwable t){}
+    }
+
+    /** 开屏恢复：上次磁力没下完就继续（BT 从 .part 续传） */
+    void restoreBtTask(){
+        try{
+            final String m = loadBtTask();
+            if(m == null || m.length() < 8) return;
+            // 已经在下就别重复起
+            if(btRunning) return;
+            // 不自动续传：只在下载页列一条，用户手动点「继续」
+            DypLog.i("BT_TASK_PENDING " + m.substring(0, Math.min(60, m.length())));
+        }catch(Throwable t){ DypLog.i("BT_TASK_RESTORE_ERR " + t); }
+    }
+
+    /** 清空持久化队列（全部下完后调用） */
+    void clearDlTasks(){
+        try{
+            getSharedPreferences(SP, MODE_PRIVATE).edit()
+                .remove(KEY_DL_TASKS).apply();
+            DypLog.i("DL_TASKS_CLEARED");
+        }catch(Throwable e){}
+    }
+
+    /** 启动时恢复上次没下完的任务 */
+    /** 下载页「继续下载」按钮：手动恢复某条任务 */
+    void resumeOneTask(final DlTask t){
+        if(t == null) return;
+        try{
+            if(BtDownloader.isMagnet(t.url)
+                    || (t.url != null && t.url.toLowerCase().endsWith(".torrent"))){
+                DypLog.i("DL_RESUME_MAGNET " + t.url.substring(0, Math.min(50, t.url.length())));
+                startMagnetDownload(t.url);
+                return;
+            }
+            // 继续：清掉暂停/取消标记，否则新起的下载线程会立刻又退出
+            try{
+                InnerDownloader.clearCancel(t.url);
+                dlPaused.remove(dlTaskKey(t));
+                dlDeleted.remove(dlTaskKey(t));
+            }catch(Throwable te){}
+            synchronized(downloadQueue){ downloadQueue.add(t); }
+            saveDlTasks();
+            DypLog.i("DL_RESUME " + t.tag);
+            showHintToast("继续下载：" + (t.nameBase.length() > 0 ? t.nameBase : t.tag));
+            if(!dlRunning){
+                dlRunning = true;
+                runDownloadQueue();
+            }
+        }catch(Throwable e){ DypLog.i("DL_RESUME_ERR " + e); }
+    }
+
+    /** 切换某条任务的「已选待下」状态（下载页手动恢复用） */
+    final java.util.List<DlTask> dlSavedPending =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<DlTask>());
+
+    /** 开屏：把上次没下完的任务列到「下载」页，等用户手动点继续（不自动下载） */
+    void showSavedDlTasks(){
+        try{
+            java.util.List<DlTask> saved = loadDlTasks();
+            String btM = loadBtTask();
+            if((saved == null || saved.isEmpty()) && (btM == null || btM.length() < 8)){
+                DypLog.i("DL_SAVED_EMPTY");
+                dlRefreshHead();
+                return;
+            }
+            synchronized(dlSavedPending){
+                dlSavedPending.clear();
+                if(saved != null) dlSavedPending.addAll(saved);
+            }
+            dlRowClear();
+            // 磁力任务单独一条（BT 有自己独立的续传）
+            if(btM != null && btM.length() >= 8){
+                btSavedMagnet = btM;
+                final int bk = 950000;
+                dlRowAdd(bk, "【磁力·未完成】" + btM.substring(0, Math.min(32, btM.length())));
+                dlRowUpdate(bk, 0, "点「继续下载」接着下");
+                dlRowResume.put(bk, null);
+                dlRowIsBt.put(bk, true);
+                try{
+                    // 未完成磁力的落盘目录（按 infohash 定位）
+                    dlRowPath.put(bk, btSaveDir(btM).getAbsolutePath());
+                }catch(Throwable t){}
+                btRowKey = Math.max(btRowKey, bk);
+            }
+            for(int i = 0; i < dlSavedPending.size(); i++){
+                DlTask t = dlSavedPending.get(i);
+                if(t == null || t.url == null || t.url.length() == 0) continue;
+                if(BtDownloader.isMagnet(t.url)) continue;
+                if(dlDeleted.contains(dlTaskKey(t))) continue;
+                final int key = 940000 + i;
+                String nm = (t.nameBase != null && t.nameBase.length() > 0)
+                        ? (t.nameBase + "." + t.ext)
+                        : (t.tag.length() > 0 ? t.tag : t.url.substring(0, Math.min(30, t.url.length())));
+                dlRowAdd(key, "【未完成】" + nm);
+                dlRowUpdate(key, 0, "点「继续下载」接着下");
+                dlRowResume.put(key, t);
+            }
+            DypLog.i("DL_SAVED_SHOWN n=" + dlSavedPending.size()
+                    + " bt=" + (btM != null && btM.length() >= 8));
+            if(dlTaskList != null && dlTaskList.getChildCount() > 0){
+                showHintToast("有 " + dlTaskList.getChildCount() + " 个未完成下载，可在「下载」页继续");
+            }
+            dlRefreshHead();
+        }catch(Throwable e){ DypLog.i("DL_SAVED_SHOW_ERR " + e); }
+    }
+
+    /** 清空已完成：只保留没下完的（未完成任务 + 磁力未完成） */
+    void clearFinishedDl(){
+        try{
+            // 只保留真正还在下载的任务。
+            // 之前把 dlSavedPending 全量当「未完成」保留，导致历史失败任务
+            // （用户已删的、早已清掉的）又列回下载页，看起来像删不掉。
+            java.util.List<DlTask> keep = new java.util.ArrayList<DlTask>();
+            synchronized(dlInFlight){
+                for(DlTask t : dlInFlight){
+                    if(!dlDeleted.contains(dlTaskKey(t))) keep.add(t);
                 }
+            }
+            // 去重
+            java.util.Set<String> seen = new java.util.HashSet<String>();
+            java.util.List<DlTask> out = new java.util.ArrayList<DlTask>();
+            for(DlTask t : keep){
+                String k = t.url + "|" + t.tag;
+                if(seen.add(k)) out.add(t);
+            }
+            synchronized(downloadQueue){
+                downloadQueue.clear();
+                downloadQueue.addAll(out);
+            }
+            synchronized(dlSavedPending){
+                dlSavedPending.clear();
+                dlSavedPending.addAll(out);
+            }
+            // 磁力没下完就保留，下完的标记已清空
+            String btM = loadBtTask();
+            boolean hasBt = btM != null && btM.length() >= 8;
+            saveDlTasks();
+            // 重建下载页行：只列未完成的
+            dlRowClear();
+            dlRowResume.clear();
+            if(hasBt){
+                final int bk = 950000;
+                dlRowAdd(bk, "【磁力·未完成】" + btM.substring(0, Math.min(32, btM.length())));
+                dlRowUpdate(bk, 0, "点「继续下载」接着下");
+                dlRowResume.put(bk, null);
+                dlRowIsBt.put(bk, true);
+                try{
+                    dlRowPath.put(bk, btSaveDir(btM).getAbsolutePath());
+                }catch(Throwable t){}
+            }
+            for(int i = 0; i < out.size(); i++){
+                DlTask t = out.get(i);
+                if(BtDownloader.isMagnet(t.url)) continue;
+                final int key = 940000 + i;
+                String nm = (t.nameBase != null && t.nameBase.length() > 0)
+                        ? (t.nameBase + "." + t.ext) : t.tag;
+                dlRowAdd(key, "【未完成】" + nm);
+                dlRowUpdate(key, 0, "点「继续下载」接着下");
+                dlRowResume.put(key, t);
+            }
+            DypLog.i("DL_CLEAR_FINISHED keep=" + out.size() + " bt=" + hasBt);
+            showHintToast("已清空下载完成的项目，保留 " + (out.size() + (hasBt ? 1 : 0)) + " 个未完成");
+            dlRefreshHead();
+        }catch(Throwable e){ DypLog.i("DL_CLEAR_FINISHED_ERR " + e); }
+    }
+
+    /** 行 key -> 待恢复任务（null 表示磁力） */
+    final java.util.Map<Integer, DlTask> dlRowResume =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<Integer, DlTask>());
+    String btSavedMagnet = "";
+
+    void restoreDlTasks(){
+        try{
+            java.util.List<DlTask> saved = loadDlTasks();
+            if(saved.isEmpty()) return;
+            java.util.List<DlTask> todo = new java.util.ArrayList<DlTask>();
+            // 去掉重复 URL（上次退出时队列与正在下载可能有同一任务）
+            java.util.Set<String> seen = new java.util.HashSet<String>();
+            int skipMagnet = 0;
+            for(DlTask t : saved){
+                // 磁力任务不能走 HTTP 队列（magnet: 交给 InnerDownloader 必失败），
+                // 它自己从 saveDir 里的 .part 续传，这里直接跳过
+                if(BtDownloader.isMagnet(t.url)){
+                    skipMagnet++;
+                    continue;
+                }
+                String k = t.url + "|" + t.tag;
+                if(!seen.add(k)) continue;
+                if(dlDeleted.contains(dlTaskKey(t))) continue;
+                todo.add(t);
+            }
+            if(skipMagnet > 0) DypLog.i("DL_TASKS_SKIP_MAGNET n=" + skipMagnet);
+            if(todo.isEmpty()){ clearDlTasks(); return; }
+            synchronized(dlInFlight){ dlInFlight.clear(); }
+            synchronized(downloadQueue){
+                downloadQueue.clear();
+                downloadQueue.addAll(todo);
+            }
+            DypLog.i("DL_TASKS_RESTORE n=" + todo.size());
+            // 关键：恢复的未完成任务【不自动重新下载】。
+            // 之前这里直接 runDownloadQueue()，导致用户新下 1 个视频时，
+            // 上次失败的任务被一起塞进队列 → 下载页显示「1/2」，用户以为多下了一个；
+            // 而且失败任务的直链多半已过期，自动重下还是 403，白费流量。
+            // 现在只把任务渲染到「下载」页，由用户手动点「继续」再下。
+            s("发现 " + todo.size() + " 个未完成任务，可在「下载」页点「继续」重下");
+            showHintToast("上次有 " + todo.size() + " 个未完成任务，已放到下载页");
+            dlRefreshHead();
+            showSavedDlTasks();
+        }catch(Throwable e){
+            DypLog.i("DL_TASKS_RESTORE_ERR " + e);
+        }
+    }
+
+    /** 消费下载队列：并发执行（默认 3 个同时下） */
+    void runDownloadQueue(){
+        try{
+            DownloadService.markStart(this);
+            DownloadService.updateProgress("DYParse 下载", "准备中…", -1);
+        }catch(Throwable t){
+            DypLog.i("DL_SERVICE_ERR " + t);
+        }
+        final int conc = dlConcurrency();
+        new Thread(new Runnable(){ public void run(){
+            int total;
+            synchronized(downloadQueue){ total = downloadQueue.size(); }
+            // 动态总数：后续再追加的任务也算进分母，否则进度会超过 100%
+            final java.util.concurrent.atomic.AtomicInteger dynTotal =
+                    new java.util.concurrent.atomic.AtomicInteger(total);
+            // 已经被算进 dynTotal 分母的任务数（含已处理完的）。
+            // 出队时用它判断是否是新追加的任务，只有真新增才让分母 +1，
+            // 避免「初始值已含队列任务 → 出队又 +1」的重复计数（1 个任务显示 1/2）。
+            final java.util.concurrent.atomic.AtomicInteger countedInTotal =
+                    new java.util.concurrent.atomic.AtomicInteger(total);
+            final java.util.concurrent.atomic.AtomicInteger idxSeq =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            final java.util.concurrent.atomic.AtomicInteger okCount =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            final java.util.concurrent.atomic.AtomicInteger failCount =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            final java.util.concurrent.atomic.AtomicInteger doneCount =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            final java.util.concurrent.atomic.AtomicInteger running =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            final String[] lastCatDir = new String[]{ "" };
+            progShow();
+            // 只有「本次队列刚开始」才清空下载页；
+            // 队列在跑的过程中追加任务时不能清，否则正在下载的行会被抹掉。
+            boolean firstStart = true;
+            synchronized(dlInFlight){ firstStart = dlInFlight.isEmpty(); }
+            if(firstStart){
+                dlRowClear();
+            }else{
+                DypLog.i("DLQ_KEEP_ROWS 队列追加，保留已有行");
+            }
+            dlSetOverall(0, dynTotal.get(), 0);
+            dlRefreshHead();
+            DypLog.i("DLQ_CONCURRENT start conc=" + conc + " total=" + dynTotal.get());
+
+            java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newFixedThreadPool(conc);
+            try{
+                while(true){
+                    if(progCancel){
+                        synchronized(downloadQueue){ downloadQueue.clear(); }
+                        break;
+                    }
+                    DlTask task = null;
+                    synchronized(downloadQueue){
+                        if(!downloadQueue.isEmpty()){
+                            task = downloadQueue.remove(0);
+                            // 出队即进「正在下载」：这里也落盘，
+                            // 否则下载中退出软件，这个任务就彻底丢了
+                            synchronized(dlInFlight){ dlInFlight.add(task); }
+                            saveDlTasks();
+                            // 分母维护：只有「队列里出现了初始值没算过的新任务」才 +1。
+                            //
+                            // 以前无条件 dynTotal.incrementAndGet()，而 dynTotal 初始
+                            // 已经等于 downloadQueue.size()，于是 1 个任务被算成 2，
+                            // 界面显示「已完成 1/2」，用户以为多下了一个。
+                            // 现在用 countedInTotal 记账，保证分母 = 实际处理过的任务数。
+                            if(countedInTotal.get() <= doneCount.get() + running.get()){
+                                countedInTotal.incrementAndGet();
+                                dynTotal.incrementAndGet();
+                            }
+                        }
+                    }
+                    if(task == null){
+                        // 队列空了，但可能还有任务在跑 —— 不能直接 break，
+                        // 否则用户这时候再点下载，新任务会永远卡在队列里没人消费。
+                        if(running.get() > 0){
+                            try{ Thread.sleep(300); }catch(Throwable t){}
+                            continue;
+                        }
+                        // 没有任务在跑：最后再确认一次队列（防止刚加进来就漏掉）
+                        synchronized(downloadQueue){
+                            if(!downloadQueue.isEmpty()) continue;
+                        }
+                        break;
+                    }
+                    if(task.url == null || task.url.length() == 0){
+                        dynTotal.decrementAndGet();
+                        doneCount.incrementAndGet();
+                        continue;
+                    }
+                    final int taskIdx = idxSeq.incrementAndGet();
+                    final DlTask fTask = task;
+                    running.incrementAndGet();
+                    pool.execute(new Runnable(){ public void run(){
+                        boolean ok = false;
+                        try{
+                            ok = runOneTask(fTask, taskIdx, dynTotal.get(), lastCatDir,
+                                    doneCount, running);
+                        }catch(Throwable t){
+                            DypLog.i("DL_ONE_ERR " + t);
+                        }finally{
+                            // 下完就从「正在下载」移除；失败则留在持久化里，
+                            // 让用户下次在「下载」页手动点「继续」（.part 接着下）
+                            synchronized(dlInFlight){ dlInFlight.remove(fTask); }
+                            // 用户已删除：不回填、不写盘
+                            if(dlDeleted.contains(dlTaskKey(fTask))){
+                                synchronized(dlFailed){ dlFailed.remove(fTask); }
+                                DypLog.i("DL_SKIP_DELETED " + dlTaskKey(fTask));
+                            } else if(dlPaused.contains(dlTaskKey(fTask))){
+                                // 用户主动暂停：不算失败，也不进失败清单
+                                synchronized(dlFailed){ dlFailed.remove(fTask); }
+                                DypLog.i("DL_SKIP_PAUSED " + dlTaskKey(fTask));
+                            } else if(!ok){
+                                synchronized(dlFailed){ dlFailed.remove(fTask); dlFailed.add(fTask); }
+                            } else {
+                                synchronized(dlFailed){ dlFailed.remove(fTask); }
+                            }
+                            saveDlTasks();
+                            if(ok) okCount.incrementAndGet(); else failCount.incrementAndGet();
+                            int dc = doneCount.incrementAndGet();
+                            running.decrementAndGet();
+                            int tot2 = dynTotal.get();
+                            float ratio = tot2 > 0 ? (float)((double) dc / tot2) : 0f;
+                            int act = running.get();
+                            String label = String.format(Locale.US, "已完成 %d/%d%s",
+                                    dc, tot2, act > 0 ? ("，进行中 " + act + " 个") : "");
+                            progSet(ratio, label);
+                            dlSetOverall(dc, tot2, act);
+                            if(dc >= tot2) dlRefreshHead();
+                        }
+                    }});
+                }
+                pool.shutdown();
+                try{ pool.awaitTermination(30, java.util.concurrent.TimeUnit.MINUTES); }catch(Throwable t){}
+                // 只清成功的：把「失败/中断」的任务写回持久化，下次可手动继续
+                try{
+                    java.util.List<DlTask> keep = new java.util.ArrayList<DlTask>();
+                    synchronized(dlFailed){
+                        for(DlTask t : dlFailed){
+                            if(!dlDeleted.contains(dlTaskKey(t))) keep.add(t);
+                        }
+                    }
+                    synchronized(dlInFlight){
+                        for(DlTask t : dlInFlight){
+                            if(dlDeleted.contains(dlTaskKey(t))) continue;
+                            if(!keep.contains(t)) keep.add(t);
+                        }
+                    }
+                    if(keep.isEmpty()){
+                        clearDlTasks();
+                        DypLog.i("DL_TASKS_ALL_DONE");
+                    }else{
+                        // 关键：失败任务【不塞回 downloadQueue】。
+                        //
+                        // 以前这里 downloadQueue.addAll(keep)，导致下一轮下载时
+                        // dynTotal 初始值把上次失败的任务也算进去 ——
+                        // 用户下 1 个却看到「已完成 1/2」，以为多下了一个；
+                        // 而且旧任务直链早就过期，自动重下还是 403。
+                        //
+                        // 现在只写进 dlSavedPending（下载页的「继续」清单），
+                        // 由用户点「继续」才真正重新入队。
+                        synchronized(downloadQueue){ downloadQueue.clear(); }
+                        synchronized(dlSavedPending){
+                            dlSavedPending.clear();
+                            dlSavedPending.addAll(keep);
+                        }
+                        saveDlTasks();
+                        final int kn = keep.size();
+                        DypLog.i("DL_TASKS_KEEP_FAILED n=" + kn + " (只列到下载页，不自动重下)");
+                        h.post(new Runnable(){ public void run(){
+                            showHintToast("有 " + kn + " 个下载未完成，可在「下载」页继续");
+                        }});
+                    }
+                }catch(Throwable t){ DypLog.i("DL_TASKS_KEEP_ERR " + t); }
             }catch(Throwable t){
-                Log.i("DYP", "DLQ_ERR " + t);
+                DypLog.i("DLQ_ERR " + t);
             }finally{
-                final int fo = okCount, ff = failCount;
+                try{ pool.shutdownNow(); }catch(Throwable t){}
+                final int fo = okCount.get(), ff = failCount.get();
                 dlRunning = false;
-                // 队列结束：更新通知栏为最终状态再收起（有失败时提示可「继续下载」）
+                dlRefreshHead();
                 try{
                     if(ff > 0){
                         DownloadService.updateProgress("DYParse 下载",
                             fo + " 成功 / " + ff + " 失败（可重新点下载续传）", 100);
-                        Thread.sleep(600);   // 让用户看到结果
+                        Thread.sleep(600);
                     }else if(fo > 0){
                         DownloadService.updateProgress("DYParse 下载", "全部完成 " + fo + " 个文件", 100);
                         Thread.sleep(400);
                     }
                     DownloadService.markStop(MainActivity.this, null);
                 }catch(Throwable t){}
-                // 汇总本次下载实际落盘的目录（去重，保持顺序）
-                final java.util.LinkedHashSet<String> dirSet =
-                        new java.util.LinkedHashSet<String>(savedDirs);
+                final java.util.LinkedHashSet<String> dirSet;
+                synchronized(savedDirs){
+                    dirSet = new java.util.LinkedHashSet<String>(savedDirs);
+                }
                 h.post(new Runnable(){ public void run(){
                     StringBuilder sb = new StringBuilder();
                     if(ff == 0){
@@ -14731,7 +22159,7 @@ final String pfx;
                             if(i > 0) sb.append("\n");
                             sb.append("→ ").append(d);
                             i++;
-                            if(i >= 4){   // 最多显示 4 个目录，避免刷屏
+                            if(i >= 4){
                                 if(dirSet.size() > 4) sb.append("\n→ …共 ").append(dirSet.size()).append(" 个目录");
                                 break;
                             }
@@ -14739,11 +22167,8 @@ final String pfx;
                     }
                     s(sb.toString());
                     if(ff > 0 && isXDomain(curUrl)){
-                        // X 的 CDN（video/pbs.twimg.com）在国内常被 DNS 污染，
-                        // 解析能成功但下载连不上，这里明确告诉用户怎么办。
                         showHintToast("X 媒体直连失败，请开启代理后重试下载");
                     }
-                    // 有失败时：告诉用户 .part 已保留，重新点下载会接着下（不用从头）
                     if(ff > 0){
                         long keptBytes = 0;
                         try{
@@ -14766,10 +22191,21 @@ final String pfx;
                     }
                     h.postDelayed(new Runnable(){ public void run(){ progHide(); }}, 1200);
                 }});
-                savedDirs.clear();
+                synchronized(savedDirs){ savedDirs.clear(); }
+                // 兜底：收尾这段时间里如果用户又加了任务（队列非空），
+                // 必须重新起一轮消费，否则新任务会一直卡在队列里下不动。
+                boolean leftover = false;
+                synchronized(downloadQueue){ leftover = (downloadQueue.size() > 0); }
+                if(leftover){
+                    DypLog.i("DLQ_RESTART_LEFTOVER 收尾时发现新任务，重新起队列");
+                    dlRunning = true;
+                    h.post(new Runnable(){ public void run(){ runDownloadQueue(); }});
+                }
             }
         }}).start();
     }
+
+
 
     /**
      * 按真实文件头修正图片后缀。
@@ -14803,7 +22239,7 @@ final String pfx;
                 if(dot > 0) base = base.substring(0, dot);
                 File nf = new File(f.getParentFile(), base + ".webp");
                 if(f.renameTo(nf)){
-                    Log.i("DYP", "EXT_FIX webp " + f.getName() + " -> " + nf.getName());
+                    DypLog.i("EXT_FIX webp " + f.getName() + " -> " + nf.getName());
                     return nf;
                 }
             }
@@ -14814,12 +22250,12 @@ final String pfx;
                 if(dot > 0) base = base.substring(0, dot);
                 File nf = new File(f.getParentFile(), base + ".png");
                 if(f.renameTo(nf)){
-                    Log.i("DYP", "EXT_FIX png " + f.getName() + " -> " + nf.getName());
+                    DypLog.i("EXT_FIX png " + f.getName() + " -> " + nf.getName());
                     return nf;
                 }
             }
         }catch(Throwable t){
-            Log.i("DYP", "EXT_FIX_ERR " + t);
+            DypLog.i("EXT_FIX_ERR " + t);
         }finally{
             try{ if(in != null) in.close(); }catch(Throwable t){}
         }
@@ -14844,12 +22280,12 @@ final String pfx;
                 null,
                 new android.media.MediaScannerConnection.OnScanCompletedListener(){
                     public void onScanCompleted(String path, android.net.Uri uri){
-                        Log.i("DYP", "SCAN done path=" + path + " uri=" + uri);
+                        DypLog.i("SCAN done path=" + path + " uri=" + uri);
                     }
                 });
-            Log.i("DYP", "SCAN request " + f.getName());
+            DypLog.i("SCAN request " + f.getName());
         }catch(Throwable t){
-            Log.i("DYP", "SCAN_ERR " + t);
+            DypLog.i("SCAN_ERR " + t);
         }
     }
 
@@ -14880,7 +22316,7 @@ final String pfx;
             for(String root : roots){
                 collectMedia(new File(root), paths, 0);
             }
-            Log.i("DYP", "FIXMEDIA found=" + paths.size());
+            DypLog.i("FIXMEDIA found=" + paths.size());
             if(paths.isEmpty()){
                 h.post(new Runnable(){ public void run(){
                     Toast.makeText(MainActivity.this, "没有找到可补录的文件", Toast.LENGTH_SHORT).show();
@@ -14902,7 +22338,7 @@ final String pfx;
                     public void onScanCompleted(String path, android.net.Uri uri){
                         int n;
                         synchronized(done){ n = ++done[0]; }
-                        Log.i("DYP", "FIXMEDIA " + n + "/" + totalN + " -> " + uri);
+                        DypLog.i("FIXMEDIA " + n + "/" + totalN + " -> " + uri);
                         if(n >= totalN){
                             h.post(new Runnable(){ public void run(){
                                 Toast.makeText(MainActivity.this,
