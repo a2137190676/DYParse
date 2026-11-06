@@ -114,9 +114,49 @@ public class YtParser {
         v.pageUrl = url;
         if(url == null || url.length() == 0){ v.err = "空链接"; return v; }
 
+        // ★ 第一优先级：Invidious 公共实例直连（免服务器、免登录、支持 Range）
+        //
+        // 为什么放最前：2026-11 起 YouTube 网页端 streamingData 不再下发 url，
+        // 手机抓页面拿不到流地址；同时自建服务器 /api/yt/parse 被 YouTube 风控
+        // 一挂就是 110 秒无响应。Invidious 在它自己的服务端做完整解析，
+        // 手机直接问它要结果即可，既不消耗自家服务器流量，也不会被风控拖死。
+        try{
+            YtInvidious.Result inv = YtInvidious.resolve(ctx, url);
+            if(inv != null && inv.ok()){
+                v.id = inv.id;
+                v.title = inv.title;
+                v.author = inv.author;
+                v.thumb = inv.thumb;
+                v.durationSec = inv.durationSec;
+                v.videoUrl = inv.videoUrl;
+                v.audioUrl = inv.audioUrl;
+                Log.i(TAG, "YT_INV_USED src=" + inv.source + " q=" + inv.qualityHeight + "p");
+                return v;
+            }
+Log.i(TAG, "YT_INV_FALLBACK " + (inv == null ? "null" : inv.err));
+        }catch(Throwable t){
+            Log.i(TAG, "YT_INV_WRAP_ERR " + t);
+        }
+
+        // ★ 第二优先级：本机页面直连 + n-sig WebView 求解（B 方案）
+        //
+        // Invidious 公共实例不稳定（经常 403/401/SSL 中断），需要一条完全自主的路。
+        // 做法：手机直接抓 watch 页 → 从 ytInitialPlayerResponse 拿 adaptiveFormats 的
+        // itag/contentLength 等元数据 → 用隐藏 WebView 跑 YouTube 自己的 player.js
+        // 求出 n → 拼出 googlevideo 直链 → 直接拉流。
+        try{
+            YtVideo local = resolveLocalWithJs(ctx, url);
+            if(local != null && local.videoUrl.length() > 0){
+                Log.i(TAG, "YT_LOCAL_OK v=" + local.videoUrl.length());
+                return local;
+            }
+        }catch(Throwable t){
+            Log.i(TAG, "YT_LOCAL_ERR " + t);
+        }
+
         String srv = MainActivity.effSrvS(ctx);
         if(srv.length() == 0){
-            v.err = "无服务器：YouTube 解析必须走服务器（本地直连被 DNS 污染）";
+            v.err = "YouTube 解析失败：Invidious 实例不可用，且未配置服务器";
             return v;
         }
 
@@ -196,12 +236,114 @@ public class YtParser {
         }
     }
 
+    /**
+     * B 方案：本机直连 YouTube 页 + WebView 解 n-sig。
+     *
+     * 步骤：
+     *   1. 手机抓 watch 页（走用户代理，实测可拿到完整 ytInitialPlayerResponse）
+     *   2. 抠 streamingData.adaptiveFormats
+     *   3. 用隐藏 WebView 载入 YouTube 页面，把 player.js 跑起来
+     *   4. 让 player.js 自己算出 n，改写 URL
+     *
+     * 失败返回 null，上层继续回退服务器。
+     */
+    static YtVideo resolveLocalWithJs(Context ctx, String url){
+        String id = YtInvidious.extractId(url);
+        if(id.length() == 0) return null;
+        YtVideo v = new YtVideo();
+        v.id = id;
+        v.pageUrl = url;
+
+        String page = httpGetText(ctx, "https://www.youtube.com/watch?v=" + id, 30000);
+        if(page == null || page.length() < 5000){
+            Log.i(TAG, "YT_LOCAL_PAGE_EMPTY");
+            return null;
+        }
+        String pr = YtJsSolver.extractJsonObject(page, "ytInitialPlayerResponse");
+        if(pr == null || pr.length() < 500){
+            Log.i(TAG, "YT_LOCAL_NO_PR");
+            return null;
+        }
+        v.title = YtJsSolver.jgetStr(pr, "title");
+        v.author = YtJsSolver.jgetStr(pr, "author");
+        try{ v.durationSec = Long.parseLong(YtJsSolver.jgetStr(pr, "lengthSeconds").trim()); }catch(Throwable t){}
+        v.thumb = "https://i.ytimg.com/vi/" + id + "/maxresdefault.jpg";
+
+        boolean needsJs = YtJsSolver.needsJsSolver(pr);
+        Log.i(TAG, "YT_LOCAL_PR len=" + pr.length() + " needsJs=" + needsJs);
+
+        String[] picked = YtJsSolver.pickBestFormats(pr);
+        if(picked != null && picked[0] != null && picked[0].startsWith("http")){
+            v.videoUrl = picked[0];
+            v.audioUrl = picked[1] != null ? picked[1] : "";
+            Log.i(TAG, "YT_LOCAL_DIRECT v=" + v.videoUrl.length());
+            return v;
+        }
+
+        String raw = picked != null && picked.length > 2 && picked[2] != null ? picked[2] : "";
+        if(raw.length() == 0){
+            Log.i(TAG, "YT_LOCAL_NO_RAW");
+            return null;
+        }
+        String solved = YtInvidious.ytSolveNByWebView(ctx, raw);
+        if(solved.length() == 0 || !solved.startsWith("http")){
+            Log.i(TAG, "YT_LOCAL_SOLVE_FAIL");
+            return null;
+        }
+        v.videoUrl = solved;
+        v.audioUrl = "";
+        Log.i(TAG, "YT_LOCAL_SOLVED len=" + solved.length());
+        return v;
+    }
+
+    /** 简单 GET 文本（走用户代理） */
+    static String httpGetText(Context ctx, String url, int readMs){
+        HttpURLConnection c = null;
+        java.io.InputStream in = null;
+        try{
+            c = MainActivity.openConn(ctx, url);
+            c.setConnectTimeout(15000);
+            c.setReadTimeout(readMs);
+            c.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            c.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
+            c.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+            // 桌面 UA 必须配套 Sec-Fetch 头，否则 YouTube 会退回精简页
+            c.setRequestProperty("Sec-Fetch-Dest", "document");
+            c.setRequestProperty("Sec-Fetch-Mode", "navigate");
+            c.setRequestProperty("Sec-Fetch-Site", "none");
+            c.setRequestProperty("Sec-Fetch-User", "?1");
+            c.setRequestProperty("Upgrade-Insecure-Requests", "1");
+            int code = c.getResponseCode();
+            if(code < 200 || code >= 300){
+                Log.i(TAG, "YT_LOCAL_HTTP " + code);
+                return null;
+            }
+            in = c.getInputStream();
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n; int guard = 0;
+            while((n = in.read(buf)) > 0){
+                bo.write(buf, 0, n);
+                if(++guard > 2048) break;
+            }
+            return new String(bo.toByteArray(), "UTF-8");
+        }catch(Throwable t){
+            Log.i(TAG, "YT_LOCAL_GEX " + t);
+            return null;
+        }finally{
+            try{ if(in != null) in.close(); }catch(Throwable t){}
+            try{ if(c != null) c.disconnect(); }catch(Throwable t){}
+        }
+    }
+
     /** 带 HMAC 鉴权的 GET（服务器 API：永不套用户代理） */
     static String httpGetApi(Context ctx, String url, int timeout){
         HttpURLConnection c = null;
         try{
             // 服务器 API 强制直连：用户代理可能不通（YouTube 服务器必须能直连）
-            c = (HttpURLConnection) new URL(url).openConnection(java.net.Proxy.NO_PROXY);
+            c = (HttpURLConnection) new URL(url).openConnection();
             c.setRequestProperty("User-Agent", UA);
             c.setRequestProperty("Accept", "application/json,*/*");
             // HMAC 鉴权
@@ -224,8 +366,12 @@ public class YtParser {
             }catch(Throwable t){
                 Log.i(TAG, "YT_SIGN_ERR " + t);
             }
-            c.setConnectTimeout(30000);
-            c.setReadTimeout(timeout);
+            c.setConnectTimeout(15000);
+            // 读超时从 600 秒收到 75 秒。
+            // 原来写 600000（10 分钟），但服务器 /api/yt/parse 被 YouTube 风控时
+            // 是「连上了、一个字节都不发」的挂死状态，10 分钟里用户只能干等。
+            // 75 秒足够 yt-dlp 正常跑完一条单视频；超了就当失败，让上层给提示。
+            c.setReadTimeout(timeout > 75000 ? 75000 : timeout);
             int code = c.getResponseCode();
             if(code < 200 || code >= 300){
                 Log.i(TAG, "YT_HTTP " + code + " " + url);
