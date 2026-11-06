@@ -1,0 +1,18 @@
+[Unit]
+Description=DYParse server watchdog (auto-heal 8080/8443)
+After=network.target dyparse.service
+Wants=dyparse.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/dyparse/dyparse_watchdog.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+# 轻量守卫，不需要任何特权
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
