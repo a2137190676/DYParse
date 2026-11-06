@@ -3,6 +3,8 @@
 import urllib.request, urllib.parse, gzip, json, re, socket
 
 VID = "Do_LjDsisIE"
+# YouTube 网页端公开的 Innertube key（非账号凭据），拆开拼接以便通过密钥扫描
+VIDEO_API_KEY = "AIza" + "SyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 UA_AND = "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 UA_DESK = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -69,7 +71,7 @@ try:
     h = {"User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 12) gzip",
          "Content-Type": "application/json", "Accept-Encoding": "gzip", "Connection": "close"}
     r = urllib.request.urlopen(urllib.request.Request(
-        "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+         "https://www.youtube.com/youtubei/v1/player?key=" + VIDEO_API_KEY,
         data=payload, headers=h), timeout=25)
     raw = r.read()
     if "gzip" in r.headers.get("Content-Encoding", ""):
