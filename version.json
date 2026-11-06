@@ -1,14 +1,14 @@
 {
-  "tag": "v2.1.0",
-  "name": "v2.1.0",
-  "body": "## v2.1.0\n\n### 新增\n- 支持磁力链接（magnet）与 .torrent 文件直接下载，带进度与节点信息\n- 解析页顶部支持平台数更新为 22 个，新增腾讯视频、磁力下载\n- TikTok 主页解析：直接抓主页作品列表，视频与图集都能收\n- TikTok 主页自动滚动加载，能翻出全部作品而非首屏\n- X（推特）主页解析：新增网页数据源，游客态即可拿到时间线\n- 设置页「支持的平台」清单同步更新\n\n### 优化\n- TikTok 批量下载改走本地直连，不再逐条空等服务器超时\n- 服务器不可达时自动回退本地，功能不中断\n- 主页列表作品 id 校验收紧，不再混入作者 id 之类的无效条目\n- 列表「解析看详情」改为回到解析页渲染，不再直接进下载\n- 列表「批量下载」按当前子页选数据（批量 / 单条 / 主页 / 合集）\n\n### 修复\n- 列表里的记录删不掉，删完再点一次又刷新出来\n- 实况图下载路径缺少平台目录，落到「动图」而不是「TikTok/动图」\n- TikTok 主页批量下载提示「成功入队 0/3 条」\n- 主页列表点「批量下载」提示列表是空的\n- 列表单条解析报「所有数据源都没拿到媒体」（改走列表已有直链）\n\n### 说明\n- 磁力下载为 P2P 分享，请只下载自己有权限获取的内容\n- TikTok / X 主页解析均为本地直连，不依赖服务器\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.0/DYParse-v2.1.0.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.0/DYParse-v2.1.0.apk",
-  "released": "2026-11-03",
+  "tag": "v2.1.1",
+  "name": "v2.1.1",
+  "body": "## v2.1.1\n\n### 新增\n- YouTube 解析新增 Invidious 直连通道，不再依赖服务器，可拿 1080P/4K 原画\n- YouTube 解析新增本机 player.js 求解通道，作为 Invidious 失效时的第二道保障\n\n### 修复\n- YouTube 解析不了、一直转圈：服务器解析超时从 10 分钟收到 75 秒，失败立刻提示\n- YouTube 解析出来没画面：改为手机直连 Invidious 取流，带 Range 支持边下边播\n- TikTok 遇到私密 / 已删除作品时一直转圈：现在直接提示「作品不可用」\n- 应用图标丢失导致部分机型不显示图标\n\n### 说明\n- YouTube 的 Invidious 通道走公共实例，全部失效时会自动回退自建服务器\n- 服务器到期后 YouTube 解析仍可用，只是少了服务器这条兜底\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.1/DYParse-v2.1.1.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.1/DYParse-v2.1.1.apk",
+  "released": "2026-11-06",
   "upgrade_notice": {
-    "title": "发现新版本 2.1",
-    "message": "v2.1.0 已发布：新增磁力链接下载，TikTok / X 主页解析重做，并修复列表删不掉、批量下载入队失败等多个问题。建议更新到最新版。",
+    "title": "发现新版本 2.1.1",
+    "message": "v2.1.1 已发布：YouTube 解析恢复（新增 Invidious 直连，不再依赖服务器），并修复解析卡死、TikTok 私密作品一直转圈等问题。建议更新到最新版。",
     "url": "https://gitee.com/adaaixianzun/dyparse/releases",
-    "until": 2010000
+    "until": 2010100
   }
 }
