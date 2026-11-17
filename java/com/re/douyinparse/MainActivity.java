@@ -56,6 +56,10 @@ public class MainActivity extends Activity {
     // 播放器当前的代理/站点标记，配置变了就重建播放器
     String miniProxyKey = null;
     boolean miniWasTT = false;
+    /** 播放器当前的 Referer（按平台不同）。只有一个 miniWasTT 布尔量不够：
+     *  抖音→小红书切换时 ttUrl 都是 false，播放器会被错误复用，
+     *  Referer 还是老的 douyin.com，小红书 CDN 直接 403（v2.1.6 修复） */
+    String miniRefKey = null;
     View videoBox, miniBar, miniTouch;
     TextView miniTimeNow, miniTimeAll, miniPlay, miniSpeed, miniFull;
     SeekBar miniSeek;
@@ -142,6 +146,8 @@ public class MainActivity extends Activity {
     volatile boolean autoFired = false;
     /** 解析成功后自动清空输入框（默认关闭） */
     static final String KEY_CLEAR_INPUT = "clear_input";
+    /** 实况图导出方式：0=实况照片(jpg) 1=视频(mp4) 2=动图(gif) */
+    static final String KEY_LIVE_MODE = "live_mode";
     /** 兼容旧版单一自定义路径 key */
     static final String KEY_DL_PATH  = "dl_path";
     /** 内置服务器默认地址。
@@ -242,6 +248,10 @@ public class MainActivity extends Activity {
         if(WeiboParser.isWeiboUrl(u)) return true;
         // 腾讯视频
         if(TxParser.isTxUrl(u)) return true;
+        // 网易云音乐（走第三方 API，见 Music163Parser）
+        if(Music163Parser.canHandle(u)) return true;
+        // 聚合通道覆盖的平台（video-crack + 即梦/豆包官方接口，免 Key，本地直连）
+        if(AggApi.mightHandle(u)) return true;
         return false;
     }
 
@@ -3037,6 +3047,21 @@ DypLog.i("PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
     }
 
     /** 解析后自动播放是否开启（默认关闭） */
+    /** 实况图导出方式：0=实况照片 1=mp4 2=gif */
+    int liveMode(){
+        int v = getSharedPreferences(SP, MODE_PRIVATE).getInt(KEY_LIVE_MODE, 0);
+        if(v < 0 || v > 2) v = 0;
+        return v;
+    }
+    void setLiveMode(int v){
+        getSharedPreferences(SP, MODE_PRIVATE).edit().putInt(KEY_LIVE_MODE, v).apply();
+    }
+    String liveModeLabel(){
+        int m = liveMode();
+        if(m == 1) return "视频 MP4";
+        if(m == 2) return "动图 GIF";
+        return "实况照片（默认）";
+    }
     boolean autoPlayOn(){
         return getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_AUTO_PLAY, false);
     }
@@ -4326,6 +4351,9 @@ LinearLayout stRow = addSettingRow("存储写入检测", storageStateLabel(), ne
         addSettingRow("修复媒体库", "相册里看不到已下载文件？点这里补录", new View.OnClickListener(){
             public void onClick(View v){ fixMediaLibrary(); }});
 
+        addSettingSection("实况图导出");
+        addSettingRow("导出方式", liveModeLabel() + " · 解析到实况图时按此格式下载", new View.OnClickListener(){
+            public void onClick(View v){ showLiveModeDialog(); }});
         addSettingSection("服务器");
         addSettingRow("服务器地址", "自建服务器 / 内置服务器状态", new View.OnClickListener(){
             public void onClick(View v){ showSettings(); }});
@@ -4357,7 +4385,6 @@ addSettingRow("B站 Cookie", curBiliCkLabel(), new View.OnClickListener(){
              public void onClick(View v){ showDyProfileLoginMenu(); }});
         addSettingRow("Cookie 文件位置", "点开查看已保存的 cookie 名单", new View.OnClickListener(){
             public void onClick(View v){ showCookieFilesInfo(); }});
-
 addSettingSection("平台支持");
          addSettingRow("平台支持说明", "各平台解析方式与服务器依赖", new View.OnClickListener(){
              public void onClick(View v){ showPlatformHelp(); }});
@@ -4904,7 +4931,6 @@ DypLog.i("CRASH_HANDLER_INSTALLED");
             .setNegativeButton("取消", null)
             .create().show();
     }
-
     /** Cookie 文件位置说明 */
     void showCookieFilesInfo(){
         curDark = isDarkMode();
@@ -8320,6 +8346,26 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
     }
 
     /** 主题选择弹窗 */
+    /** 实况图导出方式选择 */
+    void showLiveModeDialog(){
+        final int[] keys = { 0, 1, 2 };
+        String[] items = {
+            "实况照片 · 单个 .jpg，相册长按可播放（跟抖音原生一样，推荐）",
+            "视频 MP4 · 只存动轨视频，通用播放器都能放",
+            "动图 GIF · 480px 宽动图，适合聊天直接发"
+        };
+        dypDlg()
+            .setTitle("实况图导出方式")
+            .setSingleChoiceItems(items, liveMode(), new android.content.DialogInterface.OnClickListener(){
+                public void onClick(android.content.DialogInterface dd, int which){
+                    setLiveMode(keys[which]);
+                    buildSettingsPage();
+                    try{ dd.dismiss(); }catch(Throwable t){}
+                }
+            })
+            .setNegativeButton("取消", null)
+            .create().show();
+    }
     void showThemeDialog(){
         curDark = isDarkMode();
         final String[] keys = { THEME_FOLLOW, THEME_LIGHT, THEME_DARK };
@@ -9256,10 +9302,110 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             }
         }}).start();
     }
-
     void showHintToast(String m){
         try{ Toast.makeText(this, m, Toast.LENGTH_LONG).show(); }catch(Throwable t){}
     }
+
+    /**
+     * 文件名清洗：把视频标题变成可用的文件名主体。
+     *
+     * 处理内容（按顺序）：
+     *   1. 去掉 URL（标题里常夹分享短链）
+     *   2. 去掉 emoji（各类扩展平面符号 + 变体选择符 + 零宽连接符）
+     *   3. 去掉装饰性符号（★☆♥♦◆●■▲※ 这类）
+     *   4. 去掉话题标签里的 # 号（保留文字，别把 # 变成文件名一部分）
+     *   5. 去掉非法字符 \ / : * ? " < > |
+     *   6. 折叠空白与连续下划线
+     *   7. 截断长度（避免文件名过长导致写入失败）
+     *
+     * @return 清洗后的安全文件名主体；若清洗后为空则返回 ""
+     */
+    static String safeFileTitle(String raw){
+        if(raw == null) return "";
+        String t = raw;
+
+        // 1) 去掉 URL
+        t = t.replaceAll("https?://\\S+", " ");
+        t = t.replaceAll("www\\.\\S+", " ");
+
+        // 2) 去掉 emoji 与各类符号
+        //    \p{So}  = Symbol, other（★♥✅⚡ 以及大部分 emoji）
+        //    \p{Cs}  = 代理对（emoji 本体常落在这里）
+        //    \p{Cn}  = 未分配码位
+        //    \p{Co}  = 私用区（部分 App 自定义表情）
+        //    \uFE0F / \u200D = 变体选择符 / 零宽连接符（emoji 组合用）
+        t = t.replaceAll("[\\p{So}\\p{Cs}\\p{Cn}\\p{Co}]", "");
+        t = t.replaceAll("[\\uFE0F\\uFE0E\\u200D\\u20E3]", "");
+
+        // 3) 去装饰性/特殊符号（中文标题里常见的花哨字符）
+        t = t.replaceAll("[\\u2018\\u2019\\u201C\\u201D]", "");   // 弯引号
+        t = t.replaceAll("[\\u2605\\u2606\\u2665\\u2666\\u25C6\\u25CF\\u25A0\\u25B2\\u203B]", ""); // ★☆♥♦◆●■▲※
+        t = t.replaceAll("[\\u2190-\\u21FF\\u27A1\\u2B00-\\u2BFF]", "");  // 箭头
+        t = t.replaceAll("[\\u2460-\\u24FF]", "");               // ①②③ 带圈字符
+
+// 4) 去话题 # 与 @（保留后面文字）
+        t = t.replace("#", " ").replace("@", " ");
+        // 4.1) 去小红书/微博常见的 [话题] 【话题】 方括号标记（保留框内文字）
+        //      先删「纯标记」，再删剩余各种括号，避免出现 [话题] 这种尾巴
+        t = t.replaceAll("\\[\\s*(话题|超话|音乐|表情)\\s*\\]", " ");
+        t = t.replaceAll("[\\[\\]\\{\\}【】〔〕（）()<>《》]", " ");
+        // 4.2) 去中文常见但文件名里没意义的标点，统一成空格
+        //      注意：逗号、句号、感叹号在中文标题里非常多，留着会让名字很乱
+        t = t.replaceAll("[，。！？、；：—~·…「」『』”“‘’]", " ");
+        // 5) Windows/Android 文件名非法字符
+        t = t.replaceAll("[\\/:*?\"<>|]", " ");
+
+        // 6) 空白统一成下划线（文件名里带空格在某些文件管理器/命令行下不好处理）
+        t = t.replaceAll("\\s+", "_");
+        t = t.trim();
+        t = t.replaceAll("_{2,}", "_");
+        t = t.replaceAll("^[_]+|[_]+$", "");
+
+        // 7) 截断：中文按 60 字，避免超长
+        if(t.length() > 60) t = t.substring(0, 60).trim();
+        t = t.replaceAll("^[_]+|[_]+$", "");
+
+        return t;
+    }
+
+    /** 当前解析目标是否是网易云音乐（用于下载分类、播放器 Referer 判定） */
+    boolean isMusic163Domain(String url){
+        if(url == null) return false;
+        String u = url.toLowerCase();
+        if(u.contains("music.163.com") || u.contains("163cn.tv")) return true;
+        // 纯数字 ID 解析时 curUrl 可能存的是 ID
+        if(u.matches("\\d{6,}")) return true;
+        return false;
+    }
+
+    /**
+     * 解析失败卡片：把原因清清楚楚摆到结果区
+     * 用于「第三方 API 不可用 / 平台不支持 / 版权受限」这类必须让用户知道的情况，
+     * 避免用户以为 App 卡住了或者什么都没发生。
+     */
+    void showResultErrorCard(String title, String reason){
+        try{
+            StringBuilder sb = new StringBuilder();
+            sb.append("解析失败");
+            if(title != null && title.length() > 0){
+                sb.append("\n【").append(title).append("】");
+            }
+            sb.append("\n\n");
+            sb.append(reason == null ? "未知原因" : reason);
+            sb.append("\n\n——————————————\n");
+            sb.append("· 本功能依赖第三方公开接口，接口不可用时无法解析\n");
+            sb.append("· 其他平台解析不受影响，可正常使用");
+            curResult = sb.toString();
+            renderCards(curResult);
+            curPlay = "";
+            curImgs = "";
+            showMediaNow();
+        }catch(Throwable t){
+            DypLog.i("ERR_CARD " + t);
+            showHintToast("解析失败：" + (reason == null ? "" : reason.split("\n")[0]));
+        }
+    }
+
 
     /** 拉起系统安装界面 */
     void installApk(){
@@ -9576,7 +9722,63 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v2.1.1】YouTube 解析恢复，TikTok 实况图提示优化\n"
+            "【v2.1.5】实况图导出方式可选\n"
+             + "新增\n"
+             + "· 实况图可选导出：实况照片 / 视频 MP4 / 动图 GIF\n"
+             + "· 设置 → 实况图导出 → 导出方式，抖音与 TikTok 实况同时生效\n"
+             + "【v2.1.4】修复小红书与抖音图集问题\n"
+             + "新增\n"
+             + "· 小红书接入聚合通道：图片取原图、视频强制取高画质档\n"
+             + "修复\n"
+             + "· 抖音图集、实况图只出 1 张（7 张被当成 1 张处理）\n"
+             + "· 抖音实况照片动轨丢失，生成的实况图不会动\n"
+             + "· 最右、皮皮虾等聚合平台的多图作品同样只出 1 张\n"
+             + "· 小红书视频和图片下载、播放全部报 403\n"
+             + "· 小红书视频只出缩略图，正片看不到\n"
+             + "· 小红书画质掉到低档（两条转码里强制取高画质那条）\n"
+             + "· 输入框残留上一条链接，导致接口报「不支持的内容」\n"
+             + "· 『CDN 只放行住宅 IP』提示误弹到其他平台\n"
+             + "· 文件名残留 [话题] 方括号与中文标点\n"
+             + "· 小红书文件名前缀错成 dy_、标题为空\n"
+             + "· 文件名标题重复作品名\n"
+             + "优化\n"
+             + "· 实况图下载弹窗逐张标注「实况→动图/实况照片」，可单独选第几张\n"
+             + "· 切换平台时播放器自动重建，不会用错 Referer\n"
+             + "· 下载、命名、格式修正等公共逻辑不变\n"
+             + "\n"
+             + "【v2.1.3】修复小红书、抖音画质、按标题命名\n"
+             + "新增\n"
+             + "· 下载文件按视频标题命名，自动清理表情符号和特殊字符\n"
+             + "· 批量下载（主页/合集/图集）同样按标题命名，重名自动加 _2/_3\n"
+             + "修复\n"
+             + "· 小红书解析失败（正则表达式转义错误导致崩溃）\n"
+             + "· 抖音画质不是最高（聚合通道只给单档地址，改回本地直连 11 档清晰度）\n"
+             + "· 图片下载后缀是 webp（改为向图床要 JPEG，并按真实文件头校正后缀）\n"
+             + "优化\n"
+             + "· 文件名空格统一成下划线，更整齐\n"
+             + "· 纯表情标题自动回落到作品 ID 命名，不会出现空文件名\n"
+             + "说明\n"
+             + "· 命名规则：dy_标题.mp4 / bl_标题_第3集.mp4 / dy_标题_图1.jpg\n"
+             + "\n"
+            + "【v2.1.2】新增网易云音乐解析，聚合通道全平台扩展\n"
+             + "新增\n"
+             + "· 网易云音乐：支持单曲解析，可拿歌名/歌手/专辑/封面/时长\n"
+             + "· 网易云音乐：音频直链优先 320kbps MP3，下载自动归入「音乐」分类\n"
+             + "· 网易云音乐：支持歌曲链接、纯数字歌曲ID、分享文案三种输入\n"
+             + "· 抖音本地直连解析：免 Cookie 免签名，支持原画/图集/实况/背景音乐\n"
+             + "· 即梦AI 解析（官方接口）\n"
+             + "· 聚合通道新增最右，抖音长链也支持了\n"
+             + "优化\n"
+             + "· 聚合通道覆盖平台扩展：B站/抖音/快手/TikTok/视频号/最右\n"
+             + "· 解析失败会明确告知原因，不再静默无反应\n"
+             + "修复\n"
+             + "· 抖音长链解析失败（原来只认短链）\n"
+             + "· 网易云封面加载失败、播放器拉不到音频\n"
+             + "说明\n"
+             + "· 网易云走第三方公开接口，不逆向官方协议\n"
+             + "· 部分歌曲受版权限制没有直链，会明确提示原因\n"
+             + "\n"
+            + "【v2.1.1】YouTube 解析恢复，TikTok 实况图提示优化\n"
              + "新增\n"
              + "· YouTube 解析新增 Invidious 直连通道，不再依赖服务器，可拿 1080P/4K 原画\n"
              + "· YouTube 解析新增本机 player.js 求解通道，作为 Invidious 失效时的第二道保障\n"
@@ -9726,7 +9928,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
            + "支持：✓ 视频解析（DASH，可到 1080P60/4K）  ✓ 合集(ugc_season)  ✓ 分P\n"
            + "　　　✓ 主页解析+批量下载  ✓ 纯 av号/BV号 直接输入  ✓ b23.tv 短链\n"
            + "不支持：✗ 大会员专享  ✗ 付费视频\n"
-           + "方式：view/playurl API 本地直连免签；CDN 拉流用桌面 UA + buvid3\n"
+           + "方式：优先走聚合 API（免 Key，秒回直链）；失败再走 view/playurl 本地直连\n"
            + "　　　匿名封顶 480P/720P，登录（填 SESSDATA）1080P，大会员 1080P60\n"
            + "　　　可在 App 内登录 B站 自动抓 Cookie（只存本地，不上传）\n\n"
            + "【Instagram】\n"
@@ -9735,10 +9937,35 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
            + "方式：需在 App 内登录 IG（Cookie 存本地不上传），带登录态直连解析；\n"
            + "　　　匿名只能拿封面，视频流一律 403。\n"
            + "　　　登录前请先在官方 App 登录过该账号，否则有封号风险。\n\n"
-          + "【通用】\n"
-          + "· 只解析公开分享页，不解密加密内容，不存储账号信息。\n"
-          + "· 文件名前缀：dy_抖音 ks_快手 tt_TikTok x_X yt_YouTube bl_B站 ins_IG\n"
-          + "· CDN 直链有时效，过期需重新解析。";
+           + "【聚合通道】免 Key、免 Cookie、免服务器\n"
+           + "═══ video-crack（实测已验证）═══\n"
+           + "　✓ 哔哩哔哩（BV/av/b23.tv 短链/分P）\n"
+           + "　✓ 抖音（短链+长链，视频/图集/实况）\n"
+           + "　✓ 快手（短链，视频/图集）\n"
+           + "　✓ TikTok\n"
+           + "　✓ 微信视频号\n"
+           + "　✓ 最右\n"
+           + "═══ 抖音本地直连（api.amemv.com）═══\n"
+           + "　✓ 视频原画（多档清晰度）  ✓ 图集原图\n"
+           + "　✓ 实况动轨（Live Photo）  ✓ 背景音乐\n"
+           + "═══ 本地解析器（现有能力，不依赖任何 API）═══\n"
+           + "　✓ YouTube  ✓ X（推特）  ✓ Instagram\n"
+           + "　✓ 小红书  ✓ 微博  ✓ 今日头条/西瓜视频\n"
+           + "　✓ 好看视频  ✓ 微视  ✓ AcFun\n"
+           + "　✓ 皮皮虾  ✓ 皮皮搞笑  ✓ 豆包\n"
+           + "　✓ 即梦AI  ✓ 腾讯视频  ✓ 微信公众号\n"
+           + "　✓ 磁力/BT\n"
+           + "═══ 网易云音乐（第三方 API）═══\n"
+           + "　✓ 单曲：歌名/歌手/专辑/封面/时长\n"
+           + "　✓ 音频直链：优先无损 FLAC，其次 320kbps MP3\n"
+           + "　支持输入歌曲链接、纯数字歌曲ID、分享文案\n"
+           + "　⚠ 该功能依赖第三方公开接口，不逆向官方协议\n"
+           + "　　受版权限制，部分歌曲无直链（会明确提示原因）\n"
+           + "说明：聚合失败自动回落到本地解析，不影响正常使用\n\n"
+           + "【通用】\n"
+           + "· 只解析公开分享页，不解密加密内容，不存储账号信息。\n"
+           + "· 文件名前缀：dy_抖音 ks_快手 tt_TikTok x_X yt_YouTube bl_B站 ins_IG\n"
+           + "· CDN 直链有时效，过期需重新解析。";
 
         int bgDlg   = curDark ? 0xFF191B21 : 0xFFFFFFFF;
         int textDlg = curDark ? 0xFFF2F3F5 : 0xFF1A1A1F;
@@ -15371,8 +15598,97 @@ webDone=false;
         // 新解析开始时退出主页收集模式（防残留）
         if(profileMode && !isProfileUrl(url)) stopProfileMode();
         o("");
+        // 聚合解析 API（本地直连优先，最高优先级）
+        // 只有实测可用的平台才会进这里；失败/未命中立即回落到下面的本地解析器，
+        // 不会因为第三方 API 挂掉而让用户解析不了。
+        if(AggApi.mightHandle(url) && !profileMode){
+            s("解析中（聚合API）...");
+            web.setVisibility(View.GONE);
+            final String aggUrl = url;
+            new Thread(new Runnable(){ public void run(){
+                final AggApi.Item it = AggApi.resolve(MainActivity.this, aggUrl);
+                DypLog.i("AGG_DONE ok=" + it.ok + " src=" + it.src
+                    + " plat=" + it.platform + " v=" + it.hasVideo()
+                    + " imgs=" + it.images.size() + " err=" + it.err);
+                h.post(new Runnable(){ public void run(){
+                    if(it.ok){
+                        webDone = true;
+                        String r = AggApi.toText(it);
+                        String[] md = AggApi.toMedia(it);
+                        DypLog.i("AGG_RESULT_BEGIN\n" + r + "\nAGG_RESULT_END");
+                        // v2.1.6 排查：把关键字段单独打出来，定位「视频只出缩略图」到底是哪一步丢的
+                        DypLog.i("AGG_FIELDS type=" + it.type
+                            + " playLen=" + (it.playUrl == null ? -1 : it.playUrl.length())
+                            + " playHead=" + (it.playUrl == null || it.playUrl.length() == 0
+                                ? "" : it.playUrl.substring(0, Math.min(70, it.playUrl.length())))
+                            + " imgsN=" + it.images.size()
+                            + " coverLen=" + (it.cover == null ? -1 : it.cover.length())
+                            + " gearsN=" + it.gears.size()
+                            + " mdPlayLen=" + (md[1] == null ? -1 : md[1].length()));
+                        curId = "";
+                        curDesc = it.title;
+                        curCover = it.cover;
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(" + it.platform + "·聚合API)"
+                            + (it.hasImages() ? " " + it.images.size() + " 张图" : ""));
+                    } else {
+                        // 回落到本地解析链路：重新走一次 loadForParse，但标记跳过聚合
+                        s("聚合API未命中，改用本地解析...");
+                        h.postDelayed(new Runnable(){ public void run(){
+                            loadLocalParse(url);
+                        }}, 60);
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        loadLocalParse(url);
+    }
+
+    /** 跳过聚合 API，直接走本地解析链路（原 loadForParse 主体） */
+    void loadLocalParse(final String url){
+        // 抖音单作品：本地直连（免 Cookie / 免签名 / 免服务器）
+        //   走 api.amemv.com/aweme/v1/aweme/detail/，实测 92KB 完整数据，
+        //   支持视频原画（11 档 bit_rate）、图集原图、实况动轨、背景音乐。
+        //   失败再落回原来的 WebView 链路，不影响既有能力。
+        if(DyLocalParser.canHandle(url) && !url.contains("/user/")){
+            s("解析抖音（本地直连）...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final DyLocalParser.Item it = DyLocalParser.resolve(MainActivity.this, url);
+                DypLog.i("DY_LOCAL_DONE ok=" + it.ok + " v=" + it.hasVideo()
+                    + " imgs=" + it.images.size() + " live=" + it.hasLive()
+                    + " music=" + it.hasMusic() + " err=" + it.err);
+                h.post(new Runnable(){ public void run(){
+                    if(it.ok){
+                        webDone = true;
+                        curId = it.id;
+                        curDesc = it.title;
+                        curCover = it.cover;
+                        String r = DyLocalParser.toText(it);
+                        String[] md = DyLocalParser.toMedia(it);
+                        DypLog.i("DY_LOCAL_RESULT_BEGIN\n" + r + "\nDY_LOCAL_RESULT_END");
+                        o2(r, md[0], md[1], md[2]);
+                        s("完成(抖音·本地)"
+                            + (it.images.size() > 0 ? " " + it.images.size() + " 张图" : "")
+                            + (it.hasLive() ? " 含实况" : ""));
+                    } else {
+                        s("本地直连未命中，改用网页模式...");
+                        h.postDelayed(new Runnable(){ public void run(){
+                            loadLocalParseWeb(url);
+                        }}, 60);
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        loadLocalParseWeb(url);
+    }
+
+    /** 原有的本地解析链路（WebView / 各平台 Parser），保持不变 */
+    void loadLocalParseWeb(final String url){
         // 轻量平台（微视/AcFun/最右/皮皮虾/皮皮搞笑/好看/西瓜）：页面内嵌 JSON 本地逆向
-        if(MiscParser.isMiscUrl(url)){
+if(MiscParser.isMiscUrl(url)){
             s("解析中...");
             web.setVisibility(View.GONE);
             new Thread(new Runnable(){ public void run(){
@@ -15455,6 +15771,40 @@ webDone=false;
                     } else {
                         s("腾讯视频解析失败：" + (it.err.length() > 0 ? it.err : "无内容"));
                         showHintToast("腾讯视频解析失败，会员/付费内容只能拿试看片段");
+                    }
+                }});
+            }}).start();
+            return;
+        }
+        // 网易云音乐：纯 API 方案（官方元数据 + 第三方直链），不做本地协议逆向
+        //   任何一步失败都会给出人话原因，不会假成功
+        if(Music163Parser.canHandle(url)){
+            s("解析网易云音乐...");
+            web.setVisibility(View.GONE);
+            new Thread(new Runnable(){ public void run(){
+                final Music163Parser.Song sg = Music163Parser.resolve(url);
+                DypLog.i("M163_DONE ok=" + sg.ok + " name=" + sg.name
+                    + " artist=" + sg.artist + " src=" + sg.src
+                    + " br=" + sg.playBr + " err=" + sg.err.replace("\n", " | "));
+                h.post(new Runnable(){ public void run(){
+                    if(sg.ok){
+                        webDone = true;
+                        String r = Music163Parser.toText(sg);
+                        String[] md = Music163Parser.toMedia(sg);
+                        DypLog.i("M163_RESULT_BEGIN\n" + r + "\nM163_RESULT_END");
+curId = sg.id;
+                        curDesc = sg.artist.length() > 0 ? sg.artist + " - " + sg.name : sg.name;
+                        curCover = sg.cover;
+                        o2(r, md[0], md[1], md[2]);
+                        String q = sg.playBr;
+                        if("797".equals(q) || "999".equals(q)) q = "无损";
+                        else if(q.length() > 0) q = q + "kbps";
+                        s("完成(网易云音乐)" + (q.length() > 0 ? " " + q : ""));
+                    } else {
+                        // 明确告知不可用，绝不静默失败
+                        String why = sg.err.length() > 0 ? sg.err : "该歌曲暂无可下载音频";
+                        s("网易云解析失败");
+                        showResultErrorCard(sg.name, why);
                     }
                 }});
             }}).start();
@@ -16980,6 +17330,11 @@ webDone=false;
         if(u.contains("googlevideo.com") || u.contains("ytimg.com")) return "https://www.youtube.com/";
         // Instagram
         if(u.contains("cdninstagram.com") || u.contains("fbcdn.net")) return "https://www.instagram.com/";
+        // 网易云音乐（封面图床 p*.music.126.net、m*.music.126.net、音频 CDN）
+        if(u.contains("music.126.net") || u.contains("music.163.com")
+                || u.contains("163cn.tv")){
+            return "https://music.163.com/";
+        }
         // 抖音（放最后，避免误伤其他字节系域名）
         if(u.contains("douyin.com") || u.contains("douyinpic.com") || u.contains("douyinvod.com")
                 || u.contains("iesdouyin.com") || u.contains("amemv.com") || u.contains("snssdk.com")){
@@ -17153,6 +17508,26 @@ webDone=false;
         }catch(Throwable t){ DypLog.i("MINI_INIT_ERR " + t); }
     }
 
+    /** 按目标 URL（以及当前解析页 URL）决定播放器该带哪个 Referer。
+     *  创建播放器与「是否需要重建」的比较都走这一个函数，保证两边永远一致。 */
+    String playRefKey(String play, String page){
+        String p = play == null ? "" : play;
+        String g = page == null ? "" : page;
+        if(p.indexOf("tiktok") >= 0 || g.indexOf("tiktok") >= 0) return "https://www.tiktok.com/";
+        if(p.indexOf("kwaicdn") >= 0 || p.indexOf("kuaishou") >= 0 || KsParser.isKsUrl(g))
+            return "https://www.kuaishou.com/";
+        if(p.indexOf("twimg.com") >= 0 || isXDomain(p) || isXDomain(g)) return "https://x.com/";
+        if(p.indexOf("bilivideo") >= 0 || p.indexOf("hdslb") >= 0 || BiliParser.isBiliUrl(g))
+            return "https://www.bilibili.com/";
+        if(p.indexOf("googlevideo") >= 0 || YtParser.isYtUrl(g)) return "https://www.youtube.com/";
+        // 小红书：xhscdn（视频/图床）、ci.xiaohongshu.com（原图）、sns-webpic 等
+        if(p.indexOf("xhscdn") >= 0 || p.indexOf("xiaohongshu") >= 0 || XhsParser.isXhsUrl(g))
+            return "https://www.xiaohongshu.com/";
+        if(p.indexOf("sinaimg") >= 0 || p.indexOf("weibo") >= 0 || g.indexOf("weibo") >= 0)
+            return "https://weibo.com/";
+        return "https://www.douyin.com/";
+    }
+
     void doPlayInner(){
         if(curPlay==null||curPlay.length()==0) return;
         try{
@@ -17167,13 +17542,13 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     || (curPlay != null && curPlay.contains("bilivideo.com"));
             // 当前播放器用的 DataSource.Factory（双轨合并时复用）
             final androidx.media3.datasource.DataSource.Factory[] dsf = new androidx.media3.datasource.DataSource.Factory[1];
-            if(miniPlayer == null || miniProxyKey == null || miniProxyKey != proxyCacheKey(curPlay) || miniWasTT != ttUrl){
+            if(miniPlayer == null || miniProxyKey == null || miniProxyKey != proxyCacheKey(curPlay)
+                    || miniWasTT != ttUrl || miniRefKey == null || !miniRefKey.equals(playRefKey(curPlay, curUrl))){
                 if(miniPlayer != null){ try{ miniPlayer.release(); }catch(Throwable t){} miniPlayer = null; }
-                String ref = ttUrl ? "https://www.tiktok.com/"
-                    : (ksUrl ? "https://www.kuaishou.com/"
-                    : (xUrl ? "https://x.com/"
-                    : (biliUrl ? "https://www.bilibili.com/"
-                    : (ytPlayUrl ? "https://www.youtube.com/" : "https://www.douyin.com/"))));
+                // Referer 必须按平台给，否则 CDN 判盗链直接 403。
+                // v2.1.6 修复：原来这条链里没有小红书，小红书播放用的是默认
+                // douyin.com Referer，实测必 403（下载器那边同一个坑已单独修过）。
+                String ref = playRefKey(curPlay, curUrl);
                 androidx.media3.datasource.DefaultHttpDataSource.Factory http =
                     new androidx.media3.datasource.DefaultHttpDataSource.Factory()
                         .setUserAgent(MUA)
@@ -17252,6 +17627,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                     .build();
                 miniWasTT = ttUrl;
                 miniProxyKey = proxyCacheKey(curPlay);
+                miniRefKey = ref;
                 miniPlayer.addListener(new androidx.media3.common.Player.Listener(){
                     @Override public void onPlaybackStateChanged(int state){
                         if(state == androidx.media3.common.Player.STATE_READY){
@@ -17375,11 +17751,31 @@ boolean ttUrl = isTikTokUrl(curPlay);
                             return;
                         }
                         // 403 时直接给出可操作提示
+                        // v2.1.6：原来这段写死「TikTok 的 CDN 只放行住宅 IP」，
+                        // 结果小红书/微博/B站 403 时也弹这句，误导用户（用户已反馈）。
+                        // 现在按平台给不同文案，未知平台给通用文案。
                         if(e.getErrorCodeName() != null && e.getErrorCodeName().contains("BAD_HTTP_STATUS")){
-                            final String msg = "视频被 CDN 拒绝（403）\n"
-                                + "当前代理 IP 拿不到视频流。\n"
-                                + "这不是解析失败，是 TikTok 的 CDN 只放行住宅 IP。\n"
-                                + "换住宅节点，或点「关于 → 网络自检」看具体原因。";
+                            final String u403 = curUrl == null ? "" : curUrl;
+                            String m403;
+                            if(TtParser.isTtUrl(u403) || u403.indexOf("tiktok") >= 0){
+                                m403 = "视频被 CDN 拒绝（403）\n"
+                                    + "当前代理 IP 拿不到视频流。\n"
+                                    + "这不是解析失败，是 TikTok 的 CDN 只放行住宅 IP。\n"
+                                    + "换住宅节点，或点「关于 → 网络自检」看具体原因。";
+                            }else if(XhsParser.isXhsUrl(u403) || u403.indexOf("xhscdn") >= 0
+                                    || u403.indexOf("xiaohongshu") >= 0){
+                                m403 = "小红书视频被 CDN 拒绝（403）\n"
+                                    + "直链已过期或 Referer 不对。\n"
+                                    + "解决：重新点「解析」拿新链接再下载。";
+                            }else if(u403.indexOf("weibo") >= 0 || u403.indexOf("sinaimg") >= 0){
+                                m403 = "微博资源被 CDN 拒绝（403）\n"
+                                    + "直链可能已过期，重新解析一次再试。";
+                            }else{
+                                m403 = "资源被 CDN 拒绝（403）\n"
+                                    + "直链可能已过期，或该 CDN 对本机网络/IP 有限制。\n"
+                                    + "解决：重新点「解析」拿新链接；仍失败请检查代理节点。";
+                            }
+                            final String msg = m403;
                             h.post(new Runnable(){ public void run(){ s(msg); }});
                         }
                         // X 直连播放失败：直连连不上 video.twimg.com → 自动回退服务器中转
@@ -17890,7 +18286,8 @@ boolean ttUrl = isTikTokUrl(curPlay);
             it.putExtra("id", curId);
             String d = curDesc == null ? "" : curDesc;
             it.putExtra("desc", d);
-            it.putExtra("ref", KsParser.isKsUrl(curPlay) ? "https://www.kuaishou.com/" : null);
+            it.putExtra("ref", KsParser.isKsUrl(curPlay) ? "https://www.kuaishou.com/"
+                    : (curPlay.indexOf("music.126.net") >= 0 ? "https://music.163.com/" : null));
             startActivity(it);
         }catch(Exception e){ DypLog.i("openPlayerErr "+e); s("\u64ad\u653e\u5668\u542f\u52a8\u5931\u8d25"); }
     }
@@ -18251,14 +18648,74 @@ boolean ttUrl = isTikTokUrl(curPlay);
     }
 
     /** 按 URL 推断图片扩展名 */
+    /**
+     * 判断图片扩展名。
+     *
+     * v2.1.3 重要修正：
+     *   以前 URL 里只要出现 "webp" 就返回 .webp，导致抖音/字节系的图集
+     *   全都存成 .webp（用户反馈：为什么不是 jpg/png）。
+     *
+     *   实际上字节系图床（douyinpic / byteimg / ixigua）默认就会回 webp，
+     *   想拿 jpg 必须在请求时处理（见 forceJpgUrl()）。
+     *   所以这里默认返回 jpg —— 下载完后 fixImageExt() 会按**真实文件头**
+     *   二次校正，该是 png 的改 png，该是 webp 的也不会误标成 jpg。
+     *
+     *   保留 png 判定是因为 png 多为透明图，格式本身有意义。
+     *   gif / heic 同理。
+     */
     String imgExtOf(String u){
         if(u == null) return "jpg";
         String l = u.toLowerCase();
-        if(l.indexOf(".png") > 0 || l.indexOf("format=png") > 0) return "png";
-        if(l.indexOf(".webp") > 0 || l.indexOf("format=webp") > 0) return "webp";
-        if(l.indexOf(".gif") > 0) return "gif";
+        // .gif / format=gif 是动图，必须保留
+        if(l.indexOf(".gif") > 0 || l.indexOf("format=gif") > 0) return "gif";
+        // .heic 苹果格式保留
         if(l.indexOf(".heic") > 0) return "heic";
+        // png：真 PNG 或显式要求 png
+        if(l.indexOf(".png") > 0 || l.indexOf("format=png") > 0
+                || l.indexOf("image/format,png") > 0) return "png";
+        // 其余（含 webp）统一先按 jpg 存，下载后由 fixImageExt 按文件头校正
         return "jpg";
+    }
+
+    /**
+     * 让字节系图床返回 JPEG 而不是 WEBP。
+     *
+     * 抖音/西瓜/头条的图片 URL 形如：
+     *   https://p3-sign.douyinpic.com/tos-cn-i-xxx/xxxxx~tplv-dy-aweme-images:1080:1080.webp?...
+     * 默认模板会强制 webp。改成 .jpeg 模板即可拿到 JPEG。
+     *
+     * 规则：把 `~tplv-xxx.webp` 里的 .webp 换成 .jpeg；没有 tplv 模板的
+     * 加 x-oss-process 参数要求转 jpg。
+     */
+    static String forceJpgUrl(String u){
+        if(u == null || u.length() == 0) return u;
+        String l = u.toLowerCase();
+        // 只对字节系/阿里 OSS 图床做处理，别动别人的图
+        boolean byteCdn = l.contains("douyinpic.com") || l.contains("byteimg.com")
+                || l.contains("ixiguavideo.com") || l.contains("ixigua.com")
+                || l.contains("toutiaoimg.com") || l.contains("pstatp.com")
+                || l.contains("snssdk.com");
+        if(!byteCdn) return u;
+        // gif/heic/png 不动（真动图 / 特殊格式）
+        if(l.contains(".gif") || l.contains(".heic") || l.contains(".png")) return u;
+
+        String out = u;
+        // 1) ~tplv-xxx.webp  →  ~tplv-xxx.jpeg
+        if(out.contains("~tplv-")){
+            int q = out.indexOf('?');
+            String path = q >= 0 ? out.substring(0, q) : out;
+            String query = q >= 0 ? out.substring(q) : "";
+            if(path.toLowerCase().endsWith(".webp")){
+                out = path.substring(0, path.length() - 5) + ".jpeg" + query;
+                return out;
+            }
+        }
+        // 2) 没有模板：用 OSS 参数要求转 jpg
+        if(!l.contains("x-oss-process")){
+            out = u + (u.contains("?") ? "&" : "?")
+                    + "x-oss-process=image/format,jpg";
+        }
+        return out;
     }
 
     /** 本次批量下载里：没有直链的条数 / detail 被风控的条数（用于结束提示） */
@@ -18390,7 +18847,7 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                         if(!iu.startsWith("http")) iu = effSrv() + iu;
                                         enqueueDownloadPlat(iu, "图" + (gi0 + 1),
                                                 imgExtOf(iu), "图片", "",
-                                                "TikTok", sid0 + "_" + (gi0 + 1), "");
+                                                "TikTok", sid0 + "_" + (gi0 + 1), "", myIt.title);
                                         gi0++; queued++;
                                     }
                                 }else{
@@ -18400,13 +18857,13 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                         if(iu == null || iu.indexOf("http") != 0) continue;
                                         enqueueDownloadPlat(iu, "图" + (gi0 + 1),
                                                 imgExtOf(iu), "图片", "",
-                                                "TikTok", sid0 + "_" + (gi0 + 1), "");
+                                                "TikTok", sid0 + "_" + (gi0 + 1), "", myIt.title);
                                         gi0++; queued++;
                                     }
                                 }
                             }else if(usePlay.length() > 0){
                                 enqueueDownloadPlat(usePlay, "视频", "mp4", "视频", "",
-                                        "TikTok", sid0, "");
+                                        "TikTok", sid0, "", myIt.title);
                                 queued++;
                             }
                             DypLog.i("BATCH_TT_SRV_OK idx=" + myIdxO + " type=" + type0
@@ -18427,17 +18884,17 @@ boolean ttUrl = isTikTokUrl(curPlay);
                                     }
                                     if(live.length() > 0){
                                         enqueueDownloadPlat(iu, "实况" + (gi + 1), "jpg", "动图", "",
-                                                "TikTok", sid + "_" + (gi + 1), live);
+                                                "TikTok", sid + "_" + (gi + 1), live, myIt.title);
                                     }else{
                                         enqueueDownloadPlat(iu, "图" + (gi + 1), imgExtOf(iu), "图片", "",
-                                                "TikTok", sid + "_" + (gi + 1), "");
+                                                "TikTok", sid + "_" + (gi + 1), "", myIt.title);
                                     }
                                     queued++;
                                 }
                             }
                             if(v.hasVideo()){
                                 enqueueDownloadPlat(v.playUrl, "视频", "mp4", "视频", "",
-                                        "TikTok", sid, "");
+                                        "TikTok", sid, "", myIt.title);
                                 queued++;
                             }
                             if(queued == 0) err = (v.err.length() > 0 ? v.err : "无可下载内容");
@@ -18449,14 +18906,14 @@ boolean ttUrl = isTikTokUrl(curPlay);
                         String d = (myIt.directUrl != null) ? myIt.directUrl : "";
                         if(d.indexOf("http") == 0){
                             enqueueDownloadPlat(d, "视频", "mp4", "视频", "",
-                                    "X", myIt.id, "");
+                                    "X", myIt.id, "", myIt.title);
                             queued++;
                         }else if(myIt.imgs != null && !myIt.imgs.isEmpty()){
                             for(int gi = 0; gi < myIt.imgs.size(); gi++){
                                 String iu = myIt.imgs.get(gi);
                                 if(iu == null || iu.indexOf("http") != 0) continue;
                                 enqueueDownloadPlat(iu, "图" + (gi + 1), imgExtOf(iu), "图片", "",
-                                        "X", myIt.id + "_" + (gi + 1), "");
+                                        "X", myIt.id + "_" + (gi + 1), "", myIt.title);
                                 queued++;
                             }
                         }else{
@@ -18605,11 +19062,11 @@ boolean ttUrl = isTikTokUrl(curPlay);
                 if(live.length() > 0){
                     // 实况图 → 动图目录，和单独下载完全一致
                     enqueueDownloadPlat(iu, "实况" + (gi + 1), "jpg", "动图", "",
-                            iplat, sid, live);
+                            iplat, sid, live, it.title);
                     ln++;
                 }else{
                     enqueueDownloadPlat(iu, "图" + (gi + 1), iext, "图片", "",
-                            iplat, sid, "");
+                            iplat, sid, "", it.title);
                     qn++;
                 }
             }
@@ -19484,6 +19941,8 @@ btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View
                                     if(imgsObj instanceof List && !((List) imgsObj).isEmpty()){
                                         java.util.List<String> im = new java.util.ArrayList<String>();
                                         java.util.List<String> dv = new java.util.ArrayList<String>();
+                                        // 列表页单条下载也按标题命名（adM 就是 aweme_detail）
+                                        String adTitle = gs(get(adM, "desc"));
                                         for(Object imo : (List) imgsObj){
                                             if(!(imo instanceof Map)) continue;
                                             Map imm = (Map) imo;
@@ -19512,14 +19971,14 @@ btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View
                                                     liveN++;
                                                     String ld = liveDirect(lv);
                                                     enqueueDownloadPlat(iu, "实况" + (g + 1), "jpg", "动图",
-                                                            "", "抖音", sid);
+                                                            "", "抖音", sid, "", adTitle);
                                                     if(ld.length() > 0){
                                                         enqueueDownloadPlat(ld, "实况" + (g + 1), "mp4", "动图",
-                                                                "", "抖音", sid + "_dyn");
+                                                                "", "抖音", sid + "_dyn", "", adTitle);
                                                     }
                                                 }else{
                                                     enqueueDownloadPlat(iu, "图" + (g + 1), imgExtOf(iu), "图片",
-                                                            "", "抖音", sid);
+                                                            "", "抖音", sid, "", adTitle);
                                                 }
                                             }
                                             DypLog.i("LIST_DETAIL_IMGS id=" + fdid
@@ -19834,6 +20293,14 @@ btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View
         }
         boolean hasImgs = imgUrls != null && imgUrls.size() > 0;
         if(!hasImgs && (curPlay == null || curPlay.length() == 0)){ s("无可下载地址"); return; }
+        // 网易云音乐：音频下载（分类「音乐」，扩展名按实际音质）
+        //   curPlay 是 mp3/flac 直链，不能走下面的「视频 mp4」分支
+        if(isMusic163Domain(curUrl)){
+            String ext = (curPlay != null && curPlay.indexOf(".flac") >= 0) ? "flac" : "mp3";
+            enqueueDownloadWithAudio(curPlay, "音频", ext, "音乐", "", "");
+            s("已加入下载队列（音乐·" + ext + "）");
+            return;
+        }
 
         // 视频（无图集）：大文件提醒后直接下 mp4（分类：视频）
         if(!hasImgs){
@@ -19912,47 +20379,72 @@ btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View
                     }
                 })
             .setPositiveButton("下载所选", new android.content.DialogInterface.OnClickListener(){
-                public void onClick(android.content.DialogInterface d, int w){
-                    int cnt = 0;
-                    for(int i = 0; i < n; i++){
-                        if(!sel[i]) continue;
-                        String live = liveDirect(dynAt(i));
-                        if(live.length() > 0){
-                            // 实况 → 动图目录
-                            downloadQueue.add(new DlTask(
-                                imgUrls.get(i), "实况" + (i + 1), "jpg", "动图", "", live));
-                        } else {
-                            downloadQueue.add(new DlTask(
-                                imgUrls.get(i), "图" + (i + 1), "jpg", "图片", "", ""));
-                        }
-                        cnt++;
-                    }
-                    if(cnt == 0){ s("未选择任何图片"); return; }
-                    if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
-                    s("已加入下载：" + cnt + " 个");
-                    DypLog.i("IMG_QUEUE n=" + cnt);
-                }
-            })
-            .setNeutralButton("全选下载", new android.content.DialogInterface.OnClickListener(){
-                public void onClick(android.content.DialogInterface d, int w){
-                    for(int i = 0; i < n; i++){
-                        String live = liveDirect(dynAt(i));
-                        if(live.length() > 0){
-                            // 实况 → 动图目录
-                            downloadQueue.add(new DlTask(
-                                imgUrls.get(i), "实况" + (i + 1), "jpg", "动图", "", live));
-                        } else {
-                            downloadQueue.add(new DlTask(
-                                imgUrls.get(i), "图" + (i + 1), "jpg", "图片", "", ""));
-                        }
-                    }
-                    if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
-                    s("已加入下载：" + n + " 个");
-                    DypLog.i("IMG_QUEUE all n=" + n);
-                }
-            })
-            .setNegativeButton("取消", null)
-            .show();
+                 public void onClick(android.content.DialogInterface d, int w){
+                     int cnt = 0;
+                     // 按标题命名（v2.1.6）：之前这里直接 new DlTask(...) 不带 nameBase，
+                     // 文件名回落到 dy_<id>_<tag>，小红书被标成 dy_ 且标题为空。
+                     String nbBase = taskStableName(imgUrls.get(0), "图片", "", gs(curDesc));
+                     for(int i = 0; i < n; i++){
+                         if(!sel[i]) continue;
+                         String live = liveDirect(dynAt(i));
+                         String nb = (nbBase == null ? "" : nbBase);
+                         if(nb.length() > 0){
+                             // 多张时附上序号，避免互相覆盖
+                             if(n > 1) nb = nb + "_" + (i + 1);
+                             if(live.length() > 0){
+                                 downloadQueue.add(new DlTask(
+                                     imgUrls.get(i), "实况" + (i + 1), "jpg", "动图", "", live, nb));
+                             } else {
+                                 downloadQueue.add(new DlTask(
+                                     imgUrls.get(i), "图" + (i + 1), "jpg", "图片", "", "", nb));
+                             }
+                         } else if(live.length() > 0){
+                             // 实况 → 动图目录
+                             downloadQueue.add(new DlTask(
+                                 imgUrls.get(i), "实况" + (i + 1), "jpg", "动图", "", live));
+                         } else {
+                             downloadQueue.add(new DlTask(
+                                 imgUrls.get(i), "图" + (i + 1), "jpg", "图片", "", ""));
+                         }
+                         cnt++;
+                     }
+                     if(cnt == 0){ s("未选择任何图片"); return; }
+                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
+                     s("已加入下载：" + cnt + " 个");
+                     DypLog.i("IMG_QUEUE n=" + cnt);
+                 }
+             })
+             .setNeutralButton("全选下载", new android.content.DialogInterface.OnClickListener(){
+                 public void onClick(android.content.DialogInterface d, int w){
+                     String nbBase = taskStableName(imgUrls.get(0), "图片", "", gs(curDesc));
+                     for(int i = 0; i < n; i++){
+                         String live = liveDirect(dynAt(i));
+                         String nb = (nbBase == null ? "" : nbBase);
+                         if(nb.length() > 0){
+                             if(n > 1) nb = nb + "_" + (i + 1);
+                             if(live.length() > 0){
+                                 downloadQueue.add(new DlTask(
+                                     imgUrls.get(i), "实况" + (i + 1), "jpg", "动图", "", live, nb));
+                             } else {
+                                 downloadQueue.add(new DlTask(
+                                     imgUrls.get(i), "图" + (i + 1), "jpg", "图片", "", "", nb));
+                             }
+                         } else if(live.length() > 0){
+                             // 实况 → 动图目录
+                             downloadQueue.add(new DlTask(
+                                 imgUrls.get(i), "实况" + (i + 1), "jpg", "动图", "", live));
+                         } else {
+                             downloadQueue.add(new DlTask(
+                                 imgUrls.get(i), "图" + (i + 1), "jpg", "图片", "", ""));
+                         }
+                     }
+                     if(!dlRunning){ dlRunning = true; runDownloadQueue(); }
+                     s("已加入下载：" + n + " 个");
+                     DypLog.i("IMG_QUEUE all n=" + n);
+                 }
+             })
+             .setNegativeButton("取消", null)
+             .show();
     }
 
     /**
@@ -19960,8 +20452,67 @@ btnDlAll.setOnClickListener(new View.OnClickListener(){ public void onClick(View
      * 相册长按可播放，跟抖音原生实况图一致。
      */
     boolean downloadLivePhoto(DlTask task, File target){
+        int lm = liveMode();
         byte[] img = null, mp4 = null;
         try{
+            // ===== 模式 1：只下动轨，直接存 mp4（通用播放器可放） =====
+            if(lm == 1){
+                h.post(new Runnable(){ public void run(){
+                    progSet(0.3f, "下载实况动轨…");
+                }});
+                mp4 = httpGetBytes(task.liveUrl);
+                if(mp4 == null || mp4.length < 1000){
+                    DypLog.i("LIVE_MP4_FAIL len=" + (mp4 == null ? -1 : mp4.length));
+                    appLog("下载", "✗ 实况动轨下载失败");
+                    return false;
+                }
+                h.post(new Runnable(){ public void run(){
+                    progSet(0.9f, "保存动轨…");
+                }});
+                File parent = target.getParentFile();
+                if(parent != null && !parent.exists()) parent.mkdirs();
+                java.io.FileOutputStream fo = new java.io.FileOutputStream(target);
+                try{ fo.write(mp4); fo.flush(); } finally { try{ fo.close(); }catch(Throwable t){} }
+                DypLog.i("LIVE_MODE_MP4 ok size=" + target.length());
+                appLog("下载", "✓ 实况动轨 " + target.getName()
+                        + "  " + InnerDownloader.sizeText(target.length()));
+                try{ savedDirs.add(target.getParentFile().getAbsolutePath()); }catch(Throwable t){}
+                return true;
+            }
+            // ===== 模式 2：动轨转 GIF =====
+            if(lm == 2){
+                h.post(new Runnable(){ public void run(){
+                    progSet(0.3f, "下载实况动轨…");
+                }});
+                mp4 = httpGetBytes(task.liveUrl);
+                if(mp4 == null || mp4.length < 1000){
+                    DypLog.i("LIVE_MP4_FAIL len=" + (mp4 == null ? -1 : mp4.length));
+                    appLog("下载", "✗ 实况动轨下载失败");
+                    return false;
+                }
+                h.post(new Runnable(){ public void run(){
+                    progSet(0.6f, "转码 GIF 动图…");
+                }});
+                boolean gok = LiveExporter.convertGif(mp4, target, getCacheDir(),
+                    new LiveExporter.ProgressCb(){
+                        @Override public void onProgress(final float r){
+                            h.post(new Runnable(){ public void run(){
+                                progSet(0.6f + r * 0.35f, "转码 GIF 动图…");
+                            }});
+                        }
+                    });
+                if(!gok){
+                    DypLog.i("LIVE_GIF_FAIL");
+                    appLog("下载", "✗ GIF 转码失败");
+                    return false;
+                }
+                DypLog.i("LIVE_MODE_GIF ok size=" + target.length());
+                appLog("下载", "✓ 实况动图 " + target.getName()
+                        + "  " + InnerDownloader.sizeText(target.length()));
+                try{ savedDirs.add(target.getParentFile().getAbsolutePath()); }catch(Throwable t){}
+                return true;
+            }
+            // ===== 模式 0：Motion Photo 实况照片（原逻辑） =====
             h.post(new Runnable(){ public void run(){
                 progSet(0.15f, "下载实况图…");
             }});
@@ -20638,6 +21189,13 @@ final String pfx;
         enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, stableId);
     }
 
+    /** 带平台 + 稳定 id + 标题（v2.1.3）：按标题命名，去 emoji / 特殊符号。 */
+    void enqueueDownload(String url, String tag, String ext, String cat,
+                         String mixDir, String platOverride, String stableId,
+                         String liveUrl, String title){
+        enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, stableId, liveUrl, title);
+    }
+
     /** 单个下载（不带音轨）：不进下载列表 */
     void enqueueSingle(String url, String tag, String ext, String cat, String mixDir){
         if(BtDownloader.isMagnet(url) || (url != null && url.indexOf(".torrent") > 0)){
@@ -20653,7 +21211,8 @@ final String pfx;
         // 单个下载也进「下载」页：退出软件后能继续下，用户要求下载过程都在下载里看得到
         t.silent = false;
         t.plat = platOf(url);
-        try{ t.nameBase = taskStableName(url, tag); }catch(Throwable e){}
+        // 文件名优先用当次解析出的标题（去 emoji / 特殊符号），无标题回落 平台id_tag
+        try{ t.nameBase = taskStableName(url, tag, "", curDesc); }catch(Throwable e){}
         downloadQueue.add(t);
         DypLog.i("DL_QUEUE_SINGLE + " + tag + " cat=" + cat);
         saveDlTasks();
@@ -20768,7 +21327,7 @@ final String pfx;
 
     /** 入队时就定好文件名（不带扩展名）：重启恢复后名字不变，才能接着 .part 续传 */
     String taskStableName(String url, String tag){
-        return taskStableName(url, tag, "");
+        return taskStableName(url, tag, "", "");
     }
 
     /**
@@ -20780,6 +21339,20 @@ final String pfx;
      *                 每次算出不同文件名，去重失效、重复下载。
      */
     String taskStableName(String url, String tag, String stableId){
+        return taskStableName(url, tag, stableId, "");
+    }
+
+    /**
+     * 文件名主体（完整版）。
+     *
+     * 命名规则（v2.1.3 起改为按标题命名）：
+     *   · 有标题：<平台前缀><清洗后的标题>             例：dy_好想和你走在黄昏的小路上.mp4
+     *   · 无标题：<平台前缀><id>_<tag>（保持原逻辑）    例：dy_7396234104540335395_视频.mp4
+     *   · 合集  ：<平台前缀><标题>_第N集
+     *
+     * 标题会经过 safeFileTitle() 清洗：去 emoji、去 #@、去非法字符、截断长度。
+     */
+    String taskStableName(String url, String tag, String stableId, String title){
         try{
             String u = url == null ? "" : url;
             // 【优先用调用方给的 stableId】
@@ -20812,7 +21385,21 @@ final String pfx;
                 }
             }
             String t = tag == null ? "" : tag.replace("/", "_").replace("\\", "_");
-            return mediaPfx(u) + id + "_" + t;
+            String pfx = mediaPfx(u);
+
+            // 【按标题命名】—— 用户要求：下载的文件用视频标题，并去掉表情/特殊符号
+            String clean = safeFileTitle(title);
+            if(clean.length() > 0){
+                // 合集类 tag（第N集）保留在标题后面，方便区分
+                if(t.length() > 0 && !"视频".equals(t) && !"音频".equals(t)
+                        && !"图片".equals(t) && !"动图".equals(t)){
+                    return pfx + clean + "_" + t;
+                }
+                return pfx + clean;
+            }
+
+            // 没有标题：走原来的 id 方案
+            return pfx + id + "_" + t;
         }catch(Throwable t){ return ""; }
     }
 
@@ -20850,7 +21437,8 @@ final String pfx;
         DlTask t = new DlTask(url, tag, ext, cat, mixDir, "", "", audioUrl);
         try{ InnerDownloader.clearCancel(t.url); dlDeleted.remove(dlTaskKey(t)); }catch(Throwable te){}
         t.plat = platOf(url);
-        try{ t.nameBase = taskStableName(url, tag); }catch(Throwable e){}
+        // 文件名：优先用当次解析出的标题（curDesc），失败回落到 平台id_tag
+        try{ t.nameBase = taskStableName(url, tag, "", curDesc); }catch(Throwable e){}
         downloadQueue.add(t);
         saveDlTasks();
         DypLog.i("DL_QUEUE + " + tag + " cat=" + cat + " audio=" + (audioUrl.length() > 0) + " 总计=" + downloadQueue.size());
@@ -20881,10 +21469,36 @@ final String pfx;
     void enqueueDownloadPlat(String url, String tag, String ext, String cat,
                              String mixDir, String platOverride, String stableId,
                              String liveUrl){
+        enqueueDownloadPlat(url, tag, ext, cat, mixDir, platOverride, stableId, liveUrl, "");
+    }
+
+    /**
+     * 批量/列表下载用的完整入口（v2.1.3 新增 title）。
+     *
+     * 命名规则：
+     *   · 传了 title   → <平台前缀><清洗后的标题>[_tag]  例：dy_好想和你走在黄昏的小路上
+     *   · 没传 title   → <平台前缀><stableId>_<tag>      保持原行为
+     *
+     * 批量下载时同名冲突由 runOneTask 的 dup 逻辑自动加 _2/_3，不会覆盖。
+     */
+    void enqueueDownloadPlat(String url, String tag, String ext, String cat,
+                             String mixDir, String platOverride, String stableId,
+                             String liveUrl, String title){
         if(BtDownloader.isMagnet(url) || (url != null && url.indexOf(".torrent") > 0)){
             final String mm = url;
             h.post(new Runnable(){ public void run(){ startMagnetDownload(mm); }});
             return;
+        }
+        // 图片：让字节系图床返回 JPEG 而不是默认的 WEBP
+        //   （用户反馈「为什么下载的图片后缀是 webp 不是 jpg/png」）
+        //   只处理 分类=图片/动图 的任务，视频/音频不动。
+        if(url != null && ("图片".equals(cat) || "动图".equals(cat))){
+            String forced = forceJpgUrl(url);
+            if(!forced.equals(url)){
+                DypLog.i("IMG_FORCE_JPG tail="
+                        + forced.substring(Math.max(0, forced.length() - 70)));
+                url = forced;
+            }
         }
         DlTask t = new DlTask(url, tag, ext, cat, mixDir,
                 (liveUrl == null ? "" : liveUrl), "", "");
@@ -20897,7 +21511,7 @@ final String pfx;
         }else{
             t.plat = platOf(url);
         }
-        try{ t.nameBase = taskStableName(url, tag, stableId); }catch(Throwable e){}
+        try{ t.nameBase = taskStableName(url, tag, stableId, title); }catch(Throwable e){}
         downloadQueue.add(t);
         saveDlTasks();
         DypLog.i("DL_QUEUE + " + tag + " cat=" + cat + " plat=" + t.plat
@@ -21203,7 +21817,7 @@ final String pfx;
                 h.post(new Runnable(){ public void run(){
                     String tag = "视频" + (batchDlIndex + 1);
                     DypLog.i("BATCH_DL_ENQ_DETAIL tag=" + tag + " plat=抖音");
-                    enqueueDownload(vv, tag, "mp4", "视频", "", "抖音", sid);
+                    enqueueDownload(vv, tag, "mp4", "视频", "", "抖音", sid, "", gs(get(adM, "desc")));
                     batchDlOk++;
                     advanceBatchAfterDetail(true);
                 }});
@@ -21493,6 +22107,34 @@ final String pfx;
                     }
                     if(task.mixDir != null && task.mixDir.length() > 0){
                         relSub = (platSub.length() > 0 ? platSub + "/" : "") + task.cat + "/" + task.mixDir;
+                    }
+                    // 实况图导出方式：mp4/gif 时先把目标文件名改好，
+                    // 后面的媒体库扫描、私有目录搬迁全部按这个最终名走
+                    if(task.isLive()){
+                        int lm0 = liveMode();
+                        if(lm0 == 1){
+                            name = name.endsWith(".jpg") ? name.substring(0, name.length() - 4) + ".mp4" : name + ".mp4";
+                        } else if(lm0 == 2){
+                            name = name.endsWith(".jpg") ? name.substring(0, name.length() - 4) + ".gif" : name + ".gif";
+                        }
+                        if(lm0 != 0){
+                            // 新扩展名同样做重名探测，避免覆盖用户已下好的文件
+                            synchronized(dlNameLock){
+                                File catDirTmp = new File(dlDirFor2(task.plat, task.cat));
+                                if(task.mixDir != null && task.mixDir.length() > 0){
+                                    catDirTmp = new File(catDirTmp, task.mixDir);
+                                }
+                                File probe = new File(catDirTmp, name);
+                                int dup = 2;
+                                while(probe.exists() && probe.length() > 0 && dup < 100){
+                                    name = name.substring(0, name.length() - 4) + "_" + dup
+                                            + name.substring(name.length() - 4);
+                                    probe = new File(catDirTmp, name);
+                                    dup++;
+                                }
+                            }
+                            DypLog.i("LIVE_MODE_FN " + name);
+                        }
                     }
                     final File target = new File(workDir, name);
                     lastCatDir[0] = catDir.getAbsolutePath();
@@ -22221,8 +22863,10 @@ final String pfx;
     File fixImageExt(File f){
         if(f == null || !f.exists() || f.length() < 16) return f;
         String n = f.getName().toLowerCase();
-        // 只处理以 .jpg/.jpeg 结尾的（实况照片也是 .jpg，但它是真 JPEG，头部 FF D8）
-        if(!n.endsWith(".jpg") && !n.endsWith(".jpeg")) return f;
+        // 处理 .jpg/.jpeg/.webp（v2.1.3 起 .webp 也要校正：
+        //   以前 CDN 回 webp 就存成 .webp，用户反馈「为什么不是 jpg/png」）
+        boolean maybeImage = n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".webp");
+        if(!maybeImage) return f;
         java.io.FileInputStream in = null;
         try{
             byte[] h = new byte[12];
@@ -22230,34 +22874,48 @@ final String pfx;
             int r = in.read(h);
             if(r < 12) return f;
             boolean isJpeg = (h[0] & 0xFF) == 0xFF && (h[1] & 0xFF) == 0xD8 && (h[2] & 0xFF) == 0xFF;
-            if(isJpeg) return f;
+            if(isJpeg){
+                // 真 JPEG：如果当前叫 .webp，改回 .jpg
+                if(n.endsWith(".webp")) return renameExt(f, "jpg");
+                return f;
+            }
             boolean isWebp = (h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F'
                               && h[8] == 'W' && h[9] == 'E' && h[10] == 'B' && h[11] == 'P');
             if(isWebp){
-                String base = f.getName();
-                int dot = base.lastIndexOf('.');
-                if(dot > 0) base = base.substring(0, dot);
-                File nf = new File(f.getParentFile(), base + ".webp");
-                if(f.renameTo(nf)){
-                    DypLog.i("EXT_FIX webp " + f.getName() + " -> " + nf.getName());
-                    return nf;
-                }
+                // 真 webp：保留 .webp 后缀（改名成 .jpg 会让看图软件认不出）
+                if(n.endsWith(".webp")) return f;
+                return renameExt(f, "webp");
             }
             boolean isPng = (h[0] & 0xFF) == 0x89 && h[1] == 'P' && h[2] == 'N' && h[3] == 'G';
             if(isPng){
-                String base = f.getName();
-                int dot = base.lastIndexOf('.');
-                if(dot > 0) base = base.substring(0, dot);
-                File nf = new File(f.getParentFile(), base + ".png");
-                if(f.renameTo(nf)){
-                    DypLog.i("EXT_FIX png " + f.getName() + " -> " + nf.getName());
-                    return nf;
-                }
+                if(n.endsWith(".png")) return f;
+                return renameExt(f, "png");
             }
+            // GIF
+            boolean isGif = h[0] == 'G' && h[1] == 'I' && h[2] == 'F';
+            if(isGif) return renameExt(f, "gif");
         }catch(Throwable t){
             DypLog.i("EXT_FIX_ERR " + t);
         }finally{
             try{ if(in != null) in.close(); }catch(Throwable t){}
+        }
+        return f;
+    }
+
+    /** 把文件改成指定扩展名，返回新 File（失败返回原 File） */
+    File renameExt(File f, String ext){
+        try{
+            String base = f.getName();
+            int dot = base.lastIndexOf('.');
+            if(dot > 0) base = base.substring(0, dot);
+            File nf = new File(f.getParentFile(), base + "." + ext);
+            if(nf.exists()) return nf;
+            if(f.renameTo(nf)){
+                DypLog.i("EXT_FIX " + f.getName() + " -> " + nf.getName());
+                return nf;
+            }
+        }catch(Throwable t){
+            DypLog.i("EXT_FIX_RENAME_ERR " + t);
         }
         return f;
     }
