@@ -8,6 +8,292 @@
 
 ---
 
+## v2.1.5 — 2026-11-17
+本轮：实况图（Live Photo）导出方式可选。
+### 新增
+- **设置 → 实况图导出 → 导出方式（三种可选）**
+  - 实况照片（默认）：单文件 .jpg Motion Photo，相册长按可播放，跟抖音原生一致。
+  - 视频 MP4：只存动轨视频，通用播放器都能放。
+  - 动图 GIF：480px 宽双通道调色板 GIF，适合聊天直接发。
+- 三模式对抖音与 TikTok 实况图同时生效（TikTok 动轨下载自动带解析会话）。
+### 修复
+- （无，本轮为纯新增）
+### 说明
+- TikTok 实况图请在真机自测；若动轨下载 403 与单视频同一原因（CDN 风控），开内置代理即可。
+
+---
+
+## v2.1.4 — 2026-11-11
+
+本轮两批改动：**抖音图集/实况图修复** + **小红书全链路修复**。
+
+### 新增
+- **小红书接入聚合 API（video-crack）**
+  - 之前 `AggApi.supported()` 不含小红书，注释里还写着「不通（code=-2）」，该结论已过时。
+  - 实测现在返回 `code=0`：视频给 CDN 直链，图集给 `imageUrl[]` 全部原图。
+  - 对比：API 图 1,229,674 字节 vs 网页 H5_DTL 476,119 字节（2.6 倍）。
+  - 本地 `XhsParser` 保留作兜底，聚合失败自动回落。
+
+### 修复
+- **抖音图集/实况图只解析出 1 张（核心 bug）**
+  - 现象：界面显示「7 张图 含实况」，但点开大图只有 1 张，下载弹窗也只列 1 张。
+  - 根因：`DyLocalParser.toMedia()` 用 `\n` 拼接图片列表，而 `MainActivity.parseImgs()`
+    用 `split("[|]")` 分割，7 张 URL 被拼成一个含换行的超长字符串，`split` 找不到 `|`。
+  - 修复：`toMedia()` 改为 `|` 分隔，与 `MiscParser`/`ToutiaoParser`/`XhsParser` 一致。
+  - 实测：`DY_LOCAL_OK imgs=7 live=true` → `SHOW_MEDIA imgs=7` → 「第7/7张」→ 弹窗「共 7 张」。
+- **抖音实况照片动轨丢失**
+  - 根因：`Item.liveVideos` 已解析，但 `toMedia()` 从未输出到图片串。
+  - 修复：有动轨时追加 `|DYN|` 段，长度与图片一一对齐。
+  - 实测：7 张全部 `LIVE_BUILD ok`，文件头 `FF D8 FF`，内嵌 `GCamera:MotionPhoto="1"`。
+- **聚合平台多图同样只出 1 张**
+  - `AggApi.toMedia()` 有一模一样的 `\n` 拼接问题（最右、皮皮虾等），一并改成 `|`。
+- **小红书视频/图片下载 403**
+  - `InnerDownloader` 的 Referer 分支没有小红书，落到默认 `https://www.douyin.com/`，
+    小红书 CDN 判盗链直接 403。实测：douyin Referer → 403，xiaohongshu Referer → 200。
+- **小红书视频播放 403**
+  - 播放器 `doPlayInner()` 的 Referer 链里同样没有小红书。
+  - 更隐蔽的一层：播放器复用判断只比 `miniWasTT`，抖音→小红书切换时两者都是 false，
+    播放器被错误复用，Referer 仍是旧的 douyin.com。
+  - 修复：抽出 `playRefKey()` 统一生成 Referer，新增 `miniRefKey` 记录当前值做比较。
+- **小红书视频只出缩略图**
+  - 视频作品的 `imageUrl` 里只有 1 张封面，`o2()` 看到有图就走图片预览，视频被丢掉。
+  - 修复：`fill()` 里若已有 `playUrl` 且只有 1 张图，视为封面并入 `cover`，不当图集。
+- **小红书画质掉到低档（用户重点反馈）**
+  - 接口在同一作品的**两条独立转码**之间随机返回：
+    - `.../110/258/xxx_258.mp4` → `avc1`，42,577,287 字节，2.69 Mbps，`x264 crf=22.0`
+    - `.../110/520/xxx_520.mp4` → `hvc1`，16,303,678 字节，0.95 Mbps，`HEVC CRF 30.20`
+  - 两者分辨率（720x1280）、帧数（3713）、时长（123.767s）完全一致，差别只在编码质量参数。
+    520 虽是新编码，但 CRF 差 8 档，实际是二次重压的低画质版（水印细节都被抹掉了）。
+  - 修复：`gearScore()` 按档位打分（258=100、259=95、520=40），最多重试 5 次直到拿满分。
+  - 实测：`XHS_GEAR_PICK ok=true tries=1 score=100 gear=258` → 下载 42,577,287 字节，与 CDN 字节一致。
+- **输入框清空不干净导致 code=-2**
+  - 之前只盲按 120 次 DEL：光标不在末尾、内容带换行时删不干净，两条链接拼一起发给接口。
+  - 修复：`tools/clear_box.sh` 用 `Ctrl+A + DEL` 再读回 uiautomator 验证，最多 10 轮。
+  - 实测：脏输入 `3fIGZH5b41G AU0aXVAfuqk` 1 轮清空。
+- **「CDN 只放行住宅 IP」提示误弹**
+  - 403 分支写死 TikTok 文案，小红书/微博 403 时也弹这句。修复：按平台给不同文案。
+- **文件名带 [话题] 与中文标点**
+  - `safeFileTitle()` 只清 `#`/`@`，方括号和中文标点都留着。
+  - 修复：新增括号（`[] {} 【】 （） 《》`）与中文标点清理。
+- **文件名前缀错成 dy_、标题为空**
+  - 图集下载走 `new DlTask(...)` 没传 `nameBase`，回落到 `dy_` + 空标题。
+  - 修复：补 `taskStableName(..., gs(curDesc))`，多张自动加 `_序号`。
+- **标题重复作品名**
+  - API 返回 `青椒火腿饼 |||青椒火腿饼 谁能拒绝…`，整串当文件名会重复两遍。
+  - 修复：`fill()` 按 `|||` 拆分，并去掉后半段与前半重复的前缀。
+
+### 优化
+- 聚合直链统一 `http://` → `https://`（`AggApi.httpsify`），避免 cleartext 限制。
+- 播放器 Referer 变化时自动重建，切平台不会复用错配置。
+- 实况图下载弹窗逐张标注「实况→动图 / 实况照片」，可单独选第几张。
+
+### 实测
+- 小红书视频：`tries=1 score=100 gear=258` → 播放 `MINI_READY dur=123767` → `DL_END ok=true`
+- 小红书图集：`imgs=7` → 7/7 下载完成，1.17MB~3.0MB，与 CDN 原图字节一致
+- 抖音实况：7/7 全部封装为 Motion Photo
+- 文件名：`xhs_谁能拒绝热乎乎的青椒火腿饼_外皮焦香_内里软乎乎_咸香入味_馅饼_面食_青椒火腿饼.mp4`
+
+### 说明
+- 下载队列、分类目录、按标题命名等公共逻辑均未破坏。
+
+---
+
+## v2.1.3 — 2026-11-09
+本轮全部是**线上用户反馈的 bug 修复**，外加一个命名改进。
+
+### 修复 1：小红书解析失败（用户提供链接实测）
+报错：`java.util.regex.PatternSyntaxException: Error in {min,max} interval near index 40`
+
+根因在 `XhsParser.java` 抽取 `window.__INITIAL_STATE__` 的正则：
+
+```java
+// 错误写法：源码里 4 个反斜杠
+"window\\\\.__INITIAL_STATE__\\\\s*=\\\\s*(\\\\{.*?\\\\})</script>"
+```
+
+Java 编译后字符串变成 `window\.__INITIAL_STATE__\s*=\s*(\{.*?\})`，
+正则引擎把 `\` 当作**字面反斜杠**，紧随其后的裸 `{` 就成了量词起始，
+于是报 interval 错误。
+
+**修法不再调反斜杠个数**（这个坑已经踩过两次），改成完全不用正则：
+
+```java
+int ip = html.indexOf("__INITIAL_STATE__");
+int b0 = html.indexOf("{", ip);
+int e0 = html.indexOf("</script>", ip);
+String js = html.substring(b0, e0).trim();
+```
+
+实测：`XHS_HTML len=68253` → 界面显示「完成(小红书) 6 张图」。
+
+### 修复 2：抖音画质不是最高（用户反馈）
+根因是 v2.1.2 我把抖音从短链放宽到 `douyin.com` 全匹配，导致聚合通道接管了抖音：
+
+| 通道 | 返回的画质 |
+|---|---|
+| `AggApi`（video-crack） | **1 条「默认」地址** |
+| `DyLocalParser`（本地直连） | **11 档 bit_rate**（带码率/尺寸标注） |
+
+而且 `AggApi` 在 15460 行、`DyLocalParser` 在 15501 行，聚合先命中就 return 了，
+11 档清晰度根本没机会出场。
+
+**修法**：把抖音从聚合通道剔除，固定走本地直连：
+
+```java
+// 抖音【不】走聚合通道：video-crack 只给一条「默认」地址，
+// 而本地直连 DyLocalParser 能拿到 11 档 bit_rate，画质高一个档次。
+// if(u.contains("douyin.com") || u.contains("iesdouyin.com")) return true;  ← 已删
+```
+
+实测：`DY_LOCAL_ORIGIN vid=v0d00fg10000cqib7b7o got=https://v11-cold-src.douyinvod.com/...`
+`gears=11`，界面「完成(抖音·本地)」。
+
+### 修复 3：图片下载后缀是 webp（用户反馈）
+实测文件头 `RIFF....WEBPVP8`，说明**文件本身真的是 webp**，不是后缀标错。
+
+两级原因：
+1. `imgExtOf()` 看到 URL 里有 `webp` 就返回 `.webp`
+2. `fixImageExt()` 只处理 `.jpg/.jpeg`，`.webp` 压根进不了校正分支
+
+字节系图床（douyinpic / byteimg / ixigua）的格式由 URL 里的 `~tplv-xxx` 模板控制，
+默认模板就是 webp。**双重修正**：
+
+```java
+// 1) 请求时让图床给 JPEG
+static String forceJpgUrl(String u){
+    // ~tplv-dy-aweme-images:1080:1080.webp  →  ...jpeg
+    // 没有 tplv 模板的加 x-oss-process=image/format,jpg
+}
+
+// 2) 下载后按真实文件头校正后缀
+//    JPEG → .jpg   PNG → .png   WEBP → .webp   GIF → .gif
+File fixImageExt(File f){ ... }
+File renameExt(File f, String ext){ ... }
+```
+
+`imgExtOf()` 改为默认返回 `jpg`（不再主动猜 webp），实际格式交给文件头判定。
+
+### 新增：按视频标题命名
+用户要求「解析的视频按标题重命名，顺便去掉特殊表情」。
+
+命名规则：
+
+| 场景 | 文件名 |
+|---|---|
+| 单视频 | `dy_好想和你走在黄昏的小路上_一起散散步聊聊天_治愈系风景.mp4` |
+| 无标题（回落） | `dy_7396234104540335395_视频.mp4` |
+| 合集 | `bl_标题_第3集.mp4` |
+| 图集 | `dy_标题_图1.jpg` |
+
+清洗函数 `safeFileTitle()` 共 7 步：
+
+1. 去掉 URL（标题里常夹分享短链）
+2. 去掉 emoji：`\p{So}` `\p{Cs}` `\p{Cn}` `\p{Co}` + 变体选择符 `FE0F` + 零宽连接符 `200D`
+3. 去掉装饰符号：`★☆♥♦◆●■▲※` 弯引号 箭头 `①②③`
+4. `#` `@` 换成空格（保留后面的文字）
+5. 去掉非法字符 `\ / : * ? " < > |`
+6. 空白统一成 `_`，折叠连续 `_`，去首尾 `_`
+7. 超过 60 字截断
+
+实测 8 个用例：
+
+```
+这蛋糕也太好吃了吧🍰😋 #美食 #甜品   →  这蛋糕也太好吃了吧_美食_甜品
+卖蛋糕喽 📷@蒋书剑                 →  卖蛋糕喽_蒋书剑
+【热门】★★ 超好看的风景 ✨⭐✅ https://...  →  【热门】_超好看的风景
+①②③ 测试特殊字符 ※◆■▲            →  测试特殊字符
+🎉🎉🎉                            →  (空) → 自动回落 ID 命名
+```
+
+**批量下载同样生效**，涉及 5 类场景共 14 处调用点：
+
+| 场景 | 标题来源 |
+|---|---|
+| TikTok 服务端分支（3 处） | `myIt.title` |
+| TikTok 本地分支（3 处） | `myIt.title` |
+| X 分支（2 处） | `myIt.title` |
+| 图集批量（2 处） | `it.title` |
+| 列表页单条详情（3 处） | `gs(get(adM, "desc"))` |
+| 主页批量详情（1 处） | `gs(get(adM, "desc"))` |
+
+重名由 `runOneTask` 原有的 dup 逻辑自动加 `_2`/`_3`，不会覆盖。
+
+### 清理
+删除 6 个一次性探测脚本（probe_img_fmt / probe_9plat / probe_more_plat /
+probe_netease / probe_videocrack / probe_amemv）。
+
+---
+
+## v2.1.2 — 2026-11-09
+本轮重点是 **接入第三方聚合解析 API + 网易云音乐**。用户给了三条外部 API（`video-crack v2`、
+两个 meting 实例、网易云官方公开接口），逐条实测后只保留真正可用的部分，其余全部剔除。
+
+### 聚合通道（video-crack v2）
+端点为 `http://47.99.158.118/video-crack/v2/parse?content=<url>`，免 Key、免 Cookie、直连。
+实测 20 个平台，真正通的只有 6 个：
+
+| 平台 | 结果 | 耗时 |
+|---|---|---|
+| 哔哩哔哩（BV/av/b23.tv/分P） | 通 | 0.4~1.4s |
+| 抖音（短链+长链） | 通 | 1.0~3.9s |
+| 快手（短链） | 通 | 1.2s |
+| TikTok | 通 | 5.4s |
+| 微信视频号 | 通 | 1.3s |
+| 最右 | 通 | 1.1s |
+
+其余平台（YouTube/小红书/微博/西瓜/好看/微视/AcFun/知乎/X/Instagram/皮皮虾/豆包/即梦）
+一律返回 `code=-2「不支持的内容!」`，因此**没有接入聚合通道**，继续走各自的本地解析器。
+
+> 关键修正：原以为抖音只吃短链。实测 `douyin.com/video/<id>` 长链同样返回 `code=0`，
+> 已把识别条件从 `v.douyin.com` 放宽到 `douyin.com | iesdouyin.com`。
+
+### 抖音本地直连解析（新增 DyLocalParser.java，433 行）
+来源：`github.com/jiuhunwl/short_videos` 的核心逻辑（PHP 项目，作者 `admin@bugpk.com`）。
+
+- 端点：`https://api.amemv.com/aweme/v1/aweme/detail/`
+- 固定参数：`aid=6383&device_platform=web&version_code=190500&version_name=19.5.0`
+- **必须用移动端 UA**，桌面 UA 会返回 200 但 body 长度 0（这个坑耗了两轮调试）
+- 实测短链 `v.douyin.com/irwsqD47` → `aweme_id 7396234104540335395` → 92167 字节完整数据
+- 可拿：视频原画（11 档 bit_rate）、图集原图、实况动轨、背景音乐
+
+解析优先级：`AggApi` → `DyLocalParser` → 原 WebView 链路（`loadLocalParseWeb` 完整保留）。
+
+### 网易云音乐（新增 Music163Parser.java，511 行）
+按用户决策：**走第三方 API，不逆向官方加密协议**；接口不可用时给用户明确提示。
+
+- 元数据：`music.163.com/api/song/detail/`（官方公开接口，免登录，长期稳定）
+- 播放直链：`music-api.gdstudio.xyz`（主）+ `api.i-meto.com/meting`（备）
+- 官方外链 `song/media/outer/url` 实测已作废，全部 302 跳 `/404`，不可用
+- 音质优先级 `320 → 192 → 128 → 999(FLAC)`：**MP3 优先**，因为部分机型 ExoPlayer 不解 FLAC
+- 支持输入：歌曲链接、纯数字 ID、分享文案、`163cn.tv` 短链
+- 失败分两种人话提示：拿不到元数据 → 网络/接口问题；有元数据无直链 → 版权限制
+
+覆盖率实测（12 首）：约 6 首能拿到直链，其余为版权/会员限制。
+
+### 即梦AI
+`POST https://jimeng.jianying.com/mweb/v1/get_item_info`，body `{"published_item_id":"<id>"}`。
+实测返回 `{"ret":"2032","errmsg":"itemId not exist"}`，协议通路正常。
+
+### 修复的真实 bug
+1. **豆包功能退化（我引入的）**：新写的 `AggApi.doubao()` 排在 `DoubaoParser` 前面，
+   但它只匹配 `.mp4` 链接，而 `DoubaoParser` 有完整的 `get_play_info` 播放协议（456 行）。
+   已把豆包从 AggApi 移除，实测正确回落到 `DB_HTML len=98189`。
+2. **网易云封面 + 播放器双故障**：`toMedia()` 返回顺序写成了 `{playUrl, fileName, cover}`，
+   而 `o2(text, imgs, play, cover)` 要求 `{imgs, playUrl, cover}`。导致播放地址被当成图片，
+   文件名被当成播放地址，界面显示「解码失败 / 大图加载失败」。已修正为 `{"", playUrl, cover}`。
+3. 网易云封面图床 `music.126.net` 未登记在 `refererFor()`，已补 `https://music.163.com/`。
+4. 网易云下载走 `enqueueDownloadWithAudio(..., "音乐", ...)` 单独分支，不再被当成视频下成 mp4。
+
+### 清理
+删除 3 个已废弃 API Key 与 5 个旧网关域名（`api-new.ifphp.com` / `api.bugpk.com` /
+`api.guiguiya.com` / `api.dovis.work` / `api.hongci886.top`），源码扫描 0 残留。
+
+### 平台支持说明
+重写「平台支持说明」弹窗，按「聚合通道 / 抖音直连 / 本地解析器 / 网易云」四块分层列出，
+删掉了从未实现过的知乎、梨视频、美拍、全民、虎牙、绿洲。
+
+---
+
 ## v2.1.1 — 2026-11-06
 
 本轮重点是 **YouTube 解析恢复**。YouTube 在 2026-11 改了播放器下发策略：网页端
