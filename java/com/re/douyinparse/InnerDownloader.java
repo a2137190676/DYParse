@@ -415,6 +415,11 @@ public class InnerDownloader {
                     else if(url.indexOf("googlevideo.com") >= 0) ref = "https://www.youtube.com/";
                     else if(isBili) ref = "https://www.bilibili.com/";
                     else if(url.indexOf("/api/ins/dl") >= 0) ref = "https://www.instagram.com/";
+                    // 小红书：ci.xiaohongshu.com / sns-webpic / sns-video-hw 等 CDN
+                    // 之前落到默认的 douyin.com Referer，CDN 直接判盗链返回 403，
+                    // 表现就是「解析出 7 张图但全部下载失败」——v2.1.6 修复。
+                    else if(url.indexOf("xiaohongshu.com") >= 0 || url.indexOf("xhscdn.com") >= 0
+                            || url.indexOf("xhslink") >= 0) ref = "https://www.xiaohongshu.com/";
                     c.setRequestProperty("Referer", ref);
                     // B 站 CDN 必须带 buvid3，否则 403
                     if(isBili){
