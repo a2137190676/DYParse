@@ -24,9 +24,15 @@
 
 ## 功能
 
-- 支持 **22 个平台**的 **视频 / 图文 / 动图 / 音频** 解析：
-  抖音、快手、TikTok、X（推特）、YouTube、B站、Instagram、小红书、微信视频号、微信公众号、微博、今日头条、西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包、腾讯视频、磁力下载
+- 支持 **23 个平台**的 **视频 / 图文 / 动图 / 音频** 解析：
+  抖音、快手、TikTok、X（推特）、YouTube、B站、Instagram、小红书、微信视频号、微信公众号、微博、今日头条、西瓜视频、AcFun、好看视频、最右、皮皮虾、皮皮搞笑、微视、豆包、即梦AI、腾讯视频、**网易云音乐**、磁力下载
+- **网易云音乐（v2.1.2）**：单曲解析，拿歌名/歌手/专辑/封面/时长 + 音频直链（优先 320kbps MP3，下载归入「音乐」分类）。走第三方公开接口，不逆向官方协议；受版权限制的歌会明确提示原因
+- **聚合解析通道（v2.1.2）**：`video-crack v2` 免 Key 直连，覆盖 B站（BV/av/b23.tv/分P）、抖音（短链+长链）、快手短链、TikTok、微信视频号、最右，0.4~5s 返回；失败自动回落到本地解析器
+- **抖音本地直连（v2.1.2）**：走 `api.amemv.com` 详情接口，免 Cookie、免签名、免服务器，支持原画多档清晰度、图集原图、实况动轨、背景音乐
 - **磁力 / BT 种子下载（v2.1.0）**：`magnet:` 链接与 `.torrent` 直链全部本机完成、不经服务器；支持文件选择、边下边播、种子自动保留、断点续传
+- **实况图导出方式（v2.1.5）**：设置 → 实况图导出 → 导出方式，三种可选——实况照片（单 .jpg，相册长按可播放）/ 视频 MP4（只存动轨）/ 动图 GIF（480px，聊天直发）；抖音与 TikTok 实况图同时生效，默认仍是实况照片
+- **按标题命名（v2.1.3）**：下载文件用视频标题命名，自动清理 emoji、`#`/`@`、装饰符号和非法字符，空格统一成 `_`；批量下载同样生效，重名自动加 `_2`/`_3`
+- **图片格式修正（v2.1.3）**：字节系图床默认回 webp，现在请求时优先要 JPEG，下载后按真实文件头校正后缀（JPEG/PNG/WEBP/GIF 自动识别）
 - **多平台本地直连**（v1.3.7.7）：微博 / 微信公众号 / 今日头条 / 西瓜视频 / AcFun / 好看视频 / 最右 / 皮皮虾 / 皮皮搞笑 全部纯 HTTP 本地解析，免 Cookie、免服务器、免第三方 API
 - **主页列表**：YouTube 频道 / TikTok 用户 / X 用户主页 / B站空间 / Instagram 用户主页 / **抖音主页** 一键列出全部作品，支持逐条下载与全部下载（每页 100 条，带翻页）
 - **抖音主页全量翻页（v1.3.7.2）**：主页作品列表一次拿全，实测 280 条作品 16 页全部翻完；需登录 Cookie（登录一次即可，Cookie 只存本机不上传）
@@ -94,6 +100,10 @@
 | 微视 | `weishi.qq.com/webshare/{id}` + `window.Vise.initState`（首页有 401 反爬，需分享页）|
 | 小红书 | `window.__INITIAL_STATE__`（PC `note.noteDetailMap` / 移动 `noteData.data`）；图取 `infoList` 里无 `WM` 的原图；视频优先 `consumer.originVideoKey` → `sns-video-bd.xhscdn.com` |
 | 豆包 | 分享页内嵌 JSON → 递归取 `vid` → `POST samantha/media/get_play_info` `{"key":vid}` → `original_media_info.main_url` |
+| 即梦AI（v2.1.2） | `POST jimeng.jianying.com/mweb/v1/get_item_info`，body `{"published_item_id":"<id>"}`；短链 `/s/xxx` 先跟随重定向再抠 ID |
+| 网易云音乐（v2.1.2） | 元数据走官方公开 `api/song/detail`（免登录）；直链走第三方 `music-api.gdstudio.xyz`（主，`br=320/192/128/999`）+ `api.i-meto.com/meting`（备）。官方外链 `song/media/outer/url` 已作废（302→/404） |
+| 抖音本地直连（v2.1.2） | `api.amemv.com/aweme/v1/aweme/detail/`，固定 `aid=6383&device_platform=web&version_code=190500`；**必须移动端 UA**（桌面 UA 返回 200 但 body 为 0） |
+| 聚合通道（v2.1.2） | `video-crack v2` `GET /video-crack/v2/parse?content=<url>`，免 Key；返回 `{"code":0,"data":{title,url,cover,imageUrl[],music}}`，`code=-2` 即不支持，自动回落本地解析 |
 | TikTok | 纯 HTTP + 自管 Cookie 会话，双页面模板互为兜底；下载走服务器中转（tikwm 直链） |
 | X（推特） | fxtwitter / syndication 双源纯 HTTP；挂代理直连 CDN，失败自动回退服务器中转；外链卡片深挖 |
 | YouTube | **Invidious 直连优先**（免服务器、免登录，手机直连公共实例取带 url 的 adaptiveFormats）；失效后回退本机 player.js 求解；再回退服务器 yt-dlp |
@@ -214,6 +224,8 @@ App 内置服务器加速层（开箱即用，设置里可自填替换）。以�
 | **抖音实况图（v1.3.7.1 起本地优先）** | 详情接口强制要求 `UIFID_TEMP` 访客凭据（缺失固定 403 `ArgusSecurityPlugin`）。App 会**自动静默获取**（隐藏 WebView 桌面 UA，实测 2-3 秒），拿到后本地签名，**不走服务器**；服务器只作兜底 | 提前拿过凭据的用户完全不受影响；新装用户只要网络能开抖音页面也能自取 |
 | **抖音主页列表（v1.3.7.2 起本地可用）** | 本地 WebView 跳 PC 主页 + 签名接口翻页，需要登录 Cookie（登录一次即可）。Cookie 只存本机，不上传服务器 | 服务器不可用完全不影响；未登录只能拿到第一页约 20 条 |
 | **自更新加速** | version.json + APK 下发走内置服务器优先 | 自动回退 Gitee / GitHub 直连检查 |
+| **网易云音乐（v2.1.2）** | **完全不需要服务器**：元数据走官方公开接口，直链走第三方公开实例，全部手机直连 | 完全不受服务器影响；但第三方接口若停服，会明确提示「暂不可用」，不静默失败 |
+| **聚合解析通道（v2.1.2）** | **完全不需要服务器**：`video-crack v2` 为第三方公网服务，手机直连；失败自动回落本地解析器 | 完全不受服务器影响；该 API 若停服，B站/抖音等仍走各自本地解析器 |
 
 **服务器到期后**（当前 2027-04-20）：
 - **新增多平台解析（微博 / 公众号 / 头条 / 西瓜 / AcFun / 好看 / 微信视频号元数据）完全不受影响**：
