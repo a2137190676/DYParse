@@ -1,14 +1,14 @@
 {
-  "tag": "v2.1.1",
-  "name": "v2.1.1",
-  "body": "## v2.1.1\n\n### 新增\n- YouTube 解析新增 Invidious 直连通道，不再依赖服务器，可拿 1080P/4K 原画\n- YouTube 解析新增本机 player.js 求解通道，作为 Invidious 失效时的第二道保障\n\n### 修复\n- YouTube 解析不了、一直转圈：服务器解析超时从 10 分钟收到 75 秒，失败立刻提示\n- YouTube 解析出来没画面：改为手机直连 Invidious 取流，带 Range 支持边下边播\n- TikTok 遇到私密 / 已删除作品时一直转圈：现在直接提示「作品不可用」\n- 应用图标丢失导致部分机型不显示图标\n\n### 说明\n- YouTube 的 Invidious 通道走公共实例，全部失效时会自动回退自建服务器\n- 服务器到期后 YouTube 解析仍可用，只是少了服务器这条兜底\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.1/DYParse-v2.1.1.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.1/DYParse-v2.1.1.apk",
-  "released": "2026-11-06",
+  "tag": "v2.1.5",
+  "name": "v2.1.5",
+  "body": "## v2.1.5\n\n### 新增\n- 实况图导出方式可选：实况照片 / 视频 MP4 / 动图 GIF\n- 设置 → 实况图导出 → 导出方式，抖音与 TikTok 实况同时生效\n\n### 说明\n- 默认仍是实况照片；MP4 只存动轨，GIF 为 480px 动图\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）\n",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.5/DYParse-v2.1.5.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.5/DYParse-v2.1.5.apk",
+  "released": "2026-11-17",
   "upgrade_notice": {
-    "title": "发现新版本 2.1.1",
-    "message": "v2.1.1 已发布：YouTube 解析恢复（新增 Invidious 直连，不再依赖服务器），并修复解析卡死、TikTok 私密作品一直转圈等问题。建议更新到最新版。",
+    "title": "发现新版本 2.1.5",
+    "message": "v2.1.5 已发布：实况图可选导出为 MP4 / GIF 动图，支持抖音与 TikTok 实况。",
     "url": "https://gitee.com/adaaixianzun/dyparse/releases",
-    "until": 2010100
+    "until": 2010500
   }
 }
