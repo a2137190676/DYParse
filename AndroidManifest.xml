@@ -49,10 +49,5 @@
             <grant-uri-permission android:path="update.apk"/>
             <grant-uri-permission android:path="/update.apk"/>
         </provider>
-        <provider
-            android:name="com.xn.popup.XnAutoInit"
-            android:authorities="com.re.douyinparse.xnpopup"
-            android:exported="false"
-            android:initOrder="999" />
     </application>
 </manifest>
