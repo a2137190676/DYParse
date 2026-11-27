@@ -1920,6 +1920,10 @@ public class MainActivity extends Activity {
     static final String APP_QQ_GROUP = "995434160";
     /** 加群链接（跳转浏览器打开） */
     static final String APP_QQ_GROUP_URL = "https://qm.qq.com/q/MA71T24xO0";
+    /** TG 群（纸飞机） */
+    static final String APP_TG_GROUP_URL = "https://t.me/aacaixukun";
+    /** 弹窗更新开关（默认开：检测到新版本用小尼弹窗展示） */
+    static final String KEY_XN_UPD = "xn_upd";
     // ===== 双仓库：Gitee + GitHub（用户可在设置里切换更新源） =====
     static final String SRC_GITEE  = "gitee";
     static final String SRC_GITHUB = "github";
@@ -4275,6 +4279,16 @@ DypLog.i("PROFILE_AUTO " + u.substring(0, Math.min(120, u.length())));
                 try{
                     startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
                             Uri.parse(APP_QQ_GROUP_URL)));
+                }catch(Throwable t){
+                    s("无法打开浏览器");
+                }
+            }});
+
+        addSettingRow("TG 群（纸飞机）", "点击加入 Telegram 群", new View.OnClickListener(){
+            public void onClick(View v){
+                try{
+                    startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                            Uri.parse(APP_TG_GROUP_URL)));
                 }catch(Throwable t){
                     s("无法打开浏览器");
                 }
@@ -8889,17 +8903,30 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
             .show();
     }
 
-    /** 更新源选择：Gitee / GitHub */
+    /** 更新源选择：Gitee / GitHub；弹窗更新开关 */
     void showUpdSrcDialog(){
+        boolean xnOn = getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_XN_UPD, true);
         final String[] labels = {
             "Gitee（国内直连，推荐）",
-            "GitHub（国际；国内需选镜像或自己挂代理）"
+            "GitHub（国际；国内需选镜像或自己挂代理）",
+            "弹窗更新：" + (xnOn ? "开（新版本用小尼弹窗展示）" : "关（用系统弹窗）")
         };
         int cur = isGitee(this) ? 0 : 1;
         dypDlg()
             .setTitle("选择更新源")
-            .setSingleChoiceItems(labels, cur, new android.content.DialogInterface.OnClickListener(){
+            .setSingleChoiceItems(labels, -1, new android.content.DialogInterface.OnClickListener(){
                 public void onClick(android.content.DialogInterface d, int which){
+                    if(which == 2){
+                        // 切换弹窗更新开关，不切换更新源
+                        boolean nx = !getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_XN_UPD, true);
+                        try{
+                            getSharedPreferences(SP, MODE_PRIVATE).edit().putBoolean(KEY_XN_UPD, nx).apply();
+                        }catch(Throwable t){}
+                        d.dismiss();
+                        Toast.makeText(MainActivity.this, "弹窗更新已" + (nx ? "开启" : "关闭"), Toast.LENGTH_SHORT).show();
+                        buildSettingsPage();
+                        return;
+                    }
                     String v = which == 1 ? SRC_GITHUB : SRC_GITEE;
                     try{
                         getSharedPreferences(SP, MODE_PRIVATE).edit().putString(KEY_UPD_SRC, v).apply();
@@ -9132,9 +9159,56 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
      * @param respectSnooze true = 尊重用户「下个版本再提醒」的选择（自动检查时用）
      *                      false = 手动点「检查更新」时无视 snooze，一定弹
      */
+    /**
+     * 小尼弹窗版更新提示：反射调用 classes2.dex 里的 com.xn.popup.XnPopup.showLocal(Context,String)。
+     * 配置文本动态构造（带最新版本号与下载按钮）；任何反射失败都返回 false，
+     * 由 showUpdateDialog 回落原系统弹窗。
+     */
+    boolean showXnUpdateDialog(String tag, String name, String bodyTxt, final String html,
+                               final String apkUrl, final String apkName, int newVer, int curVer,
+                               boolean respectSnooze){
+        try{
+            Class<?> c = Class.forName("com.xn.popup.XnPopup");
+            boolean force = updateIsForce(newVer, curVer);
+            if(!force && respectSnooze){
+                int skip = getSharedPreferences(SP, MODE_PRIVATE).getInt(KEY_SKIP_VER, 0);
+                if(newVer <= skip) return true;
+            }
+            String dl = (apkUrl != null && apkUrl.length() > 0) ? apkUrl : html;
+            String cfg = "style=r2" + "\n"
+                + "force=" + (force ? "1" : "0") + "\n"
+                + "backCancel=" + (force ? "0" : "1") + "\n"
+                + "outsideCancel=" + (force ? "0" : "1") + "\n"
+                + "title=" + (force ? "需要更新（强制）" : "发现新版本") + "\n"
+                + "subtitle=" + (tag != null ? tag : "") + "\n"
+                + "ver=" + (tag != null ? tag : "") + "\n"
+                + "btn1=" + (dl.length() > 0 ? "立即更新" : "打开页面") + "\n"
+                + "btn1Url=" + dl + "\n"
+                + "btn2=" + "加入Q群" + "\n"
+                + "qqUin=995434160" + "\n"
+                + "btn3=" + "TG群" + "\n"
+                + "btn3Url=https://t.me/aacaixukun" + "\n"
+                + "btn4=" + (force ? "" : "不再提示") + "\n"
+                + "reset=" + (respectSnooze ? "0" : "1") + "\n"
+                + "---" + "\n"
+                + (bodyTxt != null && bodyTxt.length() > 0 ? bodyTxt : (tag + " 已发布"))
+                + (html.length() > 0 ? ("\n发布页: " + html) : "");
+            java.lang.reflect.Method m = c.getMethod("showLocal", android.content.Context.class, String.class);
+            m.invoke(null, this, cfg);
+            DypLog.i("UPDATE_XN_OK tag=" + tag + " force=" + force);
+            return true;
+        }catch(Throwable t){
+            DypLog.i("UPDATE_XN_FAIL " + t);
+            return false;
+        }
+    }
+
     void showUpdateDialog(String tag, String name, String bodyTxt, final String html,
                           final String apkUrl, final String apkName, int newVer, int curVer,
                           boolean respectSnooze){
+        // 小尼弹窗：开关开启时优先用它弹（反射调用 com.xn.popup.XnPopup，失败自动回落系统弹窗）
+        boolean xnOn = getSharedPreferences(SP, MODE_PRIVATE).getBoolean(KEY_XN_UPD, true);
+        if(xnOn && showXnUpdateDialog(tag, name, bodyTxt, html, apkUrl, apkName, newVer, curVer, respectSnooze)) return;
         // 是否强制更新：服务端 version.json 带 force=1 / min_version 高于当前版本
         boolean force = updateIsForce(newVer, curVer);
         // 非强制时，用户之前选过「下个版本再提醒」就静默跳过
@@ -9560,7 +9634,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
           + "不可达时自动回退本地解析，不影响使用。\n\n"
           + "【问题反馈】\n"
           + "QQ：" + APP_QQ + "\n"
-          + "反馈群：" + APP_QQ_GROUP + "\n\n"
+          + "反馈群：" + APP_QQ_GROUP + "\n"
+          + "TG 群：" + APP_TG_GROUP_URL + "\n\n"
           + "【更新】\n"
           + "新版本同步发布在 Gitee 与 GitHub Releases。\n"
           + "当前更新源：" + platformName() + "（可在设置里切换），点下方「检查更新」即可。";
@@ -9722,7 +9797,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
 /** 内置的更新日志文案（随版本更新，与 CHANGELOG.md 保持同步） */
     static String changelogText(){
         return
-            "【v2.1.5】实况图导出方式可选\n"
+              "【v2.1.6】修复一些已知问题\n"
+              + "【v2.1.5】实况图导出方式可选\n"
              + "新增\n"
              + "· 实况图可选导出：实况照片 / 视频 MP4 / 动图 GIF\n"
              + "· 设置 → 实况图导出 → 导出方式，抖音与 TikTok 实况同时生效\n"
@@ -9745,7 +9821,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "· 实况图下载弹窗逐张标注「实况→动图/实况照片」，可单独选第几张\n"
              + "· 切换平台时播放器自动重建，不会用错 Referer\n"
              + "· 下载、命名、格式修正等公共逻辑不变\n"
-             + "\n"
+
              + "【v2.1.3】修复小红书、抖音画质、按标题命名\n"
              + "新增\n"
              + "· 下载文件按视频标题命名，自动清理表情符号和特殊字符\n"
@@ -9756,11 +9832,8 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "· 图片下载后缀是 webp（改为向图床要 JPEG，并按真实文件头校正后缀）\n"
              + "优化\n"
              + "· 文件名空格统一成下划线，更整齐\n"
-             + "· 纯表情标题自动回落到作品 ID 命名，不会出现空文件名\n"
-             + "说明\n"
-             + "· 命名规则：dy_标题.mp4 / bl_标题_第3集.mp4 / dy_标题_图1.jpg\n"
              + "\n"
-            + "【v2.1.2】新增网易云音乐解析，聚合通道全平台扩展\n"
+             + "【v2.1.2】聚合通道扩展，网易云音乐支持\n"
              + "新增\n"
              + "· 网易云音乐：支持单曲解析，可拿歌名/歌手/专辑/封面/时长\n"
              + "· 网易云音乐：音频直链优先 320kbps MP3，下载自动归入「音乐」分类\n"
@@ -9770,13 +9843,7 @@ void s(final String t){ h.post(new Runnable(){ public void run(){ status.setText
              + "· 聚合通道新增最右，抖音长链也支持了\n"
              + "优化\n"
              + "· 聚合通道覆盖平台扩展：B站/抖音/快手/TikTok/视频号/最右\n"
-             + "· 解析失败会明确告知原因，不再静默无反应\n"
-             + "修复\n"
-             + "· 抖音长链解析失败（原来只认短链）\n"
-             + "· 网易云封面加载失败、播放器拉不到音频\n"
-             + "说明\n"
-             + "· 网易云走第三方公开接口，不逆向官方协议\n"
-             + "· 部分歌曲受版权限制没有直链，会明确提示原因\n"
+             + "\n"
              + "\n"
             + "【v2.1.1】YouTube 解析恢复，TikTok 实况图提示优化\n"
              + "新增\n"
