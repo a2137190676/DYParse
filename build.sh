@@ -212,7 +212,7 @@ java -cp "$DEX_RUNNER" com.android.tools.r8.D8 --min-api 21 --lib "$ANDROID_JAR"
 
 # ---------- 5. aapt 打包资源 ----------
 echo '=== aapt package ==='
-aapt package -f -M AndroidManifest.xml $RES_ARGS --auto-add-overlay -I "$ANDROID_JAR" \
+aapt package -f -M AndroidManifest.xml $RES_ARGS --auto-add-overlay -A assets -I "$ANDROID_JAR" \
   -F "$BUILD/app-res.apk" || exit 30
 
 # ---------- 5.5 收集 native so ----------
@@ -263,7 +263,7 @@ def must_store(name):
     if name.startswith('lib/') and name.endswith('libtorrent4j.so'):
         return False
     return (name.startswith('lib/') and name.endswith('.so')) \
-        or name == 'classes.dex' or name == 'resources.arsc'
+        or name == 'classes.dex' or name == 'classes2.dex' or name == 'resources.arsc'
 
 zin = zipfile.ZipFile(src_apk, 'r')
 zout = zipfile.ZipFile(dst_apk, 'w', zipfile.ZIP_DEFLATED)
@@ -286,6 +286,13 @@ zin.close()
 with open(dex, 'rb') as f:
     add('classes.dex', f.read())
 print('       + classes.dex %d bytes' % os.path.getsize(dex))
+
+# 附加 dex（小尼弹窗库 classes2.dex）
+xn_dex = os.path.join(os.path.dirname(os.path.dirname(build)), 'tools', 'xn_popup_classes.dex')
+if os.path.isfile(xn_dex):
+    with open(xn_dex, 'rb') as f:
+        add('classes2.dex', f.read())
+    print('       + classes2.dex %d bytes (xn popup)' % os.path.getsize(xn_dex))
 
 # lib/**/*.so
 so_count = 0
