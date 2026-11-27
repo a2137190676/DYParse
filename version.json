@@ -1,14 +1,13 @@
 {
-  "tag": "v2.1.5",
-  "name": "v2.1.5",
-  "body": "## v2.1.5\n\n### 新增\n- 实况图导出方式可选：实况照片 / 视频 MP4 / 动图 GIF\n- 设置 → 实况图导出 → 导出方式，抖音与 TikTok 实况同时生效\n\n### 说明\n- 默认仍是实况照片；MP4 只存动轨，GIF 为 480px 动图\n\n---\n\n**反馈群：995434160**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）\n",
-  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.5/DYParse-v2.1.5.apk",
-  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.5/DYParse-v2.1.5.apk",
-  "released": "2026-11-17",
+  "tag": "v2.1.6",
+  "name": "v2.1.6",
+  "body": "## v2.1.6\n\n修复一些已知问题。\n\n---\n\n**反馈群：995434160**\n**TG 群：https://t.me/aacaixukun**\n\n- Gitee 下载：https://gitee.com/adaaixianzun/dyparse/releases\n- GitHub 下载：https://github.com/a2137190676/DYParse/releases\n  （GitHub 账号曾被误封，如打不开请走 Gitee）\n",
+  "apk": "https://gitee.com/adaaixianzun/dyparse/releases/download/v2.1.6/DYParse-v2.1.6.apk",
+  "apk_github": "https://github.com/a2137190676/DYParse/releases/download/v2.1.6/DYParse-v2.1.6.apk",
+  "released": "2026-11-27",
   "upgrade_notice": {
-    "title": "发现新版本 2.1.5",
-    "message": "v2.1.5 已发布：实况图可选导出为 MP4 / GIF 动图，支持抖音与 TikTok 实况。",
-    "url": "https://gitee.com/adaaixianzun/dyparse/releases",
-    "until": 2010500
+    "title": "发现新版本 2.1.6",
+    "message": "v2.1.6 已发布：修复一些已知问题。",
+    "until": 2010600
   }
 }
